@@ -635,24 +635,54 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const { folder = 'general' } = req.body;
     const fileName = `${folder}/${Date.now()}-${req.file.originalname}`;
 
-    const { data, error } = await supabase.storage
-      .from('user-uploads')
+    // Use the bucket name from the user's setup
+    const bucketName = 'user-pohto-video'; // or 'user-uploads' if you prefer
+
+    console.log(`Uploading file to bucket: ${bucketName}, folder: ${folder}, fileName: ${fileName}`);
+    
+    // Create a new Supabase client with service role key for this operation
+    // This ensures we use service role key even if it was set after server start
+    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const uploadSupabase = serviceRoleKey && !serviceRoleKey.includes('YOUR_SERVICE_ROLE_KEY_HERE') && !serviceRoleKey.includes('anon')
+      ? createClient(supabaseUrl, serviceRoleKey)
+      : supabase;
+
+    const { data, error } = await uploadSupabase.storage
+      .from(bucketName)
       .upload(fileName, req.file.buffer, {
         contentType: req.file.mimetype,
         upsert: false
       });
 
     if (error) {
+      console.error('Supabase storage upload error:', error);
+      console.error('Error details:', {
+        message: error.message,
+        status: error.statusCode,
+        bucketName: bucketName,
+        hasServiceRoleKey: !!supabaseKey && !supabaseKey.includes('anon')
+      });
+      
+      // Provide helpful error message
+      let errorMessage = 'Failed to upload file';
+      if (error.statusCode === '403' || error.message.includes('row-level security')) {
+        errorMessage = 'Storage permission denied. Please check bucket policies or make bucket public.';
+      }
+      
       return res.status(500).json({ 
         success: false, 
-        error: 'Failed to upload file',
-        details: error.message 
+        error: errorMessage,
+        details: error.message,
+        bucketName: bucketName,
+        hint: 'Make sure the bucket is public or has proper INSERT policy'
       });
     }
 
-    const { data: urlData } = supabase.storage
-      .from('user-uploads')
+    const { data: urlData } = uploadSupabase.storage
+      .from(bucketName)
       .getPublicUrl(fileName);
+
+    console.log('File uploaded successfully:', urlData.publicUrl);
 
     res.json({
       success: true,
@@ -664,7 +694,221 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     console.error('Error uploading file:', error);
     res.status(500).json({ 
       success: false, 
-      error: error.message 
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
+  }
+});
+
+// ==================== LISTING ENDPOINTS ====================
+
+// Create a new listing
+app.post('/api/listings', async (req, res) => {
+  try {
+    const {
+      propertyType,
+      area,
+      rooms,
+      floor,
+      amenities,
+      condition,
+      purpose,
+      price,
+      address,
+      phone,
+      description,
+      displayOption,
+      mainImageUrl,
+      additionalImageUrls,
+      videoUrl,
+      hasVideo,
+      userId, // Should come from auth/session
+    } = req.body;
+
+    // Validate required fields
+    if (!propertyType || !area || !rooms || !floor || !purpose || !price || !address || !phone || !description) {
+      console.error('Missing required fields:', {
+        propertyType: !!propertyType,
+        area: !!area,
+        rooms: !!rooms,
+        floor: !!floor,
+        purpose: !!purpose,
+        price: !!price,
+        address: !!address,
+        phone: !!phone,
+        description: !!description
+      });
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields',
+        received: req.body
+      });
+    }
+
+    console.log('Creating listing with data:', {
+      propertyType,
+      area,
+      rooms,
+      floor,
+      purpose,
+      price,
+      hasVideo
+    });
+
+    // Insert listing
+    const { data: listing, error: listingError } = await supabase
+      .from('listings')
+      .insert({
+        user_id: userId || null, // TODO: Get from auth session
+        property_type: propertyType,
+        area,
+        rooms,
+        floor,
+        condition,
+        purpose,
+        price,
+        address,
+        phone,
+        description,
+        display_option: displayOption,
+        has_video: hasVideo || false,
+        status: 'published',
+      })
+      .select()
+      .single();
+
+    if (listingError) {
+      console.error('Error creating listing:', listingError);
+      console.error('Listing error details:', JSON.stringify(listingError, null, 2));
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create listing',
+        details: listingError.message,
+        code: listingError.code,
+        hint: listingError.hint
+      });
+    }
+
+    console.log('Listing created successfully:', listing.id);
+
+    // Insert amenities
+    if (amenities && Object.keys(amenities).length > 0) {
+      const amenitiesArray = Object.entries(amenities).map(([name, quantity]) => ({
+        listing_id: listing.id,
+        amenity_name: name,
+        quantity: typeof quantity === 'number' ? quantity : 1,
+      }));
+
+      const { error: amenitiesError } = await supabase
+        .from('listing_amenities')
+        .insert(amenitiesArray);
+
+      if (amenitiesError) {
+        console.error('Error inserting amenities:', amenitiesError);
+      }
+    }
+
+    // Insert main image
+    if (mainImageUrl) {
+      const { error: imageError } = await supabase
+        .from('listing_images')
+        .insert({
+          listing_id: listing.id,
+          image_url: mainImageUrl,
+          image_type: 'main',
+          display_order: 0,
+        });
+
+      if (imageError) {
+        console.error('Error inserting main image:', imageError);
+      }
+    }
+
+    // Insert additional images
+    if (additionalImageUrls && additionalImageUrls.length > 0) {
+      const imagesArray = additionalImageUrls.map((url, index) => ({
+        listing_id: listing.id,
+        image_url: url,
+        image_type: 'additional',
+        display_order: index + 1,
+      }));
+
+      const { error: imagesError } = await supabase
+        .from('listing_images')
+        .insert(imagesArray);
+
+      if (imagesError) {
+        console.error('Error inserting additional images:', imagesError);
+      }
+    }
+
+    // Insert video
+    if (videoUrl) {
+      const { error: videoError } = await supabase
+        .from('listing_videos')
+        .insert({
+          listing_id: listing.id,
+          video_url: videoUrl,
+        });
+
+      if (videoError) {
+        console.error('Error inserting video:', videoError);
+      }
+    }
+
+    res.json({
+      success: true,
+      id: listing.id,
+      listing
+    });
+
+  } catch (error) {
+    console.error('Error creating listing:', error);
+    console.error('Error stack:', error.stack);
+    console.error('Request body:', req.body);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+      receivedData: req.body
+    });
+  }
+});
+
+// Get all listings
+app.get('/api/listings', async (req, res) => {
+  try {
+    const { status = 'published' } = req.query;
+
+    const { data: listings, error } = await supabase
+      .from('listings')
+      .select(`
+        *,
+        listing_images (*),
+        listing_videos (*),
+        listing_amenities (*)
+      `)
+      .eq('status', status)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch listings',
+        details: error.message
+      });
+    }
+
+    res.json({
+      success: true,
+      listings
+    });
+
+  } catch (error) {
+    console.error('Error fetching listings:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
