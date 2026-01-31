@@ -722,6 +722,7 @@ app.post('/api/listings', async (req, res) => {
       additionalImageUrls,
       videoUrl,
       hasVideo,
+      category, // Category number 1-11
       userId, // Should come from auth/session
     } = req.body;
 
@@ -745,14 +746,17 @@ app.post('/api/listings', async (req, res) => {
       });
     }
 
-    console.log('Creating listing with data:', {
+    console.log('📝 Creating listing with data:', {
       propertyType,
       area,
       rooms,
       floor,
       purpose,
       price,
-      hasVideo
+      hasVideo,
+      category: category || 1,
+      hasMainImage: !!mainImageUrl,
+      additionalImagesCount: additionalImageUrls?.length || 0
     });
 
     // Insert listing
@@ -772,6 +776,7 @@ app.post('/api/listings', async (req, res) => {
         description,
         display_option: displayOption,
         has_video: hasVideo || false,
+        category: category ? parseInt(category) : 1, // Default to category 1 if not provided, ensure it's an integer
         status: 'published',
       })
       .select()
@@ -810,6 +815,7 @@ app.post('/api/listings', async (req, res) => {
 
     // Insert main image
     if (mainImageUrl) {
+      console.log(`📸 Inserting main image for listing ${listing.id}:`, mainImageUrl);
       const { error: imageError } = await supabase
         .from('listing_images')
         .insert({
@@ -820,8 +826,12 @@ app.post('/api/listings', async (req, res) => {
         });
 
       if (imageError) {
-        console.error('Error inserting main image:', imageError);
+        console.error('❌ Error inserting main image:', imageError);
+      } else {
+        console.log('✅ Main image inserted successfully');
       }
+    } else {
+      console.warn('⚠️ No main image URL provided for listing', listing.id);
     }
 
     // Insert additional images
@@ -856,6 +866,13 @@ app.post('/api/listings', async (req, res) => {
       }
     }
 
+    console.log('✅ Listing created successfully:', {
+      id: listing.id,
+      category: listing.category,
+      status: listing.status,
+      hasMainImage: !!mainImageUrl
+    });
+
     res.json({
       success: true,
       id: listing.id,
@@ -875,12 +892,12 @@ app.post('/api/listings', async (req, res) => {
   }
 });
 
-// Get all listings
+// Get all listings (visible to all users)
 app.get('/api/listings', async (req, res) => {
   try {
-    const { status = 'published' } = req.query;
+    const { status = 'published', category } = req.query;
 
-    const { data: listings, error } = await supabase
+    let query = supabase
       .from('listings')
       .select(`
         *,
@@ -888,10 +905,24 @@ app.get('/api/listings', async (req, res) => {
         listing_videos (*),
         listing_amenities (*)
       `)
-      .eq('status', status)
+      .eq('status', status);
+    
+    // Filter by category if provided
+    // Only show listings with a valid category (not NULL)
+    if (category) {
+      const categoryNum = parseInt(category);
+      console.log(`🔍 Filtering listings by category: ${categoryNum}`);
+      query = query.eq('category', categoryNum);
+    }
+    
+    // Always exclude NULL categories - use isNotNull filter
+    query = query.not('category', 'is', null);
+
+    const { data: listings, error } = await query
       .order('created_at', { ascending: false });
 
     if (error) {
+      console.error('❌ Error fetching listings:', error);
       return res.status(500).json({
         success: false,
         error: 'Failed to fetch listings',
@@ -899,13 +930,85 @@ app.get('/api/listings', async (req, res) => {
       });
     }
 
+    // Filter out NULL categories manually (in case Supabase query didn't work)
+    let filteredListings = (listings || []).filter(listing => listing.category !== null && listing.category !== undefined);
+    
+    // If category filter was applied, double-check it
+    if (category) {
+      const categoryNum = parseInt(category);
+      filteredListings = filteredListings.filter(listing => parseInt(listing.category) === categoryNum);
+    }
+
+    console.log(`✅ Fetched ${filteredListings.length} listings (from ${listings?.length || 0} total)`);
+    if (filteredListings.length > 0) {
+      console.log('📋 Sample listing:', {
+        id: filteredListings[0].id,
+        category: filteredListings[0].category,
+        imagesCount: filteredListings[0].listing_images?.length || 0,
+        videosCount: filteredListings[0].listing_videos?.length || 0,
+        firstImageUrl: filteredListings[0].listing_images?.[0]?.image_url || 'none'
+      });
+    } else {
+      console.warn('⚠️ No listings found matching criteria');
+      if (listings && listings.length > 0) {
+        console.log('📋 All listings (before filtering):', listings.map(l => ({
+          id: l.id,
+          category: l.category,
+          imagesCount: l.listing_images?.length || 0
+        })));
+      }
+    }
+
     res.json({
       success: true,
-      listings
+      listings: filteredListings
     });
 
   } catch (error) {
     console.error('Error fetching listings:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Test endpoint to check if a specific listing exists
+app.get('/api/listings/test/:listingId', async (req, res) => {
+  try {
+    const { listingId } = req.params;
+    
+    const { data: listing, error } = await supabase
+      .from('listings')
+      .select(`
+        *,
+        listing_images (*),
+        listing_videos (*)
+      `)
+      .eq('id', listingId)
+      .single();
+    
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
+    
+    console.log('🔍 Test listing lookup:', {
+      id: listing?.id,
+      category: listing?.category,
+      status: listing?.status,
+      imagesCount: listing?.listing_images?.length || 0,
+      imageUrls: listing?.listing_images?.map(img => img.image_url) || []
+    });
+    
+    res.json({
+      success: true,
+      listing
+    });
+  } catch (error) {
+    console.error('Error in test endpoint:', error);
     res.status(500).json({
       success: false,
       error: error.message
