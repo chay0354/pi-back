@@ -724,26 +724,54 @@ app.post('/api/listings', async (req, res) => {
       hasVideo,
       category, // Category number 1-11
       userId, // Should come from auth/session
+      // Category 3 specific fields
+      searchPurpose,
+      preferredApartmentType,
+      preferredGender,
+      preferredAgeMin,
+      preferredAgeMax,
+      preferences,
+      budget,
     } = req.body;
 
-    // Validate required fields
-    if (!propertyType || !area || !rooms || !floor || !purpose || !price || !address || !phone || !description) {
-      console.error('Missing required fields:', {
-        propertyType: !!propertyType,
-        area: !!area,
-        rooms: !!rooms,
-        floor: !!floor,
-        purpose: !!purpose,
-        price: !!price,
-        address: !!address,
-        phone: !!phone,
-        description: !!description
-      });
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields',
-        received: req.body
-      });
+    const finalCategory = category ? parseInt(category) : 1;
+
+    // Validate required fields based on category
+    if (finalCategory === 3) {
+      // Category 3 validation
+      if (!searchPurpose || !preferredApartmentType || !budget || !description) {
+        console.error('Missing required fields for category 3:', {
+          searchPurpose: !!searchPurpose,
+          preferredApartmentType: !!preferredApartmentType,
+          budget: !!budget,
+          description: !!description
+        });
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required fields for category 3',
+          received: req.body
+        });
+      }
+    } else {
+      // Standard validation for other categories
+      if (!propertyType || !area || !rooms || !floor || !purpose || !price || !address || !phone || !description) {
+        console.error('Missing required fields:', {
+          propertyType: !!propertyType,
+          area: !!area,
+          rooms: !!rooms,
+          floor: !!floor,
+          purpose: !!purpose,
+          price: !!price,
+          address: !!address,
+          phone: !!phone,
+          description: !!description
+        });
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required fields',
+          received: req.body
+        });
+      }
     }
 
     console.log('📝 Creating listing with data:', {
@@ -754,31 +782,67 @@ app.post('/api/listings', async (req, res) => {
       purpose,
       price,
       hasVideo,
-      category: category || 1,
+      category: finalCategory,
+      categoryRaw: category,
       hasMainImage: !!mainImageUrl,
-      additionalImagesCount: additionalImageUrls?.length || 0
+      additionalImagesCount: additionalImageUrls?.length || 0,
+      // Category 3 fields
+      searchPurpose,
+      preferredApartmentType,
+      preferredGender,
+      preferredAgeMin,
+      preferredAgeMax,
+      preferences,
+      budget
     });
+    console.log('📂 [Backend] Saving listing with category:', finalCategory, '(parsed from:', category, ')');
+
+    // Prepare listing data based on category
+    const listingData = {
+      user_id: userId || null, // TODO: Get from auth session
+      category: finalCategory,
+      status: 'published',
+      description,
+      has_video: hasVideo || false,
+    };
+
+    if (finalCategory === 3) {
+      // Category 3 specific fields
+      listingData.search_purpose = searchPurpose;
+      listingData.preferred_apartment_type = preferredApartmentType;
+      listingData.preferred_gender = preferredGender || null;
+      listingData.preferred_age_min = preferredAgeMin || null;
+      listingData.preferred_age_max = preferredAgeMax || null;
+      listingData.preferences = preferences || {};
+      listingData.budget = parseFloat(budget) || 0;
+      listingData.price = parseFloat(budget) || 0; // Use budget as price
+      listingData.purpose = 'rent'; // Default for shared apartments
+      listingData.property_type = propertyType || 'office'; // Default
+      listingData.area = area || 1;
+      listingData.rooms = rooms || 1;
+      listingData.floor = floor || 1;
+      listingData.address = address || '';
+      listingData.phone = phone || '';
+      listingData.condition = condition || null;
+      listingData.display_option = displayOption || null;
+    } else {
+      // Standard fields for other categories
+      listingData.property_type = propertyType;
+      listingData.area = area;
+      listingData.rooms = rooms;
+      listingData.floor = floor;
+      listingData.condition = condition;
+      listingData.purpose = purpose;
+      listingData.price = parseFloat(price) || 0;
+      listingData.address = address;
+      listingData.phone = phone;
+      listingData.display_option = displayOption;
+    }
 
     // Insert listing
     const { data: listing, error: listingError } = await supabase
       .from('listings')
-      .insert({
-        user_id: userId || null, // TODO: Get from auth session
-        property_type: propertyType,
-        area,
-        rooms,
-        floor,
-        condition,
-        purpose,
-        price,
-        address,
-        phone,
-        description,
-        display_option: displayOption,
-        has_video: hasVideo || false,
-        category: category ? parseInt(category) : 1, // Default to category 1 if not provided, ensure it's an integer
-        status: 'published',
-      })
+      .insert(listingData)
       .select()
       .single();
 
