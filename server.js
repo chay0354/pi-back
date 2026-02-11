@@ -154,7 +154,7 @@ app.post('/api/subscription/submit', upload.fields([
         const profileFile = req.files.profilePicture[0];
         const fileName = `profile-${Date.now()}-${profileFile.originalname}`;
         const { data, error } = await supabase.storage
-          .from('user-uploads')
+          .from('user-pohto-video')
           .upload(`profiles/${fileName}`, profileFile.buffer, {
             contentType: profileFile.mimetype,
             upsert: false
@@ -162,7 +162,7 @@ app.post('/api/subscription/submit', upload.fields([
         
         if (!error && data) {
           const { data: urlData } = supabase.storage
-            .from('user-uploads')
+            .from('user-pohto-video')
             .getPublicUrl(`profiles/${fileName}`);
           fileUrls.profilePicture = urlData.publicUrl;
         }
@@ -174,7 +174,7 @@ app.post('/api/subscription/submit', upload.fields([
         for (const file of req.files.additionalImages) {
           const fileName = `additional-${Date.now()}-${file.originalname}`;
           const { data, error } = await supabase.storage
-            .from('user-uploads')
+            .from('user-pohto-video')
             .upload(`additional/${fileName}`, file.buffer, {
               contentType: file.mimetype,
               upsert: false
@@ -182,7 +182,7 @@ app.post('/api/subscription/submit', upload.fields([
           
           if (!error && data) {
             const { data: urlData } = supabase.storage
-              .from('user-uploads')
+              .from('user-pohto-video')
               .getPublicUrl(`additional/${fileName}`);
             fileUrls.additionalImages.push(urlData.publicUrl);
           }
@@ -194,7 +194,7 @@ app.post('/api/subscription/submit', upload.fields([
         const logoFile = req.files.companyLogo[0];
         const fileName = `logo-${Date.now()}-${logoFile.originalname}`;
         const { data, error } = await supabase.storage
-          .from('user-uploads')
+          .from('user-pohto-video')
           .upload(`logos/${fileName}`, logoFile.buffer, {
             contentType: logoFile.mimetype,
             upsert: false
@@ -202,7 +202,7 @@ app.post('/api/subscription/submit', upload.fields([
         
         if (!error && data) {
           const { data: urlData } = supabase.storage
-            .from('user-uploads')
+            .from('user-pohto-video')
             .getPublicUrl(`logos/${fileName}`);
           fileUrls.companyLogo = urlData.publicUrl;
         }
@@ -213,7 +213,7 @@ app.post('/api/subscription/submit', upload.fields([
         const videoFile = req.files.video[0];
         const fileName = `video-${Date.now()}-${videoFile.originalname}`;
         const { data, error } = await supabase.storage
-          .from('user-uploads')
+          .from('user-pohto-video')
           .upload(`videos/${fileName}`, videoFile.buffer, {
             contentType: videoFile.mimetype,
             upsert: false
@@ -221,7 +221,7 @@ app.post('/api/subscription/submit', upload.fields([
         
         if (!error && data) {
           const { data: urlData } = supabase.storage
-            .from('user-uploads')
+            .from('user-pohto-video')
             .getPublicUrl(`videos/${fileName}`);
           fileUrls.video = urlData.publicUrl;
         }
@@ -620,6 +620,199 @@ app.get('/api/user/current', async (req, res) => {
   }
 });
 
+// ==================== LISTINGS ENDPOINTS ====================
+
+// GET /api/listings - fetch published listings from unified ads table (optional filter by category)
+// Media (images/video) are stored in bucket user-photo-video; URLs are in ads row.
+app.get('/api/listings', async (req, res) => {
+  try {
+    const status = req.query.status || 'published';
+    const category = req.query.category ? parseInt(req.query.category, 10) : null;
+
+    let query = supabase
+      .from('ads')
+      .select('*')
+      .eq('status', status)
+      .order('created_at', { ascending: false });
+
+    if (category && !isNaN(category)) {
+      query = query.eq('category', category);
+    }
+
+    const { data: adsRows, error } = await query;
+
+    if (error) {
+      console.error('Error fetching listings:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch listings',
+        details: error.message
+      });
+    }
+
+    // Shape for frontend: add listing_images and listing_videos from unified media columns
+    const listings = (adsRows || []).map((row) => {
+      const listing_images = [];
+      if (row.main_image_url) {
+        listing_images.push({ image_url: row.main_image_url, image_type: 'main' });
+      }
+      const additional = Array.isArray(row.additional_image_urls) ? row.additional_image_urls : [];
+      additional.forEach((url) => {
+        if (url) listing_images.push({ image_url: url, image_type: 'additional' });
+      });
+      const listing_videos = row.video_url ? [{ video_url: row.video_url }] : [];
+      return { ...row, listing_images, listing_videos };
+    });
+
+    res.json({
+      success: true,
+      listings
+    });
+  } catch (error) {
+    console.error('Error in GET /api/listings:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// POST /api/listings - create a new ad in unified ads table (all fields; null for unused per user/category)
+// Media URLs reference files in storage bucket: user-photo-video
+app.post('/api/listings', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const {
+      category,
+      status = 'draft',
+      subscriptionId,
+      subscriptionType,
+      propertyType,
+      area,
+      rooms,
+      floor,
+      purpose,
+      price,
+      address,
+      phone,
+      description,
+      displayOption,
+      mainImageUrl,
+      additionalImageUrls = [],
+      videoUrl,
+      hasVideo,
+      amenities,
+      condition,
+      searchPurpose,
+      preferredApartmentType,
+      preferredGender,
+      preferredAgeMin,
+      preferredAgeMax,
+      preferences,
+      budget,
+      pricePerNight,
+      hospitalityNature,
+      serviceFacility,
+      accommodationOffers,
+      cancellationPolicy,
+      contactDetails,
+      proposedLand,
+      planApproval,
+      landInMortgage,
+      permit,
+      agriculturalLand,
+      landOwnership,
+      landAddress,
+      constructionStatus,
+      saleAtPresale,
+      generalDetails,
+      projectOffers,
+      companyOffersLandSizes,
+      salesImageUrl,
+      profileImageUrl
+    } = body;
+
+    const additionalUrls = Array.isArray(additionalImageUrls) ? additionalImageUrls : [];
+    const additionalImageUrlsJson = additionalUrls.filter(Boolean);
+
+    const adRecord = {
+      subscription_id: subscriptionId || null,
+      subscription_type: subscriptionType || null,
+      category: category != null ? parseInt(category, 10) : 1,
+      status: status === 'published' ? 'published' : 'draft',
+      main_image_url: mainImageUrl || null,
+      additional_image_urls: additionalImageUrlsJson.length ? additionalImageUrlsJson : [],
+      video_url: videoUrl || null,
+      sales_image_url: salesImageUrl || null,
+      profile_image_url: profileImageUrl || null,
+      display_option: displayOption || null,
+      property_type: propertyType || null,
+      area: area != null ? parseInt(area, 10) : null,
+      rooms: rooms != null ? parseInt(rooms, 10) : null,
+      floor: floor != null ? parseInt(floor, 10) : null,
+      purpose: purpose || 'sale',
+      price: price != null ? parseFloat(price) : null,
+      budget: budget != null ? parseFloat(budget) : null,
+      price_per_night: pricePerNight != null ? parseFloat(pricePerNight) : null,
+      amenities: amenities && typeof amenities === 'object' ? amenities : null,
+      condition: condition || null,
+      address: address || null,
+      phone: phone || null,
+      description: description || null,
+      search_purpose: searchPurpose || null,
+      preferred_apartment_type: preferredApartmentType || null,
+      preferred_gender: preferredGender || null,
+      preferred_age_min: preferredAgeMin != null ? parseInt(preferredAgeMin, 10) : null,
+      preferred_age_max: preferredAgeMax != null ? parseInt(preferredAgeMax, 10) : null,
+      preferences: preferences && typeof preferences === 'object' ? preferences : null,
+      hospitality_nature: hospitalityNature || null,
+      service_facility: serviceFacility && typeof serviceFacility === 'object' ? serviceFacility : null,
+      accommodation_offers: accommodationOffers && typeof accommodationOffers === 'object' ? accommodationOffers : null,
+      cancellation_policy: cancellationPolicy || null,
+      contact_details: contactDetails && typeof contactDetails === 'object' ? contactDetails : null,
+      proposed_land: proposedLand && typeof proposedLand === 'object' ? proposedLand : null,
+      plan_approval: planApproval || null,
+      land_in_mortgage: landInMortgage || null,
+      permit: permit || null,
+      agricultural_land: agriculturalLand || null,
+      land_ownership: landOwnership || null,
+      land_address: landAddress || null,
+      construction_status: constructionStatus || null,
+      sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
+      general_details: generalDetails && typeof generalDetails === 'object' ? generalDetails : null,
+      project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,
+      company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null
+    };
+
+    const { data: ad, error: insertError } = await supabase
+      .from('ads')
+      .insert([adRecord])
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Error creating ad:', insertError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create listing',
+        details: insertError.message
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      id: ad.id,
+      listing: ad
+    });
+  } catch (error) {
+    console.error('Error in POST /api/listings:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ==================== FILE UPLOAD ENDPOINTS ====================
 
 // Upload file to Supabase Storage
@@ -628,21 +821,32 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
-        error: 'No file provided' 
+        error: 'No file provided. Ensure the form field is named "file".' 
       });
     }
 
-    const { folder = 'general' } = req.body;
-    const fileName = `${folder}/${Date.now()}-${req.file.originalname}`;
+    // Service role key is required for storage uploads; anon key will fail with RLS
+    if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
+      console.error('Upload failed: SUPABASE_SERVICE_ROLE_KEY is missing or still a placeholder.');
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Server upload not configured. Set SUPABASE_SERVICE_ROLE_KEY in the backend .env (Supabase Dashboard > Settings > API > service_role secret).' 
+      });
+    }
+
+    const folder = (req.body && req.body.folder) ? String(req.body.folder).replace(/[^a-zA-Z0-9/_-]/g, '') : 'general';
+    const safeName = (req.file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const fileName = `${folder}/${Date.now()}-${safeName}`;
 
     const { data, error } = await supabase.storage
-      .from('user-uploads')
+      .from('user-pohto-video')
       .upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype,
+        contentType: req.file.mimetype || 'application/octet-stream',
         upsert: false
       });
 
     if (error) {
+      console.error('Supabase storage upload error:', error);
       return res.status(500).json({ 
         success: false, 
         error: 'Failed to upload file',
@@ -651,7 +855,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     }
 
     const { data: urlData } = supabase.storage
-      .from('user-uploads')
+      .from('user-pohto-video')
       .getPublicUrl(fileName);
 
     res.json({
