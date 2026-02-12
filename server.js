@@ -735,8 +735,15 @@ app.post('/api/listings', async (req, res) => {
     const additionalUrls = Array.isArray(additionalImageUrls) ? additionalImageUrls : [];
     const additionalImageUrlsJson = additionalUrls.filter(Boolean);
 
+    // subscription_id must be a valid UUID; client may send "user-123" style ids
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const validSubscriptionId =
+      subscriptionId && typeof subscriptionId === 'string' && uuidRegex.test(subscriptionId.trim())
+        ? subscriptionId.trim()
+        : null;
+
     const adRecord = {
-      subscription_id: subscriptionId || null,
+      subscription_id: validSubscriptionId,
       subscription_type: subscriptionType || null,
       category: category != null ? parseInt(category, 10) : 1,
       status: status === 'published' ? 'published' : 'draft',
