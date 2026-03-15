@@ -13,19 +13,28 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Initialize Supabase client
+// Initialize Supabase client with longer timeout to reduce ConnectTimeoutError (e.g. 30s)
+const FETCH_TIMEOUT_MS = Number(process.env.SUPABASE_FETCH_TIMEOUT_MS) || 30000;
+const customFetch = (url, options = {}) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(url, { ...options, signal: options.signal || controller.signal })
+    .finally(() => clearTimeout(timeoutId));
+};
+
 const supabaseUrl = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL;
-let supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Support correct name and common typo (SUPABASE_SERVICCE_ROLE_KEY)
+let supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICCE_ROLE_KEY;
 
 // Check if service role key is set and not a placeholder
 if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
   console.warn('⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY not set or is a placeholder.');
   console.warn('⚠️  Using anon key as fallback. Some operations may fail.');
-  console.warn('⚠️  Please get your service_role key from Supabase Dashboard > Settings > API');
+  console.warn('⚠️  Please set service_role key in .env from Supabase Dashboard > Settings > API');
   supabaseKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey, { global: { fetch: customFetch } });
 
 // Initialize Resend for email sending (optional - can use other services)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -116,7 +125,8 @@ app.post('/api/subscription/submit', upload.fields([
       types, // Array of selected types (for professional)
       specializations, // Array of selected specializations (for professional)
       activityRegions, // Array of selected regions (for broker)
-      agreedToTerms
+      agreedToTerms,
+      profile_picture_url // Optional: URL from stage-1 upload (profile-pics bucket)
     } = req.body;
 
     // Validate required fields based on subscription type
@@ -145,26 +155,31 @@ app.post('/api/subscription/submit', upload.fields([
       }
     }
 
-    // Upload files to Supabase Storage
+    // Upload files to Supabase Storage (or use profile_picture_url if already uploaded at stage 1)
     const fileUrls = {};
-    
+    if (profile_picture_url && typeof profile_picture_url === 'string' && profile_picture_url.trim()) {
+      fileUrls.profilePicture = profile_picture_url.trim();
+    }
     if (req.files) {
-      // Upload profile picture
-      if (req.files.profilePicture && req.files.profilePicture[0]) {
+      // Upload profile picture only if not already provided (e.g. uploaded when moving stage 1 → 2)
+      if (!fileUrls.profilePicture && req.files.profilePicture && req.files.profilePicture[0]) {
         const profileFile = req.files.profilePicture[0];
-        const fileName = `profile-${Date.now()}-${profileFile.originalname}`;
+        const safeName = (profileFile.originalname || 'photo').replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^_+|_+$/g, '') || 'photo';
+        const ext = safeName.includes('.') ? safeName.slice(safeName.lastIndexOf('.')) : '.jpg';
+        const fileName = `profile-${Date.now()}${ext}`;
         const { data, error } = await supabase.storage
-          .from('user-pohto-video')
-          .upload(`profiles/${fileName}`, profileFile.buffer, {
+          .from('profile-pics')
+          .upload(fileName, profileFile.buffer, {
             contentType: profileFile.mimetype,
             upsert: false
           });
-        
         if (!error && data) {
           const { data: urlData } = supabase.storage
-            .from('user-pohto-video')
-            .getPublicUrl(`profiles/${fileName}`);
+            .from('profile-pics')
+            .getPublicUrl(fileName);
           fileUrls.profilePicture = urlData.publicUrl;
+        } else if (error) {
+          console.error('Profile picture upload to profile-pics failed:', error.message, '- Ensure bucket "profile-pics" exists in Supabase Storage.');
         }
       }
 
@@ -622,12 +637,159 @@ app.get('/api/user/current', async (req, res) => {
 
 // ==================== LISTINGS ENDPOINTS ====================
 
-// GET /api/listings - fetch published listings from unified ads table (optional filter by category)
+// Build preference profile from ads the user liked (price, location, category, purpose, rooms, area)
+function buildPreferenceFromLikedAds(likedAdsRows) {
+  if (!likedAdsRows || likedAdsRows.length === 0) return null;
+  const prices = likedAdsRows.map(r => r.price).filter(p => p != null && !isNaN(Number(p)));
+  const categories = likedAdsRows.map(r => r.category).filter(c => c != null);
+  const purposes = likedAdsRows.map(r => r.purpose).filter(p => p != null && String(p).trim());
+  const rooms = likedAdsRows.map(r => r.rooms).filter(r => r != null && !isNaN(Number(r)));
+  const areas = likedAdsRows.map(r => r.area).filter(a => a != null && !isNaN(Number(a)));
+  const addresses = likedAdsRows.map(r => (r.address || '').trim()).filter(Boolean);
+
+  const freq = (arr) => {
+    const m = {};
+    arr.forEach((x) => { m[x] = (m[x] || 0) + 1; });
+    return Object.entries(m).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ value: k, count: v }));
+  };
+  const median = (arr) => {
+    if (arr.length === 0) return null;
+    const s = [...arr].sort((a, b) => Number(a) - Number(b));
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? Number(s[mid]) : (Number(s[mid - 1]) + Number(s[mid])) / 2;
+  };
+
+  const priceMin = prices.length ? Math.min(...prices) : null;
+  const priceMax = prices.length ? Math.max(...prices) : null;
+  const priceMedian = median(prices);
+  const categoryFreq = freq(categories);
+  const purposeFreq = freq(purposes);
+  const roomsMedian = median(rooms);
+  const areaMedian = median(areas);
+  const locationWords = new Set();
+  addresses.forEach((addr) => {
+    String(addr).split(/\s+|,|;/).forEach((w) => {
+      const t = w.trim().replace(/[^\w\u0590-\u05FF]/g, '');
+      if (t.length >= 2) locationWords.add(t.toLowerCase());
+    });
+  });
+
+  return {
+    priceMin,
+    priceMax,
+    priceMedian,
+    categoryFreq,
+    purposeFreq,
+    roomsMedian,
+    areaMedian,
+    locationWords,
+    likedCount: likedAdsRows.length,
+  };
+}
+
+// Score one ad against preference profile (0..1). Higher = better match.
+function scoreAdMatch(ad, pref) {
+  if (!pref || pref.likedCount === 0) return 0.5;
+  let score = 0;
+  let weightSum = 0;
+
+  const adPrice = ad.price != null ? Number(ad.price) : null;
+  if (pref.priceMin != null && pref.priceMax != null && adPrice != null) {
+    const range = pref.priceMax - pref.priceMin || 1;
+    const dist = Math.min(Math.abs(adPrice - pref.priceMedian) / range, 1);
+    score += (1 - dist) * 0.3;
+    weightSum += 0.3;
+  } else weightSum += 0.3;
+
+  if (pref.categoryFreq.length > 0 && ad.category != null) {
+    const top = pref.categoryFreq[0].value;
+    const match = Number(ad.category) === Number(top) ? 1 : (pref.categoryFreq.some(c => Number(c.value) === Number(ad.category)) ? 0.5 : 0.1);
+    score += match * 0.25;
+    weightSum += 0.25;
+  } else weightSum += 0.25;
+
+  if (pref.purposeFreq.length > 0 && ad.purpose) {
+    const top = pref.purposeFreq[0].value;
+    const match = String(ad.purpose).toLowerCase() === String(top).toLowerCase() ? 1 : (pref.purposeFreq.some(p => String(p.value).toLowerCase() === String(ad.purpose).toLowerCase()) ? 0.5 : 0.1);
+    score += match * 0.2;
+    weightSum += 0.2;
+  } else weightSum += 0.2;
+
+  if (pref.locationWords.size > 0 && ad.address) {
+    const adWords = String(ad.address).split(/\s+|,|;/).map(w => w.trim().replace(/[^\w\u0590-\u05FF]/g, '').toLowerCase()).filter(w => w.length >= 2);
+    const overlap = adWords.filter(w => pref.locationWords.has(w)).length;
+    const locationMatch = adWords.length ? Math.min(1, overlap / Math.max(adWords.length, 1) + 0.3) : 0.3;
+    score += locationMatch * 0.15;
+    weightSum += 0.15;
+  } else weightSum += 0.15;
+
+  if (pref.roomsMedian != null && ad.rooms != null) {
+    const r = Number(ad.rooms);
+    const diff = Math.abs(r - pref.roomsMedian);
+    score += Math.max(0, 1 - diff / 4) * 0.1;
+    weightSum += 0.1;
+  } else weightSum += 0.1;
+
+  if (pref.areaMedian != null && ad.area != null) {
+    const a = Number(ad.area);
+    const range = Math.max(pref.areaMedian * 0.5, 1);
+    const diff = Math.min(Math.abs(a - pref.areaMedian) / range, 1);
+    score += (1 - diff) * 0.05;
+    weightSum += 0.05;
+  } else weightSum += 0.05;
+
+  return weightSum > 0 ? Math.min(1, score / (weightSum * 0.8)) : 0.5;
+}
+
+// Exposure multiplier: low = fewer impressions, medium = default, high = more
+const EXPOSURE_MULTIPLIER = { low: 0.5, medium: 1, high: 1.5 };
+
+// Sort listings by smart feed: preference match × exposure level (only when user_id provided and not owner view)
+function sortListingsByFeedAlgorithm(adsRows, userIdParam, supabaseClient) {
+  if (!adsRows || adsRows.length === 0 || !userIdParam) return Promise.resolve(adsRows);
+  return (async () => {
+    const { data: likesRows } = await supabaseClient.from('ad_likes').select('ad_id').eq('user_id', userIdParam);
+    const likedAdIds = (likesRows || []).map(r => r.ad_id).filter(Boolean);
+    if (likedAdIds.length === 0) {
+      const withExp = adsRows.map((row) => {
+        const lvl = (row.exposure_level || 'medium').toLowerCase();
+        const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
+        return { row, score: mult };
+      });
+      withExp.sort((a, b) => b.score - a.score);
+      return withExp.map(x => x.row);
+    }
+    const { data: likedAdsRows } = await supabaseClient.from('ads').select('id, price, category, purpose, rooms, area, address').in('id', likedAdIds);
+    const pref = buildPreferenceFromLikedAds(likedAdsRows || []);
+
+    const withScore = adsRows.map((row) => {
+      const matchScore = scoreAdMatch(row, pref);
+      const lvl = (row.exposure_level || 'medium').toLowerCase();
+      const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
+      const finalScore = matchScore * mult;
+      return { row, finalScore };
+    });
+    withScore.sort((a, b) => b.finalScore - a.finalScore);
+    return withScore.map(x => x.row);
+  })();
+}
+
+// GET /api/listings - fetch published listings from unified ads table (optional filter by category, subscription_type, has_video)
+// Optional query: user_id - if provided, each listing gets liked: true/false and feed is sorted by smart algorithm (preferences from likes + exposure level).
 // Media (images/video) are stored in bucket user-photo-video; URLs are in ads row.
 app.get('/api/listings', async (req, res) => {
   try {
     const status = req.query.status || 'published';
     const category = req.query.category ? parseInt(req.query.category, 10) : null;
+    const subscriptionTypeParam = typeof req.query.subscription_type === 'string' ? req.query.subscription_type.trim() : null;
+    const hasVideo = req.query.has_video === 'true' || req.query.has_video === true;
+    const subscriptionIdParam = typeof req.query.subscription_id === 'string' ? req.query.subscription_id.trim() : null;
+    const userIdParam = typeof req.query.user_id === 'string' ? req.query.user_id.trim() : null;
+
+    const allowedSubscriptionTypes = ['user', 'broker', 'company', 'professional'];
+    const subscriptionTypes = subscriptionTypeParam
+      ? subscriptionTypeParam.split(',').map(s => s.trim()).filter(s => allowedSubscriptionTypes.includes(s))
+      : [];
 
     let query = supabase
       .from('ads')
@@ -638,8 +800,57 @@ app.get('/api/listings', async (req, res) => {
     if (category && !isNaN(category)) {
       query = query.eq('category', category);
     }
+    if (subscriptionTypes.length === 1) {
+      query = query.eq('subscription_type', subscriptionTypes[0]);
+    } else if (subscriptionTypes.length > 1) {
+      query = query.in('subscription_type', subscriptionTypes);
+    }
+    if (hasVideo) {
+      query = query.not('video_url', 'is', null);
+    }
+    // subscription_id param = "owner view" (Edit/Publish Ad): show that owner's ads including frozen
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const validSubscriptionId = subscriptionIdParam && uuidRegex.test(subscriptionIdParam) ? subscriptionIdParam : null;
+    const isOwnerView = subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
+    if (isOwnerView) {
+      if (validSubscriptionId) {
+        query = query.eq('subscription_id', validSubscriptionId);
+      } else {
+        query = query.eq('owner_id', subscriptionIdParam.trim());
+      }
+      // Owner view: do not filter by is_frozen so frozen ads still appear in "my listings"
+    } else {
+      // Public feed: exclude frozen ads
+      query = query.or('is_frozen.is.null,is_frozen.eq.false');
+    }
 
-    const { data: adsRows, error } = await query;
+    let result = await query;
+    let { data: adsRows, error } = result;
+
+    // If column doesn't exist or not in schema cache (is_frozen), retry without that filter
+    const isFrozenColumnError = error && (
+      error.code === '42703' ||
+      error.code === 'PGRST204' ||
+      (error.message && String(error.message).includes('is_frozen'))
+    );
+    if (isFrozenColumnError) {
+      let fallbackQuery = supabase
+        .from('ads')
+        .select('*')
+        .eq('status', status)
+        .order('created_at', { ascending: false });
+      if (category && !isNaN(category)) fallbackQuery = fallbackQuery.eq('category', category);
+      if (subscriptionTypes.length === 1) fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
+      else if (subscriptionTypes.length > 1) fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
+      if (hasVideo) fallbackQuery = fallbackQuery.not('video_url', 'is', null);
+      if (isOwnerView) {
+        if (validSubscriptionId) fallbackQuery = fallbackQuery.eq('subscription_id', validSubscriptionId);
+        else fallbackQuery = fallbackQuery.eq('owner_id', subscriptionIdParam.trim());
+      }
+      result = await fallbackQuery;
+      adsRows = result.data;
+      error = result.error;
+    }
 
     if (error) {
       console.error('Error fetching listings:', error);
@@ -650,8 +861,99 @@ app.get('/api/listings', async (req, res) => {
       });
     }
 
-    // Shape for frontend: add listing_images and listing_videos from unified media columns
+    // Smart feed: when user_id provided and not owner view, sort by preference match (from liked ads) × exposure level
+    if (userIdParam && !isOwnerView && adsRows && adsRows.length > 0) {
+      try {
+        adsRows = await sortListingsByFeedAlgorithm(adsRows, userIdParam, supabase);
+      } catch (err) {
+        console.warn('Feed algorithm sort failed, using default order:', err.message);
+      }
+    }
+
+    // Optionally get liked ad ids for this user (view_count/like_count are on row; ensure they exist)
+    let likedAdIds = new Set();
+    if (userIdParam && adsRows && adsRows.length > 0) {
+      try {
+        const adIds = adsRows.map(r => r.id).filter(Boolean);
+        const { data: likesRows } = await supabase
+          .from('ad_likes')
+          .select('ad_id')
+          .eq('user_id', userIdParam)
+          .in('ad_id', adIds);
+        if (likesRows && likesRows.length) {
+          likesRows.forEach(r => { if (r.ad_id) likedAdIds.add(r.ad_id); });
+        }
+      } catch (_) { /* ad_likes table may not exist yet */ }
+    }
+
+    // Fetch creator (uploader) info from subscriptions for profile/chat display name
+    const creatorBySubId = {};
+    const subIds = [...new Set((adsRows || []).map(r => r.subscription_id).filter(Boolean))];
+    if (subIds.length > 0) {
+      try {
+        const { data: subs } = await supabase
+          .from('subscriptions')
+          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url')
+          .in('id', subIds);
+        if (subs && subs.length) {
+          subs.forEach(s => {
+            // Display name by registration type (subscriptions has no agent_name column; broker agent is in "name")
+            let displayName = null;
+            const type = (s.subscription_type || '').toLowerCase();
+            if (type === 'company') {
+              displayName = s.business_name || s.name || s.contact_person_name || null;
+            } else if (type === 'broker') {
+              displayName = s.broker_office_name || s.name || s.contact_person_name || null;
+            } else {
+              displayName = s.name || s.business_name || s.contact_person_name || null;
+            }
+            creatorBySubId[s.id] = {
+              creator_email: s.email || null,
+              creator_name: displayName || null,
+              creator_profile_image_url: s.profile_picture_url || null
+            };
+          });
+        }
+      } catch (_) {
+        try {
+          const { data: subs } = await supabase
+            .from('subscriptions')
+            .select('id, email, name, contact_person_name')
+            .in('id', subIds);
+          if (subs && subs.length) {
+            subs.forEach(s => {
+              const name = s.name || s.contact_person_name || null;
+              creatorBySubId[s.id] = { creator_email: s.email || null, creator_name: name || null };
+            });
+          }
+        } catch (_) { /* ignore */ }
+      }
+      // Regular users (e.g. user-xxx) are not in subscriptions; use chat_participants for creator name/pic
+      const missingSubIds = subIds.filter((id) => !creatorBySubId[id]);
+      if (missingSubIds.length > 0) {
+        try {
+          const { data: participantRows } = await supabase
+            .from('chat_participants')
+            .select('user_id, display_name, profile_picture_url')
+            .in('user_id', missingSubIds);
+          const byUser = {};
+          (participantRows || []).forEach((p) => {
+            if (p.user_id && !byUser[p.user_id] && (p.display_name || p.profile_picture_url)) {
+              byUser[p.user_id] = {
+                creator_email: null,
+                creator_name: p.display_name || null,
+                creator_profile_image_url: p.profile_picture_url || null,
+              };
+            }
+          });
+          Object.assign(creatorBySubId, byUser);
+        } catch (_) { /* ignore */ }
+      }
+    }
+
+    // Shape for frontend: add listing_images, listing_videos, view_count, like_count, liked, creator_*
     const listings = (adsRows || []).map((row) => {
+      const creator = (row.subscription_id && creatorBySubId[row.subscription_id]) ? creatorBySubId[row.subscription_id] : {};
       const listing_images = [];
       if (row.main_image_url) {
         listing_images.push({ image_url: row.main_image_url, image_type: 'main' });
@@ -661,7 +963,18 @@ app.get('/api/listings', async (req, res) => {
         if (url) listing_images.push({ image_url: url, image_type: 'additional' });
       });
       const listing_videos = row.video_url ? [{ video_url: row.video_url }] : [];
-      return { ...row, listing_images, listing_videos };
+      return {
+        ...row,
+        view_count: row.view_count != null ? Number(row.view_count) : 0,
+        like_count: row.like_count != null ? Number(row.like_count) : 0,
+        liked: userIdParam ? likedAdIds.has(row.id) : undefined,
+        listing_images,
+        listing_videos,
+        is_frozen: row.is_frozen === true || row.is_frozen === 't',
+        creator_name: creator.creator_name || null,
+        creator_email: creator.creator_email || null,
+        creator_profile_image_url: creator.creator_profile_image_url || null
+      };
     });
 
     res.json({
@@ -670,14 +983,386 @@ app.get('/api/listings', async (req, res) => {
     });
   } catch (error) {
     console.error('Error in GET /api/listings:', error);
+    const isNetworkError =
+      error.message === 'fetch failed' ||
+      (error.cause && typeof error.cause.message === 'string') ||
+      (error.message && String(error.message).includes('fetch failed')) ||
+      (error.code && ['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ETIMEDOUT'].includes(error.code));
+    if (isNetworkError) {
+      // Return empty listings so the app can load instead of showing a hard error
+      console.warn('Supabase unreachable; returning empty listings.');
+      return res.status(200).json({
+        success: true,
+        listings: [],
+        offline: true,
+        message: 'Could not reach database. Showing empty feed.'
+      });
+    }
+    const message = error.message || 'Failed to fetch listings';
     res.status(500).json({
       success: false,
-      error: error.message
+      error: message,
+      details: error.cause?.message || error.message
     });
   }
 });
 
-// POST /api/listings - create a new ad in unified ads table (all fields; null for unused per user/category)
+// ==================== CHAT ENDPOINTS ====================
+// Simple email-based chat: users identified by email (chat_participants.user_id and chat_messages.sender_id/receiver_id store normalized email).
+
+function normEmail(email) {
+  return (email != null ? String(email).trim().toLowerCase() : '') || '';
+}
+
+// GET /api/chat/unread-count?user_email=...&after=:iso_timestamp
+app.get('/api/chat/unread-count', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.query.user_email);
+    if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
+    const after = (req.query.after && String(req.query.after).trim()) || null;
+    let query = supabase.from('chat_messages').select('id', { count: 'exact', head: true }).eq('receiver_id', userEmail);
+    if (after) query = query.gt('created_at', after);
+    const { count, error } = await query;
+    if (error) {
+      console.error('GET /api/chat/unread-count:', error.message);
+      return res.json({ success: true, count: 0 });
+    }
+    res.json({ success: true, count: typeof count === 'number' ? count : 0 });
+  } catch (err) {
+    console.error('GET /api/chat/unread-count:', err);
+    res.json({ success: true, count: 0 });
+  }
+});
+
+// GET /api/chat/conversations?user_email=...
+app.get('/api/chat/conversations', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.query.user_email);
+    if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
+
+    const { data: myParts } = await supabase
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', userEmail);
+    const convIds = [...new Set((myParts || []).map(p => p.conversation_id))];
+    if (convIds.length === 0) return res.json({ success: true, conversations: [] });
+
+    const { data: allParticipants } = await supabase
+      .from('chat_participants')
+      .select('conversation_id, user_id, display_name, profile_picture_url')
+      .in('conversation_id', convIds);
+    const participantsByConv = {};
+    (allParticipants || []).forEach(p => {
+      if (!participantsByConv[p.conversation_id]) participantsByConv[p.conversation_id] = [];
+      participantsByConv[p.conversation_id].push(p);
+    });
+
+    const { data: convs } = await supabase
+      .from('chat_conversations')
+      .select('id, last_message_at')
+      .in('id', convIds)
+      .order('last_message_at', { ascending: false, nullsFirst: false });
+
+    const { data: lastMessages } = await supabase
+      .from('chat_messages')
+      .select('conversation_id, body, created_at, sender_id')
+      .in('conversation_id', convIds);
+    const lastByConv = {};
+    (lastMessages || []).forEach(m => {
+      if (!lastByConv[m.conversation_id] || new Date(m.created_at) > new Date(lastByConv[m.conversation_id].created_at)) {
+        lastByConv[m.conversation_id] = m;
+      }
+    });
+
+    const otherEmails = [...new Set(
+      (convs || []).flatMap(c => (participantsByConv[c.id] || []).map(p => p.user_id).filter(e => normEmail(e) !== userEmail))
+    )];
+    let displayByEmail = {};
+    if (otherEmails.length > 0) {
+      const orFilter = otherEmails.map(e => `email.ilike.${e}`).join(',');
+      const { data: subs } = await supabase.from('subscriptions').select('email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url').or(orFilter);
+      (subs || []).forEach(s => {
+        const e = normEmail(s.email);
+        if (!otherEmails.includes(e)) return;
+        const type = (s.subscription_type || '').toLowerCase();
+        let name = null;
+        if (type === 'company') name = s.business_name || s.name || s.contact_person_name || null;
+        else if (type === 'broker') name = s.broker_office_name || s.name || s.contact_person_name || null;
+        else if (type === 'professional') name = s.name || s.business_name || s.contact_person_name || null;
+        else name = s.name || s.contact_person_name || s.business_name || null;
+        displayByEmail[e] = { name: name || null, profile_picture_url: s.profile_picture_url || (type === 'company' ? s.company_logo_url : null) || null };
+      });
+      (allParticipants || []).forEach(p => {
+        const e = normEmail(p.user_id);
+        if (!displayByEmail[e] && (p.display_name || p.profile_picture_url)) {
+          displayByEmail[e] = { name: p.display_name || null, profile_picture_url: p.profile_picture_url || null };
+        }
+      });
+    }
+
+    const conversations = (convs || []).map(c => {
+      const participants = participantsByConv[c.id] || [];
+      const other = participants.find(p => normEmail(p.user_id) !== userEmail);
+      const otherEmail = other ? normEmail(other.user_id) : null;
+      const display = otherEmail ? displayByEmail[otherEmail] : {};
+      const name = display?.name || (other && other.display_name) || 'משתמש';
+      const profileImageUrl = display?.profile_picture_url || (other && other.profile_picture_url) || null;
+      const last = lastByConv[c.id];
+      return {
+        id: c.id,
+        otherUserEmail: otherEmail,
+        name,
+        profileImageUrl,
+        preview: last ? (last.body || '').slice(0, 80) : '',
+        time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
+        lastMessageAt: c.last_message_at,
+      };
+    });
+
+    const byOther = {};
+    conversations.forEach(conv => {
+      const oid = conv.otherUserEmail || conv.id;
+      const existing = byOther[oid];
+      if (!existing || (conv.lastMessageAt && (!existing.lastMessageAt || new Date(conv.lastMessageAt) > new Date(existing.lastMessageAt)))) {
+        byOther[oid] = conv;
+      }
+    });
+    res.json({ success: true, conversations: Object.values(byOther) });
+  } catch (err) {
+    console.error('GET /api/chat/conversations:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/chat/participant-display?user_email=...
+app.get('/api/chat/participant-display', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.query.user_email);
+    if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
+
+    const { data: participantRows } = await supabase
+      .from('chat_participants')
+      .select('display_name, profile_picture_url')
+      .eq('user_id', userEmail)
+      .limit(1);
+    const row = participantRows && participantRows[0];
+    if (row && (row.display_name || row.profile_picture_url)) {
+      return res.json({ success: true, name: row.display_name || null, profileImageUrl: row.profile_picture_url || null });
+    }
+
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url')
+      .ilike('email', userEmail)
+      .maybeSingle();
+    if (sub) {
+      const type = (sub.subscription_type || '').toLowerCase();
+      let displayName = null;
+      if (type === 'company') displayName = sub.business_name || sub.name || sub.contact_person_name || null;
+      else if (type === 'broker') displayName = sub.broker_office_name || sub.name || sub.contact_person_name || null;
+      else if (type === 'professional') displayName = sub.name || sub.business_name || sub.contact_person_name || null;
+      else displayName = sub.name || sub.contact_person_name || sub.business_name || null;
+      const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+      return res.json({ success: true, name: displayName || null, profileImageUrl: profilePic || null });
+    }
+    res.json({ success: true, name: null, profileImageUrl: null });
+  } catch (err) {
+    console.error('GET /api/chat/participant-display:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/chat/messages?user_email=...&other_user_email=...
+app.get('/api/chat/messages', async (req, res) => {
+  try {
+    const myEmail = normEmail(req.query.user_email);
+    const otherEmail = normEmail(req.query.other_user_email);
+    if (!myEmail || !otherEmail) return res.status(400).json({ success: false, error: 'user_email and other_user_email required' });
+
+    const { data: myParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail);
+    const { data: otherParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', otherEmail);
+    const myConvIds = new Set((myParts || []).map(p => p.conversation_id));
+    let sharedConvId = (otherParts || []).find(p => myConvIds.has(p.conversation_id))?.conversation_id || null;
+
+    if (!sharedConvId && (otherParts || []).length > 0) {
+      const convId = (otherParts || [])[0].conversation_id;
+      const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
+      if ((parts || []).length === 1) {
+        await supabase.from('chat_participants').insert({ conversation_id: convId, user_id: myEmail });
+        sharedConvId = convId;
+      }
+    }
+
+    if (!sharedConvId) return res.json({ success: true, messages: [] });
+
+    const { data: messages } = await supabase
+      .from('chat_messages')
+      .select('id, sender_id, body, created_at')
+      .eq('conversation_id', sharedConvId)
+      .order('created_at', { ascending: true });
+
+    const list = (messages || []).map(m => {
+      const isMe = normEmail(m.sender_id) === myEmail;
+      return {
+        id: m.id,
+        senderId: m.sender_id,
+        body: m.body,
+        createdAt: m.created_at,
+        isMe,
+      };
+    });
+    res.json({ success: true, messages: list, conversation_id: sharedConvId });
+  } catch (err) {
+    console.error('GET /api/chat/messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/messages - body: sender_email, receiver_email, body; optional display names/pics
+app.post('/api/chat/messages', async (req, res) => {
+  try {
+    const senderEmail = normEmail(req.body.sender_email || req.query.sender_email);
+    const receiverEmail = normEmail(req.body.receiver_email || req.query.receiver_email);
+    const body = req.body.body != null ? String(req.body.body).trim() : null;
+    const receiverDisplayName = req.body.receiver_display_name != null ? String(req.body.receiver_display_name).trim() || null : null;
+    const receiverProfilePictureUrl = req.body.receiver_profile_picture_url != null ? String(req.body.receiver_profile_picture_url).trim() || null : null;
+    const senderDisplayName = req.body.sender_display_name != null ? String(req.body.sender_display_name).trim() || null : null;
+    const senderProfilePictureUrl = req.body.sender_profile_picture_url != null ? String(req.body.sender_profile_picture_url).trim() || null : null;
+
+    if (!senderEmail || !receiverEmail || body === null || body === '') {
+      return res.status(400).json({ success: false, error: 'sender_email, receiver_email, and body required' });
+    }
+
+    let convId = null;
+    const { data: senderConvs } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', senderEmail);
+    const senderConvIds = (senderConvs || []).map(p => p.conversation_id);
+    if (senderConvIds.length > 0) {
+      const { data: otherIn } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', receiverEmail).in('conversation_id', senderConvIds);
+      for (const r of otherIn || []) {
+        const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', r.conversation_id);
+        const emails = (parts || []).map(p => normEmail(p.user_id));
+        if (emails.length === 2 && emails.includes(senderEmail) && emails.includes(receiverEmail)) {
+          convId = r.conversation_id;
+          break;
+        }
+      }
+    }
+    if (!convId) {
+      const { data: newConv, error: newConvErr } = await supabase.from('chat_conversations').insert({ type: 'direct' }).select('id').single();
+      if (newConvErr || !newConv?.id) return res.status(500).json({ success: false, error: 'Failed to create conversation' });
+      convId = newConv.id;
+      const { error: insertErr } = await supabase.from('chat_participants').insert([
+        { conversation_id: convId, user_id: senderEmail },
+        { conversation_id: convId, user_id: receiverEmail },
+      ]);
+      if (insertErr) return res.status(500).json({ success: false, error: insertErr.message });
+      if (receiverDisplayName != null || receiverProfilePictureUrl != null) {
+        const u = {};
+        if (receiverDisplayName != null) u.display_name = receiverDisplayName;
+        if (receiverProfilePictureUrl != null) u.profile_picture_url = receiverProfilePictureUrl;
+        if (Object.keys(u).length > 0) await supabase.from('chat_participants').update(u).eq('conversation_id', convId).eq('user_id', receiverEmail);
+      }
+      if (senderDisplayName != null || senderProfilePictureUrl != null) {
+        const u = {};
+        if (senderDisplayName != null) u.display_name = senderDisplayName;
+        if (senderProfilePictureUrl != null) u.profile_picture_url = senderProfilePictureUrl;
+        if (Object.keys(u).length > 0) await supabase.from('chat_participants').update(u).eq('conversation_id', convId).eq('user_id', senderEmail);
+      }
+    } else {
+      if (receiverDisplayName != null || receiverProfilePictureUrl != null) {
+        const u = {};
+        if (receiverDisplayName != null) u.display_name = receiverDisplayName;
+        if (receiverProfilePictureUrl != null) u.profile_picture_url = receiverProfilePictureUrl;
+        if (Object.keys(u).length > 0) await supabase.from('chat_participants').update(u).eq('conversation_id', convId).eq('user_id', receiverEmail);
+      }
+      if (senderDisplayName != null || senderProfilePictureUrl != null) {
+        const u = {};
+        if (senderDisplayName != null) u.display_name = senderDisplayName;
+        if (senderProfilePictureUrl != null) u.profile_picture_url = senderProfilePictureUrl;
+        if (Object.keys(u).length > 0) await supabase.from('chat_participants').update(u).eq('conversation_id', convId).eq('user_id', senderEmail);
+      }
+    }
+
+    const insertPayload = { conversation_id: convId, sender_id: senderEmail, receiver_id: receiverEmail, body };
+    const { data: msg, error } = await supabase.from('chat_messages').insert(insertPayload).select('id, sender_id, body, created_at').single();
+    if (error) {
+      const fallback = await supabase.from('chat_messages').insert({ conversation_id: convId, sender_id: senderEmail, body }).select('id, sender_id, body, created_at').single();
+      if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
+      await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
+      return res.json({ success: true, message: { id: fallback.data.id, senderId: fallback.data.sender_id, body: fallback.data.body, createdAt: fallback.data.created_at, isMe: true } });
+    }
+    await supabase.from('chat_conversations').update({ last_message_at: msg.created_at }).eq('id', convId);
+    res.json({ success: true, message: { id: msg.id, senderId: msg.sender_id, body: msg.body, createdAt: msg.created_at, isMe: true } });
+  } catch (err) {
+    console.error('POST /api/chat/messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/listings/:id/view - record a view (increment view_count)
+app.post('/api/listings/:id/view', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: 'Missing listing id' });
+    const { data: row, error: selectError } = await supabase.from('ads').select('view_count').eq('id', id).maybeSingle();
+    if (selectError) {
+      console.warn('View count select failed (column may be missing):', selectError.message);
+      return res.status(200).json({ success: true });
+    }
+    const current = row?.view_count != null ? Number(row.view_count) : 0;
+    const { error } = await supabase.from('ads').update({ view_count: current + 1 }).eq('id', id);
+    if (error) {
+      console.warn('View count update failed:', error.message);
+      return res.status(200).json({ success: true });
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error recording view:', e);
+    return res.status(200).json({ success: true });
+  }
+});
+
+// POST /api/listings/:id/like - add like (user_id in body); increment ads.like_count if column exists
+app.post('/api/listings/:id/like', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const user_id = (req.body && req.body.user_id != null) ? String(req.body.user_id).trim() : (req.query.user_id && String(req.query.user_id).trim());
+    if (!id || !user_id) return res.status(400).json({ success: false, error: 'Missing listing id or user_id' });
+    const { error } = await supabase.from('ad_likes').insert({ ad_id: id, user_id });
+    if (error && error.code !== '23505') return res.status(500).json({ success: false, error: error.message }); // 23505 = duplicate key, already liked
+    if (!error) {
+      const { data: row, error: selectError } = await supabase.from('ads').select('like_count').eq('id', id).maybeSingle();
+      if (!selectError && row != null) {
+        const current = row.like_count != null ? Number(row.like_count) : 0;
+        await supabase.from('ads').update({ like_count: current + 1 }).eq('id', id);
+      }
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error adding like:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// DELETE /api/listings/:id/like - remove like (user_id in query or body); decrement ads.like_count if column exists
+app.delete('/api/listings/:id/like', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const user_id = (req.body && req.body.user_id != null) ? String(req.body.user_id).trim() : (req.query && req.query.user_id && String(req.query.user_id).trim());
+    if (!id || !user_id) return res.status(400).json({ success: false, error: 'Missing listing id or user_id' });
+    const { error } = await supabase.from('ad_likes').delete().eq('ad_id', id).eq('user_id', user_id);
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    const { data: row, error: selectError } = await supabase.from('ads').select('like_count').eq('id', id).maybeSingle();
+    if (!selectError && row != null) {
+      const current = row.like_count != null ? Number(row.like_count) : 0;
+      await supabase.from('ads').update({ like_count: Math.max(0, current - 1) }).eq('id', id);
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error removing like:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
 // Media URLs reference files in storage bucket: user-photo-video
 app.post('/api/listings', async (req, res) => {
   try {
@@ -697,6 +1382,7 @@ app.post('/api/listings', async (req, res) => {
       phone,
       description,
       displayOption,
+      feed_display_priority: feedDisplayPriority,
       mainImageUrl,
       additionalImageUrls = [],
       videoUrl,
@@ -729,7 +1415,10 @@ app.post('/api/listings', async (req, res) => {
       projectOffers,
       companyOffersLandSizes,
       salesImageUrl,
-      profileImageUrl
+      profileImageUrl,
+      overlay_x: overlayX,
+      overlay_y: overlayY,
+      exposure_level: exposureLevel
     } = body;
 
     const additionalUrls = Array.isArray(additionalImageUrls) ? additionalImageUrls : [];
@@ -744,6 +1433,7 @@ app.post('/api/listings', async (req, res) => {
 
     const adRecord = {
       subscription_id: validSubscriptionId,
+      owner_id: subscriptionId && typeof subscriptionId === 'string' && subscriptionId.trim() ? subscriptionId.trim() : null,
       subscription_type: subscriptionType || null,
       category: category != null ? parseInt(category, 10) : 1,
       status: status === 'published' ? 'published' : 'draft',
@@ -753,6 +1443,7 @@ app.post('/api/listings', async (req, res) => {
       sales_image_url: salesImageUrl || null,
       profile_image_url: profileImageUrl || null,
       display_option: displayOption || null,
+      feed_display_priority: feedDisplayPriority === 'mainImage' ? 'mainImage' : (feedDisplayPriority === 'video' ? 'video' : null),
       property_type: propertyType || null,
       area: area != null ? parseInt(area, 10) : null,
       rooms: rooms != null ? parseInt(rooms, 10) : null,
@@ -766,6 +1457,8 @@ app.post('/api/listings', async (req, res) => {
       address: address || null,
       phone: phone || null,
       description: description || null,
+      overlay_x: overlayX != null ? parseInt(overlayX, 10) : null,
+      overlay_y: overlayY != null ? parseInt(overlayY, 10) : null,
       search_purpose: searchPurpose || null,
       preferred_apartment_type: preferredApartmentType || null,
       preferred_gender: preferredGender || null,
@@ -788,7 +1481,8 @@ app.post('/api/listings', async (req, res) => {
       sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
       general_details: generalDetails && typeof generalDetails === 'object' ? generalDetails : null,
       project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,
-      company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null
+      company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null,
+      exposure_level: ['low', 'medium', 'high'].includes(String(exposureLevel || '').toLowerCase()) ? String(exposureLevel).toLowerCase() : 'medium'
     };
 
     const { data: ad, error: insertError } = await supabase
@@ -820,7 +1514,93 @@ app.post('/api/listings', async (req, res) => {
   }
 });
 
+// PATCH /api/listings/:id - update a listing (e.g. is_frozen, exposure_level)
+app.patch('/api/listings/:id', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const body = req.body || {};
+    const { is_frozen: isFrozen, exposure_level: exposureLevel } = body;
+
+    if (id == null || id === '') {
+      return res.status(400).json({ success: false, error: 'Listing id required' });
+    }
+
+    const updates = {};
+    if (['low', 'medium', 'high'].includes(String(exposureLevel || '').toLowerCase())) {
+      updates.exposure_level = String(exposureLevel).toLowerCase();
+    }
+    if (typeof isFrozen === 'boolean') {
+      updates.is_frozen = isFrozen;
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'No valid fields to update' });
+    }
+
+    const { data: ad, error } = await supabase
+      .from('ads')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating listing:', error);
+      // PGRST204 = column not in schema cache (migration not run or Supabase cache stale)
+      if (error.code === 'PGRST204' && (error.message || '').includes('is_frozen')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Database schema missing is_frozen column. Run the migration in Supabase SQL Editor (migration-ads-add-is-frozen.sql) and wait a few seconds for the schema cache to refresh.',
+          code: 'SCHEMA_MIGRATION_NEEDED'
+        });
+      }
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update listing',
+        details: error.message
+      });
+    }
+    if (!ad) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+
+    res.json({ success: true, listing: ad });
+  } catch (error) {
+    console.error('Error in PATCH /api/listings/:id:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ==================== FILE UPLOAD ENDPOINTS ====================
+
+// Upload profile picture to bucket profile-pics (e.g. when moving from stage 1 to stage 2)
+app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No profile picture provided.' });
+    }
+    if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
+      return res.status(503).json({ success: false, error: 'Server upload not configured.' });
+    }
+    // Supabase storage keys must be ASCII-safe (no Hebrew/special chars)
+    const ext = (req.file.originalname || '').includes('.') ? (req.file.originalname.match(/\.([a-zA-Z0-9]+)$/)?.[1] || 'jpg') : 'jpg';
+    const fileName = `profile-${Date.now()}.${ext.replace(/[^a-zA-Z0-9]/g, '') || 'jpg'}`;
+    const { data, error } = await supabase.storage
+      .from('profile-pics')
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype || 'image/jpeg', upsert: false });
+    if (error) {
+      console.error('Profile pic upload error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to upload profile picture.' });
+    }
+    const { data: urlData } = supabase.storage.from('profile-pics').getPublicUrl(fileName);
+    res.json({ success: true, url: urlData.publicUrl });
+  } catch (err) {
+    console.error('Upload profile pic:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // Upload file to Supabase Storage
 app.post('/api/upload', upload.single('file'), async (req, res) => {

@@ -109,13 +109,24 @@ CREATE TABLE IF NOT EXISTS ads (
   sale_at_presale BOOLEAN NULL,
   general_details JSONB NULL,
   project_offers JSONB NULL,
-  company_offers_land_sizes JSONB NULL
+  company_offers_land_sizes JSONB NULL,
+
+  -- ========== ACTIONS (freeze, boost, remove) ==========
+  is_frozen BOOLEAN DEFAULT false,
+  is_boosted BOOLEAN DEFAULT false,
+  boost_until TIMESTAMPTZ NULL,
+  is_archived BOOLEAN DEFAULT false,
+  owner_id TEXT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_ads_status ON ads(status);
 CREATE INDEX IF NOT EXISTS idx_ads_category ON ads(category);
 CREATE INDEX IF NOT EXISTS idx_ads_created_at ON ads(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ads_subscription_type ON ads(subscription_type);
+CREATE INDEX IF NOT EXISTS idx_ads_is_frozen ON ads(is_frozen) WHERE is_frozen = false;
+CREATE INDEX IF NOT EXISTS idx_ads_is_boosted ON ads(is_boosted) WHERE is_boosted = true;
+CREATE INDEX IF NOT EXISTS idx_ads_is_archived ON ads(is_archived) WHERE is_archived = false;
+CREATE INDEX IF NOT EXISTS idx_ads_owner_id ON ads(owner_id) WHERE owner_id IS NOT NULL;
 
 -- Trigger to update updated_at
 CREATE OR REPLACE FUNCTION update_ads_updated_at()
