@@ -569,9 +569,9 @@ app.get('/api/subscription/:id', async (req, res) => {
       .single();
 
     if (error || !subscription) {
-      return res.status(404).json({ 
+      return res.status(200).json({ 
         success: false, 
-        error: 'Subscription not found' 
+        subscription: null 
       });
     }
 
@@ -888,12 +888,14 @@ app.get('/api/listings', async (req, res) => {
 
     // Fetch creator (uploader) info from subscriptions for profile/chat display name
     const creatorBySubId = {};
-    const subIds = [...new Set((adsRows || []).map(r => r.subscription_id).filter(Boolean))];
+    const fromSubscriptionId = [...new Set((adsRows || []).map(r => r.subscription_id).filter(Boolean))];
+    const fromOwnerId = [...new Set((adsRows || []).map(r => r.owner_id).filter(Boolean).filter(id => uuidRegex.test(String(id))))];
+    const subIds = [...new Set([...fromSubscriptionId, ...fromOwnerId])];
     if (subIds.length > 0) {
       try {
         const { data: subs } = await supabase
           .from('subscriptions')
-          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url')
+          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, specializations, activity_regions, description')
           .in('id', subIds);
         if (subs && subs.length) {
           subs.forEach(s => {
@@ -907,10 +909,37 @@ app.get('/api/listings', async (req, res) => {
             } else {
               displayName = s.name || s.business_name || s.contact_person_name || null;
             }
+            let creatorSpecialties = null;
+            if (s.specializations != null) {
+              if (Array.isArray(s.specializations)) creatorSpecialties = s.specializations;
+              else if (typeof s.specializations === 'string') {
+                try {
+                  const parsed = JSON.parse(s.specializations);
+                  creatorSpecialties = Array.isArray(parsed) ? parsed : s.specializations.split(',').map(x => x.trim()).filter(Boolean);
+                } catch (_) {
+                  creatorSpecialties = s.specializations.split(',').map(x => x.trim()).filter(Boolean);
+                }
+              }
+            }
+            let creatorActivityRegions = null;
+            if (s.activity_regions != null) {
+              if (Array.isArray(s.activity_regions)) creatorActivityRegions = s.activity_regions;
+              else if (typeof s.activity_regions === 'string') {
+                try {
+                  const parsed = JSON.parse(s.activity_regions);
+                  creatorActivityRegions = Array.isArray(parsed) ? parsed : s.activity_regions.split(',').map(x => x.trim()).filter(Boolean);
+                } catch (_) {
+                  creatorActivityRegions = s.activity_regions.split(',').map(x => x.trim()).filter(Boolean);
+                }
+              }
+            }
             creatorBySubId[s.id] = {
               creator_email: s.email || null,
               creator_name: displayName || null,
-              creator_profile_image_url: s.profile_picture_url || null
+              creator_profile_image_url: s.profile_picture_url || null,
+              creator_specialties: creatorSpecialties || null,
+              creator_activity_regions: creatorActivityRegions || null,
+              creator_bio: (s.description && String(s.description).trim()) ? String(s.description).trim() : null
             };
           });
         }
@@ -953,7 +982,12 @@ app.get('/api/listings', async (req, res) => {
 
     // Shape for frontend: add listing_images, listing_videos, view_count, like_count, liked, creator_*
     const listings = (adsRows || []).map((row) => {
-      const creator = (row.subscription_id && creatorBySubId[row.subscription_id]) ? creatorBySubId[row.subscription_id] : {};
+      const creator = (row.subscription_id && creatorBySubId[row.subscription_id])
+        ? creatorBySubId[row.subscription_id]
+        : (row.owner_id && creatorBySubId[row.owner_id])
+          ? creatorBySubId[row.owner_id]
+          : {};
+      // Prefer creator saved on the ad at upload time (real uploader details)
       const listing_images = [];
       if (row.main_image_url) {
         listing_images.push({ image_url: row.main_image_url, image_type: 'main' });
@@ -971,9 +1005,12 @@ app.get('/api/listings', async (req, res) => {
         listing_images,
         listing_videos,
         is_frozen: row.is_frozen === true || row.is_frozen === 't',
-        creator_name: creator.creator_name || null,
-        creator_email: creator.creator_email || null,
-        creator_profile_image_url: creator.creator_profile_image_url || null
+        creator_name: row.creator_name ?? creator.creator_name ?? null,
+        creator_email: row.creator_email ?? creator.creator_email ?? null,
+        creator_profile_image_url: row.profile_image_url ?? creator.creator_profile_image_url ?? null,
+        creator_specialties: creator.creator_specialties || null,
+        creator_activity_regions: creator.creator_activity_regions || null,
+        creator_bio: creator.creator_bio || null
       };
     });
 
@@ -1431,9 +1468,35 @@ app.post('/api/listings', async (req, res) => {
         ? subscriptionId.trim()
         : null;
 
+    // Save uploader (creator) name and email from subscription so listing always shows who uploaded it
+    let creatorName = null;
+    let creatorEmail = null;
+    if (validSubscriptionId) {
+      try {
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name')
+          .eq('id', validSubscriptionId)
+          .maybeSingle();
+        if (sub) {
+          creatorEmail = sub.email || null;
+          const type = (sub.subscription_type || '').toLowerCase();
+          if (type === 'company') {
+            creatorName = sub.business_name || sub.name || sub.contact_person_name || null;
+          } else if (type === 'broker') {
+            creatorName = sub.broker_office_name || sub.name || sub.contact_person_name || null;
+          } else {
+            creatorName = sub.name || sub.business_name || sub.contact_person_name || null;
+          }
+        }
+      } catch (_) { /* ignore */ }
+    }
+
     const adRecord = {
       subscription_id: validSubscriptionId,
       owner_id: subscriptionId && typeof subscriptionId === 'string' && subscriptionId.trim() ? subscriptionId.trim() : null,
+      creator_name: creatorName,
+      creator_email: creatorEmail,
       subscription_type: subscriptionType || null,
       category: category != null ? parseInt(category, 10) : 1,
       status: status === 'published' ? 'published' : 'draft',
