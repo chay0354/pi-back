@@ -95,6 +95,67 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running' });
 });
 
+// ==================== AI SMART INFO (Gemini) ====================
+// POST /api/ai/smart-info - body: { topic, topicLabel, address }
+// Returns short Hebrew answer about the topic for the given address.
+app.post('/api/ai/smart-info', async (req, res) => {
+  try {
+    const { topic, topicLabel, address } = req.body || {};
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ success: false, error: 'AI not configured', text: 'שירות המידע החכם לא מוגדר.' });
+    }
+    const addr = (address && String(address).trim()) || '';
+    const label = (topicLabel && String(topicLabel).trim()) || (topic && String(topic)) || 'נושא';
+    const prompt = `You are a helpful real-estate assistant. Answer in Hebrew only, in 2-4 short sentences.
+Question: What can you tell me about "${label}" (${topic || label}) for the address/area: ${addr || 'Israel'}?
+Give practical, factual info relevant to someone considering a property there. No preamble.`;
+    // Use 2.5-flash-lite for better free-tier quota (15 RPM, 1000 RPD); fallback to 2.5-flash
+    const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+    let lastError = null;
+    let response = null;
+    let triedUrl = '';
+    for (const model of modelsToTry) {
+      triedUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      response = await fetch(triedUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 256, temperature: 0.4 }
+        })
+      });
+      if (response.ok) break;
+      lastError = await response.text();
+      if (response.status === 429) break; // quota - don't hammer other models
+      if (response.status === 404) continue; // try next model
+      break;
+    }
+    if (!response.ok) {
+      const errText = lastError != null ? lastError : (await response.text());
+      console.error('Gemini API error:', response.status, errText);
+      if (response.status === 429) {
+        return res.status(429).json({
+          success: false,
+          error: 'quota_exceeded',
+          text: 'המכסה היומית של שירות המידע החכם הותשתה. נסה שוב מחר או בדוק את המכסות ב-Google AI Studio.'
+        });
+      }
+      if (response.status === 404) {
+        return res.status(502).json({ success: false, error: 'model_not_found', text: 'מודל AI לא זמין. נסה שוב מאוחר יותר.' });
+      }
+      return res.status(502).json({ success: false, error: 'AI request failed', text: 'לא ניתן לקבל מידע כרגע. נסה שוב מאוחר יותר.' });
+    }
+    const data = await response.json();
+    const textPart = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const text = (textPart && String(textPart).trim()) || 'לא התקבל מידע.';
+    return res.json({ success: true, text });
+  } catch (err) {
+    console.error('POST /api/ai/smart-info:', err);
+    return res.status(500).json({ success: false, error: err.message, text: 'שגיאה בקבלת מידע. נסה שוב.' });
+  }
+});
+
 // ==================== SUBSCRIPTION ENDPOINTS ====================
 
 // Submit subscription form (all types: broker, company, professional)
@@ -557,24 +618,28 @@ app.post('/api/subscription/resend-code', async (req, res) => {
   }
 });
 
-// Get subscription by ID
+// Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
+const SUBSCRIPTION_SELECT = 'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, specializations, activity_regions, types, description, phone, mobile_phone, office_phone';
 app.get('/api/subscription/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
     const { data: subscription, error } = await supabase
       .from('subscriptions')
-      .select('*')
+      .select(SUBSCRIPTION_SELECT)
       .eq('id', id)
       .single();
 
     if (error || !subscription) {
-      return res.status(200).json({ 
-        success: false, 
-        subscription: null 
+      return res.status(200).json({
+        success: false,
+        subscription: null
       });
     }
 
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[GET /api/subscription/:id] id=', id, 'description=', subscription.description != null ? `"${String(subscription.description).slice(0, 50)}..."` : subscription.description);
+    }
     res.json({
       success: true,
       subscription
@@ -586,6 +651,121 @@ app.get('/api/subscription/:id', async (req, res) => {
       success: false, 
       error: error.message 
     });
+  }
+});
+
+// ==================== PROFILE REVIEWS ====================
+// GET /api/reviews?target_subscription_id=uuid – list reviews for a profile
+app.get('/api/reviews', async (req, res) => {
+  try {
+    const targetId = typeof req.query.target_subscription_id === 'string' ? req.query.target_subscription_id.trim() : null;
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: 'target_subscription_id required' });
+    }
+    const { data: rows, error } = await supabase
+      .from('profile_reviews')
+      .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+      .eq('target_subscription_id', targetId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('GET /api/reviews error:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const reviews = rows || [];
+    const needEnrich = reviews.filter(r => r.reviewer_subscription_id && (!r.reviewer_name || !r.reviewer_image_url));
+    if (needEnrich.length > 0) {
+      const ids = [...new Set(needEnrich.map(r => r.reviewer_subscription_id))];
+      const { data: subs } = await supabase
+        .from('subscriptions')
+        .select('id, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url')
+        .in('id', ids);
+      const byId = {};
+      (subs || []).forEach(s => { byId[s.id] = s; });
+      reviews.forEach(r => {
+        if (!r.reviewer_subscription_id) return;
+        const sub = byId[r.reviewer_subscription_id];
+        const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+        if (name && !r.reviewer_name) r.reviewer_name = name;
+        if (imageUrl && !r.reviewer_image_url) r.reviewer_image_url = imageUrl;
+      });
+    }
+    res.json({ success: true, reviews });
+  } catch (err) {
+    console.error('GET /api/reviews:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Helper: get display name and image URL for a subscription (all 4 types: broker, company, professional, user)
+function getSubscriptionDisplayNameAndImage(sub) {
+  if (!sub) return { name: null, imageUrl: null };
+  const type = (sub.subscription_type || '').toLowerCase();
+  let name = null;
+  if (type === 'company') name = sub.business_name || sub.name || sub.contact_person_name || null;
+  else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
+  else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
+  else name = sub.name || sub.contact_person_name || sub.business_name || sub.broker_office_name || null;
+  const imageUrl = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+  return {
+    name: name && String(name).trim() ? String(name).trim() : null,
+    imageUrl: imageUrl && String(imageUrl).trim() ? String(imageUrl).trim() : null,
+  };
+}
+
+// POST /api/reviews – add a review (rating 1–5 + optional comment)
+app.post('/api/reviews', async (req, res) => {
+  try {
+    const { target_subscription_id, rating, comment, reviewer_name, reviewer_image_url, reviewer_subscription_id } = req.body || {};
+    const targetId = target_subscription_id && String(target_subscription_id).trim() ? String(target_subscription_id).trim() : null;
+    if (!targetId) {
+      return res.status(400).json({ success: false, error: 'target_subscription_id required' });
+    }
+    const numRating = rating != null ? parseInt(rating, 10) : null;
+    if (numRating == null || isNaN(numRating) || numRating < 1 || numRating > 5) {
+      return res.status(400).json({ success: false, error: 'rating must be 1–5' });
+    }
+    const commentStr = comment != null ? String(comment).trim() : '';
+    const rawReviewerSubId = reviewer_subscription_id && String(reviewer_subscription_id).trim() ? String(reviewer_subscription_id).trim() : null;
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const reviewerSubId = rawReviewerSubId && uuidRegex.test(rawReviewerSubId) ? rawReviewerSubId : null;
+
+    let finalReviewerName = reviewer_name && String(reviewer_name).trim() ? String(reviewer_name).trim() : null;
+    let finalReviewerImageUrl = reviewer_image_url && String(reviewer_image_url).trim() ? String(reviewer_image_url).trim() : null;
+
+    if (reviewerSubId) {
+      const { data: sub } = await supabase
+        .from('subscriptions')
+        .select('name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url')
+        .eq('id', reviewerSubId)
+        .maybeSingle();
+      const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+      if (name) finalReviewerName = name;
+      if (imageUrl) finalReviewerImageUrl = imageUrl;
+    }
+
+    const { data: row, error } = await supabase
+      .from('profile_reviews')
+      .insert({
+        target_subscription_id: targetId,
+        reviewer_subscription_id: reviewerSubId || null,
+        rating: numRating,
+        comment: commentStr || null,
+        reviewer_name: finalReviewerName,
+        reviewer_image_url: finalReviewerImageUrl,
+      })
+      .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+      .single();
+
+    if (error) {
+      console.error('POST /api/reviews error:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    res.json({ success: true, review: row });
+  } catch (err) {
+    console.error('POST /api/reviews:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -895,7 +1075,7 @@ app.get('/api/listings', async (req, res) => {
       try {
         const { data: subs } = await supabase
           .from('subscriptions')
-          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, specializations, activity_regions, description')
+          .select(SUBSCRIPTION_SELECT)
           .in('id', subIds);
         if (subs && subs.length) {
           subs.forEach(s => {
@@ -933,12 +1113,25 @@ app.get('/api/listings', async (req, res) => {
                 }
               }
             }
+            let creatorTypes = null;
+            if (s.types != null) {
+              if (Array.isArray(s.types)) creatorTypes = s.types;
+              else if (typeof s.types === 'string') {
+                try {
+                  const parsed = JSON.parse(s.types);
+                  creatorTypes = Array.isArray(parsed) ? parsed : s.types.split(',').map(x => x.trim()).filter(Boolean);
+                } catch (_) {
+                  creatorTypes = s.types.split(',').map(x => x.trim()).filter(Boolean);
+                }
+              }
+            }
             creatorBySubId[s.id] = {
               creator_email: s.email || null,
               creator_name: displayName || null,
               creator_profile_image_url: s.profile_picture_url || null,
               creator_specialties: creatorSpecialties || null,
               creator_activity_regions: creatorActivityRegions || null,
+              creator_types: creatorTypes || null,
               creator_bio: (s.description && String(s.description).trim()) ? String(s.description).trim() : null
             };
           });
@@ -1010,6 +1203,7 @@ app.get('/api/listings', async (req, res) => {
         creator_profile_image_url: row.profile_image_url ?? creator.creator_profile_image_url ?? null,
         creator_specialties: creator.creator_specialties || null,
         creator_activity_regions: creator.creator_activity_regions || null,
+        creator_types: creator.creator_types || null,
         creator_bio: creator.creator_bio || null
       };
     });
