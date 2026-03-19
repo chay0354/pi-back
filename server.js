@@ -1739,7 +1739,10 @@ app.post('/api/listings', async (req, res) => {
       construction_status: constructionStatus || null,
       sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
       general_details: generalDetails && typeof generalDetails === 'object' ? generalDetails : null,
-      project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,
+      project_offers: (() => {
+        const po = body.projectOffers ?? body.project_offers;
+        return po && typeof po === 'object' ? po : null;
+      })(),
       company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null,
       exposure_level: ['low', 'medium', 'high'].includes(String(exposureLevel || '').toLowerCase()) ? String(exposureLevel).toLowerCase() : 'medium'
     };
