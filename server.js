@@ -90,6 +90,40 @@ const sendVerificationEmail = async (email, verificationCode, subscriptionType) 
   return false;
 };
 
+/** Send subscriber number (מספר מנוי) to verified account email – secret code recovery */
+const sendSubscriberRecoveryEmail = async (email, subscriberNumber, subscriptionType) => {
+  const typeNames = { broker: 'מתווכים', company: 'חברות', professional: 'בעלי מקצוע' };
+  const typeName = typeNames[subscriptionType] || 'מנוי';
+  const html = `
+    <div dir="rtl" style="font-family: Arial, sans-serif; text-align: right;">
+      <h2>שלום,</h2>
+      <p>ביקשת לקבל את מספר המנוי שלך (${typeName}).</p>
+      <p><strong>מספר המנוי שלך:</strong></p>
+      <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 28px; font-weight: bold; margin: 20px 0; border-radius: 8px;">
+        ${subscriberNumber}
+      </div>
+      <p>אם לא ביקשת מייל זה, אנא התעלם.</p>
+      <p>בברכה,<br>צוות PI</p>
+    </div>
+  `;
+  if (resend) {
+    try {
+      await resend.emails.send({
+        from: process.env.EMAIL_FROM || 'onboarding@resend.dev',
+        to: email,
+        subject: 'מספר המנוי שלך – שחזור קוד',
+        html,
+      });
+      console.log(`✅ Subscriber recovery email sent to ${email}`);
+      return true;
+    } catch (error) {
+      console.error('❌ Error sending subscriber recovery email:', error);
+    }
+  }
+  console.log(`\n📧 === SUBSCRIBER RECOVERY EMAIL ===\nTo: ${email}\nמספר מנוי: ${subscriberNumber}\n==========================\n`);
+  return false;
+};
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running' });
@@ -618,8 +652,54 @@ app.post('/api/subscription/resend-code', async (req, res) => {
   }
 });
 
+// Recover subscriber number by email (שחזור קוד סודי) – only verified subscriptions; always same response to avoid email enumeration
+app.post('/api/subscription/recover-subscriber-code', async (req, res) => {
+  try {
+    const emailRaw = req.body && req.body.email != null ? String(req.body.email).trim() : '';
+    const emailNorm = emailRaw.toLowerCase();
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm);
+    if (!emailOk) {
+      return res.status(400).json({
+        success: false,
+        error: 'אנא הזן כתובת מייל תקינה',
+      });
+    }
+
+    const { data: rows, error } = await supabase
+      .from('subscriptions')
+      .select('subscriber_number, email, subscription_type')
+      .eq('status', 'verified')
+      .ilike('email', emailNorm)
+      .limit(1);
+
+    if (error) {
+      console.error('recover-subscriber-code lookup:', error);
+    }
+
+    const subscription = rows && rows[0];
+    if (subscription && subscription.subscriber_number != null && String(subscription.subscriber_number).trim() !== '') {
+      const toEmail = subscription.email || emailRaw;
+      await sendSubscriberRecoveryEmail(
+        toEmail,
+        String(subscription.subscriber_number).trim(),
+        subscription.subscription_type,
+      );
+    } else {
+      console.log(`recover-subscriber-code: no verified subscription for email (masked)`);
+    }
+
+    res.json({
+      success: true,
+      message: 'אם קיים חשבון למייל זה, נשלח אליו את מספר המנוי.',
+    });
+  } catch (error) {
+    console.error('recover-subscriber-code:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
-const SUBSCRIPTION_SELECT = 'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, specializations, activity_regions, types, description, phone, mobile_phone, office_phone';
+const SUBSCRIPTION_SELECT = 'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, specializations, activity_regions, types, description, phone, mobile_phone, office_phone';
 app.get('/api/subscription/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -965,6 +1045,36 @@ app.get('/api/listings', async (req, res) => {
     const hasVideo = req.query.has_video === 'true' || req.query.has_video === true;
     const subscriptionIdParam = typeof req.query.subscription_id === 'string' ? req.query.subscription_id.trim() : null;
     const userIdParam = typeof req.query.user_id === 'string' ? req.query.user_id.trim() : null;
+    const favoritesOnly =
+      req.query.favorites_only === 'true' ||
+      req.query.favorites_only === true ||
+      req.query.liked_only === 'true';
+
+    let favoriteAdIds = null;
+    if (favoritesOnly) {
+      if (!userIdParam) {
+        return res.status(400).json({
+          success: false,
+          error: 'user_id is required when favorites_only=true',
+        });
+      }
+      try {
+        const { data: likeRows, error: likeErr } = await supabase
+          .from('ad_likes')
+          .select('ad_id')
+          .eq('user_id', userIdParam);
+        if (likeErr) {
+          console.warn('ad_likes query (favorites):', likeErr.message);
+        }
+        favoriteAdIds = (likeRows || []).map((r) => r.ad_id).filter(Boolean);
+      } catch (e) {
+        console.warn('ad_likes favorites:', e.message);
+        favoriteAdIds = [];
+      }
+      if (!favoriteAdIds || favoriteAdIds.length === 0) {
+        return res.json({ success: true, listings: [] });
+      }
+    }
 
     const allowedSubscriptionTypes = ['user', 'broker', 'company', 'professional'];
     const subscriptionTypes = subscriptionTypeParam
@@ -976,6 +1086,10 @@ app.get('/api/listings', async (req, res) => {
       .select('*')
       .eq('status', status)
       .order('created_at', { ascending: false });
+
+    if (favoriteAdIds && favoriteAdIds.length > 0) {
+      query = query.in('id', favoriteAdIds);
+    }
 
     if (category && !isNaN(category)) {
       query = query.eq('category', category);
@@ -991,7 +1105,8 @@ app.get('/api/listings', async (req, res) => {
     // subscription_id param = "owner view" (Edit/Publish Ad): show that owner's ads including frozen
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const validSubscriptionId = subscriptionIdParam && uuidRegex.test(subscriptionIdParam) ? subscriptionIdParam : null;
-    const isOwnerView = subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
+    const isOwnerView =
+      !favoritesOnly && subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
     if (isOwnerView) {
       if (validSubscriptionId) {
         query = query.eq('subscription_id', validSubscriptionId);
@@ -1019,6 +1134,9 @@ app.get('/api/listings', async (req, res) => {
         .select('*')
         .eq('status', status)
         .order('created_at', { ascending: false });
+      if (favoriteAdIds && favoriteAdIds.length > 0) {
+        fallbackQuery = fallbackQuery.in('id', favoriteAdIds);
+      }
       if (category && !isNaN(category)) fallbackQuery = fallbackQuery.eq('category', category);
       if (subscriptionTypes.length === 1) fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
       else if (subscriptionTypes.length > 1) fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
@@ -1042,7 +1160,7 @@ app.get('/api/listings', async (req, res) => {
     }
 
     // Smart feed: when user_id provided and not owner view, sort by preference match (from liked ads) × exposure level
-    if (userIdParam && !isOwnerView && adsRows && adsRows.length > 0) {
+    if (userIdParam && !isOwnerView && adsRows && adsRows.length > 0 && !favoritesOnly) {
       try {
         adsRows = await sortListingsByFeedAlgorithm(adsRows, userIdParam, supabase);
       } catch (err) {
@@ -1052,7 +1170,9 @@ app.get('/api/listings', async (req, res) => {
 
     // Optionally get liked ad ids for this user (view_count/like_count are on row; ensure they exist)
     let likedAdIds = new Set();
-    if (userIdParam && adsRows && adsRows.length > 0) {
+    if (favoritesOnly && adsRows && adsRows.length > 0) {
+      adsRows.forEach((r) => { if (r.id) likedAdIds.add(r.id); });
+    } else if (userIdParam && adsRows && adsRows.length > 0) {
       try {
         const adIds = adsRows.map(r => r.id).filter(Boolean);
         const { data: likesRows } = await supabase
@@ -1128,7 +1248,10 @@ app.get('/api/listings', async (req, res) => {
             creatorBySubId[s.id] = {
               creator_email: s.email || null,
               creator_name: displayName || null,
-              creator_profile_image_url: s.profile_picture_url || null,
+              creator_profile_image_url:
+                s.profile_picture_url ||
+                (type === 'company' ? s.company_logo_url : null) ||
+                null,
               creator_specialties: creatorSpecialties || null,
               creator_activity_regions: creatorActivityRegions || null,
               creator_types: creatorTypes || null,
@@ -1235,6 +1358,129 @@ app.get('/api/listings', async (req, res) => {
       error: message,
       details: error.cause?.message || error.message
     });
+  }
+});
+
+// ==================== STORIES (separate from ads) ====================
+
+function subscriptionDisplayNameForStory(sub) {
+  if (!sub) return 'משתמש';
+  const type = String(sub.subscription_type || '').toLowerCase();
+  if (type === 'company') {
+    return sub.business_name || sub.name || sub.contact_person_name || 'משתמש';
+  }
+  if (type === 'broker') {
+    return sub.broker_office_name || sub.name || sub.contact_person_name || 'משתמש';
+  }
+  return sub.name || sub.business_name || sub.contact_person_name || 'משתמש';
+}
+
+// GET /api/stories/feed — active story rings (last 24h), grouped by subscription
+app.get('/api/stories/feed', async (req, res) => {
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data: rows, error } = await supabase
+      .from('stories')
+      .select('id, subscription_id, media_url, created_at')
+      .gte('created_at', since)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      if (
+        String(error.message || '').includes('does not exist') ||
+        error.code === '42P01'
+      ) {
+        return res.json({
+          success: true,
+          rings: [],
+          message: 'stories table missing; run migration-stories.sql',
+        });
+      }
+      console.error('GET /api/stories/feed:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const bySub = {};
+    for (const row of rows || []) {
+      const sid = row.subscription_id;
+      if (!sid) continue;
+      if (!bySub[sid]) bySub[sid] = [];
+      bySub[sid].push({
+        id: row.id,
+        media_url: row.media_url,
+        created_at: row.created_at,
+      });
+    }
+    const subIds = Object.keys(bySub);
+    if (subIds.length === 0) {
+      return res.json({ success: true, rings: [] });
+    }
+
+    const { data: subs, error: subErr } = await supabase
+      .from('subscriptions')
+      .select(
+        'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+      )
+      .in('id', subIds);
+
+    if (subErr) {
+      console.error('GET /api/stories/feed subscriptions:', subErr);
+    }
+    const subMap = {};
+    (subs || []).forEach((s) => {
+      subMap[s.id] = s;
+    });
+
+    const rings = subIds.map((sid) => {
+      const s = subMap[sid];
+      const st = (s?.subscription_type || '').toLowerCase();
+      const storyPic =
+        s?.profile_picture_url ||
+        (st === 'company' ? s?.company_logo_url : null) ||
+        null;
+      return {
+        subscription_id: sid,
+        display_name: subscriptionDisplayNameForStory(s),
+        profile_image_url: storyPic,
+        slides: bySub[sid],
+      };
+    });
+
+    res.json({ success: true, rings });
+  } catch (err) {
+    console.error('GET /api/stories/feed:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/stories — body: { subscription_id, media_url }
+app.post('/api/stories', async (req, res) => {
+  try {
+    const { subscription_id: subscriptionId, media_url: mediaUrl } = req.body || {};
+    const sid = subscriptionId && String(subscriptionId).trim();
+    const url = mediaUrl && String(mediaUrl).trim();
+    if (!sid || !url) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscription_id and media_url are required',
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('stories')
+      .insert([{ subscription_id: sid, media_url: url }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('POST /api/stories:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.status(201).json({ success: true, story: data });
+  } catch (err) {
+    console.error('POST /api/stories:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
