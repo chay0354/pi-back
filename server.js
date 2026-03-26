@@ -1887,6 +1887,8 @@ app.post('/api/listings', async (req, res) => {
       agriculturalLand,
       landOwnership,
       landAddress,
+      landParcel,
+      landBlock,
       constructionStatus,
       saleAtPresale,
       generalDetails,
@@ -1981,7 +1983,28 @@ app.post('/api/listings', async (req, res) => {
       permit: permit || null,
       agricultural_land: agriculturalLand || null,
       land_ownership: landOwnership || null,
-      land_address: landAddress || null,
+      // חלקה/גוש: merged into land_address so inserts work without land_parcel/land_block columns.
+      // Run migration-ads-land-parcel-block.sql if you want dedicated columns in Supabase.
+      land_address: (() => {
+        const line =
+          landAddress != null && String(landAddress).trim() !== ''
+            ? String(landAddress).trim()
+            : null;
+        const parcelStr =
+          landParcel != null && String(landParcel).trim() !== ''
+            ? String(landParcel).trim()
+            : null;
+        const blockStr =
+          landBlock != null && String(landBlock).trim() !== ''
+            ? String(landBlock).trim()
+            : null;
+        const parts = [
+          line,
+          parcelStr ? `חלקה ${parcelStr}` : null,
+          blockStr ? `גוש ${blockStr}` : null,
+        ].filter(Boolean);
+        return parts.length ? parts.join(' | ') : null;
+      })(),
       construction_status: constructionStatus || null,
       sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
       general_details: generalDetails && typeof generalDetails === 'object' ? generalDetails : null,
