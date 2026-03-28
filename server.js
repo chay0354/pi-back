@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
+const { Pool } = require('pg');
 const { Resend } = require('resend');
 
 const app = express();
@@ -31,10 +32,33 @@ if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
   console.warn('⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY not set or is a placeholder.');
   console.warn('⚠️  Using anon key as fallback. Some operations may fail.');
   console.warn('⚠️  Please set service_role key in .env from Supabase Dashboard > Settings > API');
+  console.warn('⚠️  Broker search (/api/brokers/search) often returns empty with anon + RLS — use service role or set DATABASE_URL for direct Postgres.');
   supabaseKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey, { global: { fetch: customFetch } });
+
+/** Direct Postgres for broker search when REST/RLS returns no rows (set DATABASE_URL from Supabase → Settings → Database). */
+let brokerSearchPgPool = null;
+let brokerSearchPgInited = false;
+function getBrokerSearchPgPool() {
+  if (brokerSearchPgInited) return brokerSearchPgPool;
+  brokerSearchPgInited = true;
+  const conn = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || process.env.POSTGRES_URL;
+  if (!conn || !String(conn).trim()) return null;
+  try {
+    brokerSearchPgPool = new Pool({
+      connectionString: String(conn).trim(),
+      max: 4,
+      ssl: String(conn).includes('supabase.co') ? { rejectUnauthorized: false } : undefined,
+    });
+    console.log('Broker search: DATABASE_URL set — using direct Postgres (bypasses PostgREST/RLS).');
+  } catch (e) {
+    console.error('Broker search: failed to create Postgres pool:', e.message);
+    brokerSearchPgPool = null;
+  }
+  return brokerSearchPgPool;
+}
 
 // Initialize Resend for email sending (optional - can use other services)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
@@ -734,6 +758,555 @@ app.get('/api/subscription/:id', async (req, res) => {
   }
 });
 
+// GET /api/brokers/search?q=...&exclude_email=... — brokers only (not suspended); text match on name / contact / office fields
+app.get('/api/brokers/search', async (req, res) => {
+  try {
+    const rawQ = req.query.q != null ? String(req.query.q).trim() : '';
+    if (rawQ.length < 2) {
+      return res.json({ success: true, brokers: [] });
+    }
+    const safeQ = rawQ.replace(/%/g, '').replace(/,/g, '').replace(/\(/g, '').replace(/\)/g, '').replace(/\*/g, '').slice(0, 80);
+    const like = `%${safeQ}%`;
+    const excludeEmail = normEmail(req.query.exclude_email || '');
+
+    const mapRowToBroker = (sub) => {
+      const person = sub.name || sub.contact_person_name || '';
+      const office = sub.broker_office_name || sub.business_name || '';
+      const title = person.trim() || office.trim() || 'מתווך';
+      let subtitle = '';
+      if (office && office.trim() !== person.trim()) {
+        subtitle = `תיווך ${office.trim()}`;
+      } else if (office) {
+        subtitle = `תיווך ${office.trim()}`;
+      } else {
+        subtitle = 'מתווך נדל"ן';
+      }
+      return {
+        id: sub.id,
+        email: sub.email || null,
+        title,
+        subtitle,
+        profileImageUrl: sub.profile_picture_url || null,
+      };
+    };
+
+    let list = [];
+
+    const pool = getBrokerSearchPgPool();
+    if (pool) {
+      try {
+        const r = await pool.query(
+          `SELECT id, email, name, contact_person_name, broker_office_name, business_name, profile_picture_url
+           FROM subscriptions
+           WHERE subscription_type = 'broker'
+             AND status IN ('verified', 'active', 'pending_verification')
+             AND (
+               COALESCE(name, '') ILIKE $1
+               OR COALESCE(contact_person_name, '') ILIKE $1
+               OR COALESCE(broker_office_name, '') ILIKE $1
+               OR COALESCE(business_name, '') ILIKE $1
+             )
+           LIMIT 35`,
+          [like],
+        );
+        list = r.rows || [];
+      } catch (pgErr) {
+        console.error('GET /api/brokers/search (Postgres):', pgErr.message);
+      }
+    }
+
+    if (list.length === 0) {
+      const selectCols = 'id, email, name, contact_person_name, broker_office_name, business_name, profile_picture_url';
+      const orFilters = `name.ilike.${like},contact_person_name.ilike.${like},broker_office_name.ilike.${like},business_name.ilike.${like}`;
+      const { data: rows, error } = await supabase
+        .from('subscriptions')
+        .select(selectCols)
+        .eq('subscription_type', 'broker')
+        .in('status', ['verified', 'active', 'pending_verification'])
+        .or(orFilters)
+        .limit(35);
+
+      if (error) {
+        console.error('GET /api/brokers/search (Supabase):', error.message);
+        return res.status(500).json({ success: false, error: error.message, brokers: [] });
+      }
+      list = rows || [];
+    }
+
+    if (excludeEmail) {
+      list = list.filter((r) => normEmail(r.email) !== excludeEmail);
+    }
+
+    const brokers = list.map(mapRowToBroker);
+    res.json({ success: true, brokers });
+  } catch (err) {
+    console.error('GET /api/brokers/search:', err);
+    res.status(500).json({ success: false, error: err.message, brokers: [] });
+  }
+});
+
+// GET /api/brokers/group-picker?q=&exclude_email= — brokers for multi-select; empty/short q lists first brokers (for group creation)
+app.get('/api/brokers/group-picker', async (req, res) => {
+  try {
+    const rawQ = req.query.q != null ? String(req.query.q).trim() : '';
+    const excludeEmail = normEmail(req.query.exclude_email || '');
+    const limit = 60;
+
+    const mapRowToBroker = (sub) => {
+      const person = sub.name || sub.contact_person_name || '';
+      const office = sub.broker_office_name || sub.business_name || '';
+      const title = person.trim() || office.trim() || 'מתווך';
+      let subtitle = '';
+      if (office && office.trim() !== person.trim()) subtitle = `תיווך ${office.trim()}`;
+      else if (office) subtitle = `תיווך ${office.trim()}`;
+      else subtitle = 'מתווך נדל"ן';
+      return {
+        id: sub.id,
+        email: sub.email || null,
+        title,
+        subtitle,
+        profileImageUrl: sub.profile_picture_url || null,
+      };
+    };
+
+    let list = [];
+    const pool = getBrokerSearchPgPool();
+    const useFilter = rawQ.length >= 2;
+    const safeQ = rawQ.replace(/%/g, '').replace(/,/g, '').replace(/\(/g, '').replace(/\)/g, '').replace(/\*/g, '').slice(0, 80);
+    const like = `%${safeQ}%`;
+
+    if (pool) {
+      try {
+        if (useFilter) {
+          const r = await pool.query(
+            `SELECT id, email, name, contact_person_name, broker_office_name, business_name, profile_picture_url
+             FROM subscriptions
+             WHERE subscription_type = 'broker'
+               AND status IN ('verified', 'active', 'pending_verification')
+               AND (
+                 COALESCE(name, '') ILIKE $1
+                 OR COALESCE(contact_person_name, '') ILIKE $1
+                 OR COALESCE(broker_office_name, '') ILIKE $1
+                 OR COALESCE(business_name, '') ILIKE $1
+               )
+             ORDER BY name NULLS LAST
+             LIMIT ${limit}`,
+            [like],
+          );
+          list = r.rows || [];
+        } else {
+          const r = await pool.query(
+            `SELECT id, email, name, contact_person_name, broker_office_name, business_name, profile_picture_url
+             FROM subscriptions
+             WHERE subscription_type = 'broker'
+               AND status IN ('verified', 'active', 'pending_verification')
+             ORDER BY name NULLS LAST
+             LIMIT ${limit}`,
+          );
+          list = r.rows || [];
+        }
+      } catch (pgErr) {
+        console.error('GET /api/brokers/group-picker (Postgres):', pgErr.message);
+      }
+    }
+
+    if (list.length === 0) {
+      const selectCols = 'id, email, name, contact_person_name, broker_office_name, business_name, profile_picture_url';
+      let q = supabase
+        .from('subscriptions')
+        .select(selectCols)
+        .eq('subscription_type', 'broker')
+        .in('status', ['verified', 'active', 'pending_verification'])
+        .order('name', { ascending: true })
+        .limit(limit);
+      if (useFilter) {
+        const orFilters = `name.ilike.${like},contact_person_name.ilike.${like},broker_office_name.ilike.${like},business_name.ilike.${like}`;
+        q = q.or(orFilters);
+      }
+      const { data: rows, error } = await q;
+      if (error) {
+        console.error('GET /api/brokers/group-picker (Supabase):', error.message);
+        return res.status(500).json({ success: false, error: error.message, brokers: [] });
+      }
+      list = rows || [];
+    }
+
+    if (excludeEmail) list = list.filter((r) => normEmail(r.email) !== excludeEmail);
+    const brokers = list.map(mapRowToBroker);
+    res.json({ success: true, brokers });
+  } catch (err) {
+    console.error('GET /api/brokers/group-picker:', err);
+    res.status(500).json({ success: false, error: err.message, brokers: [] });
+  }
+});
+
+// GET /api/chat/direct-contacts?user_email=&q= — people from 1:1 chats (for customer group picker)
+app.get('/api/chat/direct-contacts', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.query.user_email);
+    const qRaw = req.query.q != null ? String(req.query.q).trim().toLowerCase() : '';
+    if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
+
+    const { data: myParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', userEmail);
+    const convIds = [...new Set((myParts || []).map((p) => p.conversation_id))];
+    if (convIds.length === 0) return res.json({ success: true, contacts: [] });
+
+    const { data: allParts } = await supabase
+      .from('chat_participants')
+      .select('conversation_id, user_id, display_name, profile_picture_url')
+      .in('conversation_id', convIds);
+
+    const countByConv = {};
+    (allParts || []).forEach((p) => {
+      countByConv[p.conversation_id] = (countByConv[p.conversation_id] || 0) + 1;
+    });
+    const directConvIds = new Set(convIds.filter((cid) => countByConv[cid] === 2));
+
+    const byEmail = new Map();
+    (allParts || []).forEach((p) => {
+      if (!directConvIds.has(p.conversation_id)) return;
+      const em = normEmail(p.user_id);
+      if (!em || em === userEmail) return;
+      const disp = (p.display_name && String(p.display_name).trim()) || '';
+      const pic = p.profile_picture_url || null;
+      const prev = byEmail.get(em);
+      const title = prev ? disp || prev.title : disp || em;
+      const profileImageUrl = (prev && prev.profileImageUrl) || pic;
+      byEmail.set(em, { email: em, title, subtitle: em, profileImageUrl });
+    });
+
+    let contacts = [...byEmail.values()];
+    if (qRaw.length >= 1) {
+      contacts = contacts.filter(
+        (c) =>
+          c.email.includes(qRaw) ||
+          (c.title && String(c.title).toLowerCase().includes(qRaw)) ||
+          (c.subtitle && String(c.subtitle).toLowerCase().includes(qRaw)),
+      );
+    }
+    contacts.sort((a, b) => String(a.title).localeCompare(String(b.title), 'he'));
+    res.json({ success: true, contacts });
+  } catch (err) {
+    console.error('GET /api/chat/direct-contacts:', err);
+    res.status(500).json({ success: false, error: err.message, contacts: [] });
+  }
+});
+
+// POST /api/chat/groups — create group conversation + participants
+app.post('/api/chat/groups', async (req, res) => {
+  try {
+    const creator = normEmail(req.body.creator_email);
+    const rawMembers = Array.isArray(req.body.member_emails) ? req.body.member_emails : [];
+    const memberEmails = [...new Set(rawMembers.map(normEmail).filter(Boolean))].filter((e) => e !== creator);
+    const titleIn = req.body.title != null ? String(req.body.title).trim().slice(0, 120) : '';
+    const kind = req.body.kind === 'brokers' ? 'brokers' : 'customers';
+    const groupImageUrl =
+      req.body.group_image_url != null && String(req.body.group_image_url).trim()
+        ? String(req.body.group_image_url).trim().slice(0, 2000)
+        : null;
+
+    if (!creator) return res.status(400).json({ success: false, error: 'creator_email required' });
+    if (memberEmails.length < 1) return res.status(400).json({ success: false, error: 'At least one member required' });
+
+    const defaultTitle = kind === 'brokers' ? 'קבוצת מתווכים' : 'קבוצת לקוחות';
+    const title = titleIn || defaultTitle;
+
+    const insertRow = { type: 'group', title };
+    if (groupImageUrl) insertRow.group_image_url = groupImageUrl;
+
+    let { data: newConv, error: convErr } = await supabase
+      .from('chat_conversations')
+      .insert(insertRow)
+      .select('id, type, title, group_image_url')
+      .single();
+    if (convErr && isMissingGroupImageUrlColumnError(convErr)) {
+      console.warn(
+        '[chat] chat_conversations.group_image_url is missing — run pi-back/migration-chat-group-image.sql in Supabase. Creating group without persisting image URL.',
+      );
+      const retry = await supabase
+        .from('chat_conversations')
+        .insert({ type: 'group', title })
+        .select('id, type, title')
+        .single();
+      newConv = retry.data;
+      convErr = retry.error;
+    }
+    if (convErr || !newConv?.id) {
+      console.error('POST /api/chat/groups conv:', convErr?.message);
+      return res.status(500).json({ success: false, error: convErr?.message || 'Failed to create conversation' });
+    }
+    const convId = newConv.id;
+
+    const rows = [{ conversation_id: convId, user_id: creator }, ...memberEmails.map((e) => ({ conversation_id: convId, user_id: e }))];
+    const { error: partErr } = await supabase.from('chat_participants').insert(rows);
+    if (partErr) {
+      await supabase.from('chat_conversations').delete().eq('id', convId);
+      return res.status(500).json({ success: false, error: partErr.message });
+    }
+
+    res.json({
+      success: true,
+      conversation: {
+        id: convId,
+        type: 'group',
+        title,
+        isGroup: true,
+        otherUserEmail: null,
+        name: title,
+        profileImageUrl: newConv?.group_image_url || groupImageUrl || null,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/chat/groups:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// PATCH /api/chat/group-description — body: user_email, conversation_id, group_description
+app.patch('/api/chat/group-description', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const descIn = req.body.group_description != null ? String(req.body.group_description) : '';
+    const groupDescription = descIn.trim().slice(0, 2000);
+
+    if (!userEmail || !convId) {
+      return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
+    }
+
+    const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
+    const members = (parts || []).map((p) => normEmail(p.user_id));
+    if (!members.includes(userEmail)) {
+      return res.status(403).json({ success: false, error: 'Not a participant' });
+    }
+
+    const { data: conv } = await supabase.from('chat_conversations').select('type').eq('id', convId).maybeSingle();
+    if (!conv || conv.type !== 'group') {
+      return res.status(400).json({ success: false, error: 'Not a group conversation' });
+    }
+
+    const { error: upErr } = await supabase
+      .from('chat_conversations')
+      .update({ group_description: groupDescription })
+      .eq('id', convId);
+
+    if (upErr && isMissingGroupDescriptionColumnError(upErr)) {
+      return res.status(500).json({
+        success: false,
+        error: 'Database column group_description missing — run migration-chat-group-description.sql',
+      });
+    }
+    if (upErr) {
+      console.error('PATCH /api/chat/group-description:', upErr);
+      return res.status(500).json({ success: false, error: upErr.message });
+    }
+
+    res.json({ success: true, group_description: groupDescription });
+  } catch (err) {
+    console.error('PATCH /api/chat/group-description:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/chat/group-messages?user_email=&conversation_id=
+app.get('/api/chat/group-messages', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.query.user_email);
+    const convId = req.query.conversation_id != null ? String(req.query.conversation_id).trim() : '';
+    if (!userEmail || !convId) return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
+
+    const { data: parts } = await supabase
+      .from('chat_participants')
+      .select('user_id, display_name, profile_picture_url')
+      .eq('conversation_id', convId);
+    const members = (parts || []).map((p) => normEmail(p.user_id)).filter(Boolean);
+    if (!members.includes(userEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
+
+    let { data: messages, error: msgErr } = await supabase
+      .from('chat_messages')
+      .select('id, sender_id, body, created_at, media_type, media_url')
+      .eq('conversation_id', convId)
+      .order('created_at', { ascending: true });
+
+    const mapRow = (m, withMedia) => {
+      const isMe = normEmail(m.sender_id) === userEmail;
+      return {
+        id: m.id,
+        senderId: m.sender_id,
+        body: m.body,
+        mediaType: withMedia ? (m.media_type || null) : null,
+        mediaUrl: withMedia ? (m.media_url || null) : null,
+        createdAt: m.created_at,
+        isMe,
+      };
+    };
+
+    let list;
+    if (msgErr) {
+      const fb = await supabase
+        .from('chat_messages')
+        .select('id, sender_id, body, created_at')
+        .eq('conversation_id', convId)
+        .order('created_at', { ascending: true });
+      if (fb.error) return res.status(500).json({ success: false, error: fb.error.message });
+      list = (fb.data || []).map((m) => mapRow(m, false));
+    } else {
+      list = (messages || []).map((m) => mapRow(m, true));
+    }
+
+    let group = { title: 'קבוצה', profileImageUrl: null, description: null };
+    let convMeta = null;
+    const rAll = await supabase
+      .from('chat_conversations')
+      .select('title, group_image_url, group_description')
+      .eq('id', convId)
+      .maybeSingle();
+    if (!rAll.error && rAll.data) {
+      convMeta = rAll.data;
+    } else if (rAll.error && isMissingGroupDescriptionColumnError(rAll.error)) {
+      const r2 = await supabase.from('chat_conversations').select('title, group_image_url').eq('id', convId).maybeSingle();
+      if (!r2.error && r2.data) convMeta = { ...r2.data, group_description: null };
+      else if (r2.error && isMissingGroupImageUrlColumnError(r2.error)) {
+        const r3 = await supabase.from('chat_conversations').select('title').eq('id', convId).maybeSingle();
+        convMeta = r3.data ? { ...r3.data, group_image_url: null, group_description: null } : null;
+      }
+    } else if (rAll.error && isMissingGroupImageUrlColumnError(rAll.error)) {
+      const r2 = await supabase.from('chat_conversations').select('title, group_description').eq('id', convId).maybeSingle();
+      if (!r2.error && r2.data) convMeta = { ...r2.data, group_image_url: null };
+      else if (r2.error && isMissingGroupDescriptionColumnError(r2.error)) {
+        const r3 = await supabase.from('chat_conversations').select('title').eq('id', convId).maybeSingle();
+        convMeta = r3.data ? { ...r3.data, group_image_url: null, group_description: null } : null;
+      }
+    }
+    if (convMeta) {
+      const t = convMeta.title != null ? String(convMeta.title).trim() : '';
+      const pic =
+        convMeta.group_image_url != null && String(convMeta.group_image_url).trim()
+          ? String(convMeta.group_image_url).trim()
+          : null;
+      const desc =
+        convMeta.group_description != null && String(convMeta.group_description).trim()
+          ? String(convMeta.group_description).trim()
+          : null;
+      group = {
+        title: t || 'קבוצה',
+        profileImageUrl: pic,
+        description: desc,
+      };
+    }
+
+    const memberList = [];
+    for (const p of parts || []) {
+      const em = normEmail(p.user_id);
+      if (!em) continue;
+      memberList.push({
+        email: em,
+        name: p.display_name != null && String(p.display_name).trim() ? String(p.display_name).trim() : null,
+        profileImageUrl:
+          p.profile_picture_url != null && String(p.profile_picture_url).trim()
+            ? String(p.profile_picture_url).trim()
+            : null,
+      });
+    }
+    await Promise.all(
+      memberList.map(async (m) => {
+        if (m.name || m.profileImageUrl) return;
+        const { data: sub } = await supabase
+          .from('subscriptions')
+          .select(
+            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+          )
+          .ilike('email', m.email)
+          .maybeSingle();
+        if (sub) {
+          m.name = subscriptionDisplayNameFromRow(sub);
+          m.profileImageUrl = subscriptionProfilePicFromRow(sub);
+        }
+        if (!m.name) m.name = m.email.includes('@') ? m.email.split('@')[0] : m.email;
+      }),
+    );
+    memberList.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
+
+    res.json({ success: true, messages: list, conversation_id: convId, group, members: memberList });
+  } catch (err) {
+    console.error('GET /api/chat/group-messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/group-messages — body: conversation_id, sender_email, body, optional media
+app.post('/api/chat/group-messages', async (req, res) => {
+  try {
+    const senderEmail = normEmail(req.body.sender_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const bodyRaw = req.body.body != null ? String(req.body.body).trim() : '';
+    const mediaTypeRaw = req.body.media_type != null ? String(req.body.media_type).trim().toLowerCase() : '';
+    const mediaUrlRaw = req.body.media_url != null ? String(req.body.media_url).trim() : '';
+    const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'audio' ? mediaTypeRaw : '';
+    const mediaUrl = mediaUrlRaw;
+
+    if (!senderEmail || !convId) return res.status(400).json({ success: false, error: 'sender_email and conversation_id required' });
+    if (!bodyRaw && !mediaUrl) return res.status(400).json({ success: false, error: 'body or media_url required' });
+    if (mediaUrl && !mediaType) return res.status(400).json({ success: false, error: 'media_type required with media_url' });
+
+    const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
+    const members = (parts || []).map((p) => normEmail(p.user_id));
+    if (!members.includes(senderEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
+
+    const insertPayload = {
+      conversation_id: convId,
+      sender_id: senderEmail,
+      receiver_id: null,
+      body: bodyRaw || '',
+    };
+    if (mediaType && mediaUrl) {
+      insertPayload.media_type = mediaType;
+      insertPayload.media_url = mediaUrl;
+    }
+
+    const { data: msg, error } = await supabase
+      .from('chat_messages')
+      .insert(insertPayload)
+      .select('id, sender_id, body, created_at, media_type, media_url')
+      .single();
+    if (error) {
+      const fallbackRow = { conversation_id: convId, sender_id: senderEmail, receiver_id: null, body: bodyRaw || '' };
+      const fallback = await supabase.from('chat_messages').insert(fallbackRow).select('id, sender_id, body, created_at').single();
+      if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
+      await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
+      const fd = fallback.data;
+      return res.json({
+        success: true,
+        message: {
+          id: fd.id,
+          senderId: fd.sender_id,
+          body: fd.body,
+          mediaType: null,
+          mediaUrl: null,
+          createdAt: fd.created_at,
+          isMe: true,
+        },
+      });
+    }
+    await supabase.from('chat_conversations').update({ last_message_at: msg.created_at }).eq('id', convId);
+    res.json({
+      success: true,
+      message: {
+        id: msg.id,
+        senderId: msg.sender_id,
+        body: msg.body,
+        mediaType: msg.media_type || null,
+        mediaUrl: msg.media_url || null,
+        createdAt: msg.created_at,
+        isMe: true,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/chat/group-messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ==================== PROFILE REVIEWS ====================
 // GET /api/reviews?target_subscription_id=uuid – list reviews for a profile
 app.get('/api/reviews', async (req, res) => {
@@ -1034,7 +1607,7 @@ function sortListingsByFeedAlgorithm(adsRows, userIdParam, supabaseClient) {
   })();
 }
 
-// GET /api/listings - fetch published listings from unified ads table (optional filter by category, subscription_type, has_video)
+// GET /api/listings - optional: category, subscription_type, has_video, condition, search_purpose, feed_post, hospitality_nature
 // Optional query: user_id - if provided, each listing gets liked: true/false and feed is sorted by smart algorithm (preferences from likes + exposure level).
 // Media (images/video) are stored in bucket user-photo-video; URLs are in ads row.
 app.get('/api/listings', async (req, res) => {
@@ -1043,8 +1616,55 @@ app.get('/api/listings', async (req, res) => {
     const category = req.query.category ? parseInt(req.query.category, 10) : null;
     const subscriptionTypeParam = typeof req.query.subscription_type === 'string' ? req.query.subscription_type.trim() : null;
     const hasVideo = req.query.has_video === 'true' || req.query.has_video === true;
+    const conditionParam =
+      typeof req.query.condition === 'string' ? req.query.condition.trim().toLowerCase() : '';
+    const allowedListingConditions = new Set(['new', 'renovated', 'old']);
+    const applyConditionFilter = (q) => {
+      if (!allowedListingConditions.has(conditionParam)) return q;
+      if (conditionParam === 'new') return q.in('condition', ['new', 'חדש']);
+      if (conditionParam === 'renovated') return q.in('condition', ['renovated', 'משופץ']);
+      if (conditionParam === 'old') return q.in('condition', ['old', 'ישן']);
+      return q;
+    };
     const subscriptionIdParam = typeof req.query.subscription_id === 'string' ? req.query.subscription_id.trim() : null;
     const userIdParam = typeof req.query.user_id === 'string' ? req.query.user_id.trim() : null;
+    // שותפים (category 3) feed: filter by roommate search intent or graphic posts
+    const searchPurposeParam =
+      typeof req.query.search_purpose === 'string' ? req.query.search_purpose.trim().toLowerCase() : '';
+    const allowedSearchPurposes = new Set(['enter', 'bring_in', 'partner']);
+    const feedPostOnly =
+      req.query.feed_post === 'true' || req.query.feed_post === true;
+    const applySearchPurposeAndFeedPost = (q) => {
+      let out = q;
+      if (searchPurposeParam && allowedSearchPurposes.has(searchPurposeParam)) {
+        out = out.eq('search_purpose', searchPurposeParam);
+      }
+      if (feedPostOnly) {
+        out = out.eq('description', 'פוסט');
+      }
+      return out;
+    };
+    // BnB (category 5): אופי האירוח — must match HospitalityNature / ads.hospitality_nature
+    const hospitalityNatureParam =
+      typeof req.query.hospitality_nature === 'string'
+        ? req.query.hospitality_nature.trim()
+        : '';
+    const allowedHospitalityNatures = new Set([
+      'landscapes',
+      'on_the_beach',
+      'with_pool',
+      'nature',
+      'experiences',
+      'special',
+      'rural',
+      'desert',
+    ]);
+    const applyHospitalityNature = (q) => {
+      if (!hospitalityNatureParam || !allowedHospitalityNatures.has(hospitalityNatureParam)) {
+        return q;
+      }
+      return q.eq('hospitality_nature', hospitalityNatureParam);
+    };
     const favoritesOnly =
       req.query.favorites_only === 'true' ||
       req.query.favorites_only === true ||
@@ -1102,6 +1722,9 @@ app.get('/api/listings', async (req, res) => {
     if (hasVideo) {
       query = query.not('video_url', 'is', null);
     }
+    query = applyConditionFilter(query);
+    query = applySearchPurposeAndFeedPost(query);
+    query = applyHospitalityNature(query);
     // subscription_id param = "owner view" (Edit/Publish Ad): show that owner's ads including frozen
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const validSubscriptionId = subscriptionIdParam && uuidRegex.test(subscriptionIdParam) ? subscriptionIdParam : null;
@@ -1141,6 +1764,9 @@ app.get('/api/listings', async (req, res) => {
       if (subscriptionTypes.length === 1) fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
       else if (subscriptionTypes.length > 1) fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
       if (hasVideo) fallbackQuery = fallbackQuery.not('video_url', 'is', null);
+      fallbackQuery = applyConditionFilter(fallbackQuery);
+      fallbackQuery = applySearchPurposeAndFeedPost(fallbackQuery);
+      fallbackQuery = applyHospitalityNature(fallbackQuery);
       if (isOwnerView) {
         if (validSubscriptionId) fallbackQuery = fallbackQuery.eq('subscription_id', validSubscriptionId);
         else fallbackQuery = fallbackQuery.eq('owner_id', subscriptionIdParam.trim());
@@ -1491,6 +2117,52 @@ function normEmail(email) {
   return (email != null ? String(email).trim().toLowerCase() : '') || '';
 }
 
+function subscriptionDisplayNameFromRow(sub) {
+  if (!sub) return null;
+  const type = (sub.subscription_type || '').toLowerCase();
+  if (type === 'company') return sub.business_name || sub.name || sub.contact_person_name || null;
+  if (type === 'broker') return sub.broker_office_name || sub.name || sub.contact_person_name || null;
+  if (type === 'professional') return sub.name || sub.business_name || sub.contact_person_name || null;
+  return sub.name || sub.contact_person_name || sub.business_name || null;
+}
+
+function subscriptionProfilePicFromRow(sub) {
+  if (!sub) return null;
+  const type = (sub.subscription_type || '').toLowerCase();
+  return sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+}
+
+/** PostgREST/Postgres when `group_image_url` migration was not applied yet */
+function isMissingGroupImageUrlColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  return /group_image_url/i.test(msg) && (/does not exist/i.test(msg) || /42703/i.test(msg) || /undefined column/i.test(msg));
+}
+
+/** When `group_description` migration was not applied yet */
+function isMissingGroupDescriptionColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  return /group_description/i.test(msg) && (/does not exist/i.test(msg) || /42703/i.test(msg) || /undefined column/i.test(msg));
+}
+
+/** ads.category → Hebrew badge on chat list (when last message has listing_id) */
+const CHAT_LISTING_CATEGORY_LABELS = {
+  1: 'חדש מקבלן',
+  2: 'משרדים',
+  3: 'שותפים',
+  4: 'גלובל',
+  5: 'BnB',
+  6: 'מגזר דתי',
+  7: 'קרקעות',
+  8: 'מסחרי',
+  9: 'נכסים',
+  10: 'דירות',
+  12: 'יוקרה',
+};
+
+/** Accept standard hyphenated UUIDs from clients (any version). */
+const CHAT_LISTING_ID_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // GET /api/chat/unread-count?user_email=...&after=:iso_timestamp
 app.get('/api/chat/unread-count', async (req, res) => {
   try {
@@ -1534,22 +2206,138 @@ app.get('/api/chat/conversations', async (req, res) => {
       participantsByConv[p.conversation_id].push(p);
     });
 
-    const { data: convs } = await supabase
+    let { data: convs, error: convsSelectErr } = await supabase
       .from('chat_conversations')
-      .select('id, last_message_at')
+      .select('id, last_message_at, type, title, group_image_url')
       .in('id', convIds)
       .order('last_message_at', { ascending: false, nullsFirst: false });
+    if (convsSelectErr && isMissingGroupImageUrlColumnError(convsSelectErr)) {
+      const fb = await supabase
+        .from('chat_conversations')
+        .select('id, last_message_at, type, title')
+        .in('id', convIds)
+        .order('last_message_at', { ascending: false, nullsFirst: false });
+      convs = fb.data;
+    }
 
-    const { data: lastMessages } = await supabase
+    let lastMessages;
+    const lm1 = await supabase
       .from('chat_messages')
-      .select('conversation_id, body, created_at, sender_id')
+      .select('conversation_id, body, created_at, sender_id, media_type, listing_id')
       .in('conversation_id', convIds);
+    if (lm1.error) {
+      const lm2 = await supabase
+        .from('chat_messages')
+        .select('conversation_id, body, created_at, sender_id, media_type, listing_id')
+        .in('conversation_id', convIds);
+      if (lm2.error) {
+        const lm3 = await supabase
+          .from('chat_messages')
+          .select('conversation_id, body, created_at, sender_id, listing_id')
+          .in('conversation_id', convIds);
+        lastMessages = lm3.data;
+      } else {
+        lastMessages = lm2.data;
+      }
+    } else {
+      lastMessages = lm1.data;
+    }
     const lastByConv = {};
     (lastMessages || []).forEach(m => {
       if (!lastByConv[m.conversation_id] || new Date(m.created_at) > new Date(lastByConv[m.conversation_id].created_at)) {
         lastByConv[m.conversation_id] = m;
       }
     });
+
+    /** Newest message in thread that carries listing_id (so badges survive when latest text msg omitted listing_id). */
+    const latestListingIdByConv = {};
+    (lastMessages || []).forEach(m => {
+      const lid = m.listing_id;
+      if (lid == null || String(lid).trim() === '') return;
+      const cid = m.conversation_id;
+      const prev = latestListingIdByConv[cid];
+      if (!prev || new Date(m.created_at) > new Date(prev.at)) {
+        latestListingIdByConv[cid] = { listing_id: lid, at: m.created_at };
+      }
+    });
+
+    const listingIds = [...new Set(
+      [
+        ...Object.values(lastByConv).map(m => m.listing_id),
+        ...Object.values(latestListingIdByConv).map(x => x.listing_id),
+      ].filter(id => id != null && String(id).trim() !== ''),
+    )];
+    const adsByListingId = {};
+    /** ad id → 1-based index by upload order for that publisher (subscription_id, else owner_id-only). */
+    let listingUploadOrderById = {};
+    if (listingIds.length > 0) {
+      const { data: adRows } = await supabase
+        .from('ads')
+        .select('id, category, subscription_id, owner_id, created_at')
+        .in('id', listingIds);
+      (adRows || []).forEach(a => {
+        adsByListingId[String(a.id)] = a;
+      });
+
+      const subIds = [...new Set((adRows || []).map(a => a.subscription_id).filter(Boolean))];
+      const ownerIdsForRank = [
+        ...new Set(
+          (adRows || [])
+            .filter(a => !a.subscription_id && a.owner_id)
+            .map(a => String(a.owner_id).trim())
+            .filter(Boolean),
+        ),
+      ];
+
+      const publisherAds = [];
+      if (subIds.length > 0) {
+        const { data: subAds } = await supabase
+          .from('ads')
+          .select('id, created_at, subscription_id, owner_id')
+          .in('subscription_id', subIds);
+        publisherAds.push(...(subAds || []));
+      }
+      if (ownerIdsForRank.length > 0) {
+        const { data: ownAds } = await supabase
+          .from('ads')
+          .select('id, created_at, subscription_id, owner_id')
+          .in('owner_id', ownerIdsForRank)
+          .is('subscription_id', null);
+        publisherAds.push(...(ownAds || []));
+      }
+
+      const seenPub = new Set();
+      const uniquePublisherAds = [];
+      for (const a of publisherAds) {
+        const k = String(a.id);
+        if (seenPub.has(k)) continue;
+        seenPub.add(k);
+        uniquePublisherAds.push(a);
+      }
+
+      const byPublisherKey = {};
+      for (const a of uniquePublisherAds) {
+        const key = a.subscription_id
+          ? `s:${a.subscription_id}`
+          : a.owner_id
+            ? `o:${String(a.owner_id).trim()}`
+            : null;
+        if (!key) continue;
+        if (!byPublisherKey[key]) byPublisherKey[key] = [];
+        byPublisherKey[key].push(a);
+      }
+      for (const key of Object.keys(byPublisherKey)) {
+        const list = byPublisherKey[key].sort((x, y) => {
+          const tx = new Date(x.created_at || 0).getTime();
+          const ty = new Date(y.created_at || 0).getTime();
+          if (tx !== ty) return tx - ty;
+          return String(x.id).localeCompare(String(y.id));
+        });
+        list.forEach((row, idx) => {
+          listingUploadOrderById[String(row.id)] = idx + 1;
+        });
+      }
+    }
 
     const otherEmails = [...new Set(
       (convs || []).flatMap(c => (participantsByConv[c.id] || []).map(p => p.user_id).filter(e => normEmail(e) !== userEmail))
@@ -1579,26 +2367,79 @@ app.get('/api/chat/conversations', async (req, res) => {
 
     const conversations = (convs || []).map(c => {
       const participants = participantsByConv[c.id] || [];
+      const isGroup = (c.type === 'group') || participants.length > 2;
+      if (isGroup) {
+        const last = lastByConv[c.id];
+        let preview = '';
+        if (last) {
+          const t = (last.body || '').trim();
+          if (t) preview = t.slice(0, 120);
+          else if (last.media_type === 'image') preview = 'תמונה';
+          else if (last.media_type === 'audio') preview = 'הודעה קולית';
+        }
+        const lastLid =
+          last?.listing_id != null && String(last.listing_id).trim() !== '' ? last.listing_id : null;
+        const listingId = lastLid || latestListingIdByConv[c.id]?.listing_id || null;
+        const adRow = listingId ? adsByListingId[String(listingId)] : null;
+        const catNum = adRow?.category != null ? Number(adRow.category) : NaN;
+        const listingCategoryLabel = !Number.isNaN(catNum) ? (CHAT_LISTING_CATEGORY_LABELS[catNum] || null) : null;
+        const listingDisplayNumber =
+          listingId != null ? listingUploadOrderById[String(listingId)] ?? null : null;
+        const gTitle = (c.title && String(c.title).trim()) || 'קבוצה';
+        const gPic = c.group_image_url != null && String(c.group_image_url).trim() ? String(c.group_image_url).trim() : null;
+        return {
+          id: c.id,
+          isGroup: true,
+          otherUserEmail: null,
+          name: gTitle,
+          profileImageUrl: gPic,
+          preview,
+          time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
+          lastMessageAt: last?.created_at || c.last_message_at || null,
+          listingId,
+          listingDisplayNumber,
+          listingCategoryLabel,
+        };
+      }
       const other = participants.find(p => normEmail(p.user_id) !== userEmail);
       const otherEmail = other ? normEmail(other.user_id) : null;
       const display = otherEmail ? displayByEmail[otherEmail] : {};
       const name = display?.name || (other && other.display_name) || 'משתמש';
       const profileImageUrl = display?.profile_picture_url || (other && other.profile_picture_url) || null;
       const last = lastByConv[c.id];
+      let preview = '';
+      if (last) {
+        const t = (last.body || '').trim();
+        if (t) preview = t.slice(0, 120);
+        else if (last.media_type === 'image') preview = 'תמונה';
+        else if (last.media_type === 'audio') preview = 'הודעה קולית';
+      }
+      const lastLid =
+        last?.listing_id != null && String(last.listing_id).trim() !== '' ? last.listing_id : null;
+      const listingId = lastLid || latestListingIdByConv[c.id]?.listing_id || null;
+      const adRow = listingId ? adsByListingId[String(listingId)] : null;
+      const catNum = adRow?.category != null ? Number(adRow.category) : NaN;
+      const listingCategoryLabel = !Number.isNaN(catNum) ? (CHAT_LISTING_CATEGORY_LABELS[catNum] || null) : null;
+      const listingDisplayNumber =
+        listingId != null ? listingUploadOrderById[String(listingId)] ?? null : null;
       return {
         id: c.id,
+        isGroup: false,
         otherUserEmail: otherEmail,
         name,
         profileImageUrl,
-        preview: last ? (last.body || '').slice(0, 80) : '',
+        preview,
         time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
-        lastMessageAt: c.last_message_at,
+        lastMessageAt: last?.created_at || c.last_message_at || null,
+        listingId,
+        listingDisplayNumber,
+        listingCategoryLabel,
       };
     });
 
     const byOther = {};
     conversations.forEach(conv => {
-      const oid = conv.otherUserEmail || conv.id;
+      const oid = conv.isGroup ? String(conv.id) : (conv.otherUserEmail || conv.id);
       const existing = byOther[oid];
       if (!existing || (conv.lastMessageAt && (!existing.lastMessageAt || new Date(conv.lastMessageAt) > new Date(existing.lastMessageAt)))) {
         byOther[oid] = conv;
@@ -1672,22 +2513,40 @@ app.get('/api/chat/messages', async (req, res) => {
 
     if (!sharedConvId) return res.json({ success: true, messages: [] });
 
-    const { data: messages } = await supabase
-      .from('chat_messages')
-      .select('id, sender_id, body, created_at')
-      .eq('conversation_id', sharedConvId)
-      .order('created_at', { ascending: true });
-
-    const list = (messages || []).map(m => {
+    const mapRow = (m, withMedia) => {
       const isMe = normEmail(m.sender_id) === myEmail;
       return {
         id: m.id,
         senderId: m.sender_id,
         body: m.body,
+        mediaType: withMedia ? (m.media_type || null) : null,
+        mediaUrl: withMedia ? (m.media_url || null) : null,
         createdAt: m.created_at,
         isMe,
       };
-    });
+    };
+
+    let { data: messages, error: msgErr } = await supabase
+      .from('chat_messages')
+      .select('id, sender_id, body, created_at, media_type, media_url')
+      .eq('conversation_id', sharedConvId)
+      .order('created_at', { ascending: true });
+
+    let list;
+    if (msgErr) {
+      const fb = await supabase
+        .from('chat_messages')
+        .select('id, sender_id, body, created_at')
+        .eq('conversation_id', sharedConvId)
+        .order('created_at', { ascending: true });
+      if (fb.error) {
+        console.error('GET /api/chat/messages (fallback):', fb.error.message);
+        return res.status(500).json({ success: false, error: fb.error.message });
+      }
+      list = (fb.data || []).map(m => mapRow(m, false));
+    } else {
+      list = (messages == null ? [] : messages).map(m => mapRow(m, true));
+    }
     res.json({ success: true, messages: list, conversation_id: sharedConvId });
   } catch (err) {
     console.error('GET /api/chat/messages:', err);
@@ -1695,19 +2554,36 @@ app.get('/api/chat/messages', async (req, res) => {
   }
 });
 
-// POST /api/chat/messages - body: sender_email, receiver_email, body; optional display names/pics
+// POST /api/chat/messages - body: sender_email, receiver_email, body (optional if media); optional media_type, media_url
 app.post('/api/chat/messages', async (req, res) => {
   try {
     const senderEmail = normEmail(req.body.sender_email || req.query.sender_email);
     const receiverEmail = normEmail(req.body.receiver_email || req.query.receiver_email);
-    const body = req.body.body != null ? String(req.body.body).trim() : null;
+    const bodyRaw = req.body.body != null ? String(req.body.body).trim() : '';
+    const body = bodyRaw;
+    const mediaTypeRaw = req.body.media_type != null ? String(req.body.media_type).trim().toLowerCase() : '';
+    const mediaUrlRaw = req.body.media_url != null ? String(req.body.media_url).trim() : '';
+    const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'audio' ? mediaTypeRaw : '';
+    const mediaUrl = mediaUrlRaw;
     const receiverDisplayName = req.body.receiver_display_name != null ? String(req.body.receiver_display_name).trim() || null : null;
     const receiverProfilePictureUrl = req.body.receiver_profile_picture_url != null ? String(req.body.receiver_profile_picture_url).trim() || null : null;
     const senderDisplayName = req.body.sender_display_name != null ? String(req.body.sender_display_name).trim() || null : null;
     const senderProfilePictureUrl = req.body.sender_profile_picture_url != null ? String(req.body.sender_profile_picture_url).trim() || null : null;
+    const listingIdRaw = req.body.listing_id != null ? String(req.body.listing_id).trim() : '';
+    const listingIdForMessage =
+      listingIdRaw && CHAT_LISTING_ID_UUID_RE.test(listingIdRaw) ? listingIdRaw : null;
 
-    if (!senderEmail || !receiverEmail || body === null || body === '') {
-      return res.status(400).json({ success: false, error: 'sender_email, receiver_email, and body required' });
+    if (!senderEmail || !receiverEmail) {
+      return res.status(400).json({ success: false, error: 'sender_email and receiver_email required' });
+    }
+    if (!body && !mediaUrl) {
+      return res.status(400).json({ success: false, error: 'body or media_url required' });
+    }
+    if (mediaUrl && !mediaType) {
+      return res.status(400).json({ success: false, error: 'media_type must be image or audio when media_url is set' });
+    }
+    if (mediaType && !mediaUrl) {
+      return res.status(400).json({ success: false, error: 'media_url required when media_type is set' });
     }
 
     let convId = null;
@@ -1760,16 +2636,64 @@ app.post('/api/chat/messages', async (req, res) => {
       }
     }
 
-    const insertPayload = { conversation_id: convId, sender_id: senderEmail, receiver_id: receiverEmail, body };
-    const { data: msg, error } = await supabase.from('chat_messages').insert(insertPayload).select('id, sender_id, body, created_at').single();
+    const insertPayload = {
+      conversation_id: convId,
+      sender_id: senderEmail,
+      receiver_id: receiverEmail,
+      body: body || '',
+    };
+    if (mediaType && mediaUrl) {
+      insertPayload.media_type = mediaType;
+      insertPayload.media_url = mediaUrl;
+    }
+    if (listingIdForMessage) {
+      insertPayload.listing_id = listingIdForMessage;
+    }
+    const { data: msg, error } = await supabase
+      .from('chat_messages')
+      .insert(insertPayload)
+      .select('id, sender_id, body, created_at, media_type, media_url')
+      .single();
     if (error) {
-      const fallback = await supabase.from('chat_messages').insert({ conversation_id: convId, sender_id: senderEmail, body }).select('id, sender_id, body, created_at').single();
+      if (mediaType && mediaUrl) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+      const fallbackRow = { conversation_id: convId, sender_id: senderEmail, body: body || '' };
+      if (listingIdForMessage) fallbackRow.listing_id = listingIdForMessage;
+      const fallback = await supabase
+        .from('chat_messages')
+        .insert(fallbackRow)
+        .select('id, sender_id, body, created_at')
+        .single();
       if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
       await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
-      return res.json({ success: true, message: { id: fallback.data.id, senderId: fallback.data.sender_id, body: fallback.data.body, createdAt: fallback.data.created_at, isMe: true } });
+      const fd = fallback.data;
+      return res.json({
+        success: true,
+        message: {
+          id: fd.id,
+          senderId: fd.sender_id,
+          body: fd.body,
+          mediaType: null,
+          mediaUrl: null,
+          createdAt: fd.created_at,
+          isMe: true,
+        },
+      });
     }
     await supabase.from('chat_conversations').update({ last_message_at: msg.created_at }).eq('id', convId);
-    res.json({ success: true, message: { id: msg.id, senderId: msg.sender_id, body: msg.body, createdAt: msg.created_at, isMe: true } });
+    res.json({
+      success: true,
+      message: {
+        id: msg.id,
+        senderId: msg.sender_id,
+        body: msg.body,
+        mediaType: msg.media_type || null,
+        mediaUrl: msg.media_url || null,
+        createdAt: msg.created_at,
+        isMe: true,
+      },
+    });
   } catch (err) {
     console.error('POST /api/chat/messages:', err);
     res.status(500).json({ success: false, error: err.message });
@@ -1892,6 +2816,9 @@ app.post('/api/listings', async (req, res) => {
       constructionStatus,
       saleAtPresale,
       generalDetails,
+      bnbHostType,
+      bnbBusinessLogoUrl,
+      hotDeal,
       projectOffers,
       companyOffersLandSizes,
       salesImageUrl,
@@ -1948,6 +2875,10 @@ app.post('/api/listings', async (req, res) => {
       video_url: videoUrl || null,
       sales_image_url: salesImageUrl || null,
       profile_image_url: profileImageUrl || null,
+      bnb_business_logo_url:
+        typeof bnbBusinessLogoUrl === 'string' && bnbBusinessLogoUrl.trim() !== ''
+          ? bnbBusinessLogoUrl.trim()
+          : null,
       display_option: displayOption || null,
       feed_display_priority: feedDisplayPriority === 'mainImage' ? 'mainImage' : (feedDisplayPriority === 'video' ? 'video' : null),
       property_type: propertyType || null,
@@ -1976,6 +2907,12 @@ app.post('/api/listings', async (req, res) => {
       service_facility: serviceFacility && typeof serviceFacility === 'object' ? serviceFacility : null,
       accommodation_offers: accommodationOffers && typeof accommodationOffers === 'object' ? accommodationOffers : null,
       cancellation_policy: cancellationPolicy || null,
+      hot_deal: !!(
+        hotDeal === true ||
+        hotDeal === 'true' ||
+        hotDeal === 1 ||
+        hotDeal === '1'
+      ),
       contact_details: contactDetails && typeof contactDetails === 'object' ? contactDetails : null,
       proposed_land: proposedLand && typeof proposedLand === 'object' ? proposedLand : null,
       plan_approval: planApproval || null,
@@ -2007,7 +2944,16 @@ app.post('/api/listings', async (req, res) => {
       })(),
       construction_status: constructionStatus || null,
       sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
-      general_details: generalDetails && typeof generalDetails === 'object' ? generalDetails : null,
+      general_details: (() => {
+        const base =
+          generalDetails && typeof generalDetails === 'object' ? {...generalDetails} : {};
+        const bnb =
+          bnbHostType === 'private' || bnbHostType === 'business'
+            ? String(bnbHostType)
+            : null;
+        if (bnb) base.bnb_host_type = bnb;
+        return Object.keys(base).length ? base : null;
+      })(),
       project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,
       company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null,
       exposure_level: ['low', 'medium', 'high'].includes(String(exposureLevel || '').toLowerCase()) ? String(exposureLevel).toLowerCase() : 'medium'
@@ -2102,6 +3048,66 @@ app.patch('/api/listings/:id', async (req, res) => {
 });
 
 // ==================== FILE UPLOAD ENDPOINTS ====================
+
+// Chat images / voice: bucket "chat" (public read recommended for getPublicUrl)
+app.post('/api/chat/upload-media', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No file provided. Use form field name "file".' });
+    }
+    if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
+      return res.status(503).json({ success: false, error: 'Server upload not configured.' });
+    }
+    const mime = (req.file.mimetype || '').toLowerCase();
+    if (!mime.startsWith('image/') && !mime.startsWith('audio/')) {
+      return res.status(400).json({ success: false, error: 'Only image or audio files are allowed.' });
+    }
+    const fromName = (req.file.originalname || '').match(/\.([a-zA-Z0-9]+)$/)?.[1];
+    const guessExt =
+      mime.includes('jpeg') || mime.includes('jpg')
+        ? 'jpg'
+        : mime.includes('png')
+          ? 'png'
+          : mime.includes('webp')
+            ? 'webp'
+            : mime.includes('gif')
+              ? 'gif'
+              : mime.includes('m4a')
+                ? 'm4a'
+                : mime.includes('mp3')
+                  ? 'mp3'
+                  : mime.includes('wav')
+                    ? 'wav'
+                    : mime.includes('ogg')
+                      ? 'ogg'
+                      : mime.includes('mpeg')
+                        ? 'mp3'
+                        : mime.includes('mp4') && mime.startsWith('audio/')
+                          ? 'm4a'
+                          : null;
+    const safeExt = String(fromName || guessExt || 'bin').replace(/[^a-zA-Z0-9]/g, '') || 'bin';
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${safeExt}`;
+    const { error } = await supabase.storage
+      .from('chat')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype || 'application/octet-stream',
+        upsert: false,
+      });
+    if (error) {
+      console.error('Chat bucket upload error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to upload to storage. Create a public "chat" bucket in Supabase if missing.',
+        details: error.message,
+      });
+    }
+    const { data: urlData } = supabase.storage.from('chat').getPublicUrl(fileName);
+    res.json({ success: true, url: urlData.publicUrl });
+  } catch (err) {
+    console.error('POST /api/chat/upload-media:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // Upload profile picture to bucket profile-pics (e.g. when moving from stage 1 to stage 2)
 app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req, res) => {
