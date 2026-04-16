@@ -11,8 +11,23 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, _res, buf) => {
+    req.rawBody = buf ? buf.toString('utf8') : '';
+  },
+}));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use((err, req, res, next) => {
+  if (err && err instanceof SyntaxError && 'body' in err) {
+    console.error(`[JSON PARSE ERROR] ${req.method} ${req.originalUrl}`, {
+      message: err.message,
+      rawBodyPreview: String(req.rawBody || '').slice(0, 300),
+    });
+    return res.status(400).json({ success: false, error: 'Invalid JSON body' });
+  }
+  return next(err);
+});
 
 // Initialize Supabase client with longer timeout to reduce ConnectTimeoutError (e.g. 30s)
 const FETCH_TIMEOUT_MS = Number(process.env.SUPABASE_FETCH_TIMEOUT_MS) || 30000;
@@ -214,6 +229,74 @@ Give practical, factual info relevant to someone considering a property there. N
   }
 });
 
+/**
+ * Test-only skip verify. Explicit ALLOW_SKIP_EMAIL_VERIFICATION=0 forces off.
+ * =1 / true turns on even in production (avoid). If unset: on when NODE_ENV is not production (typical localhost).
+ */
+function allowSkipEmailVerificationTest() {
+  const v = String(process.env.ALLOW_SKIP_EMAIL_VERIFICATION || '')
+    .trim()
+    .toLowerCase();
+  if (v === 'false' || v === '0' || v === 'no' || v === 'off') {
+    return false;
+  }
+  if (v === 'true' || v === '1' || v === 'yes' || v === 'on') {
+    return true;
+  }
+  return process.env.NODE_ENV !== 'production';
+}
+
+/** Assign subscriber number and mark subscription verified (shared by /verify and test skip). */
+async function finalizeSubscriptionVerification(subscription) {
+  let subscriberNumber;
+  let isUnique = false;
+  let attempts = 0;
+  const maxAttempts = 10;
+
+  while (!isUnique && attempts < maxAttempts) {
+    subscriberNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
+    const { data: existing } = await supabase
+      .from('subscriptions')
+      .select('id')
+      .eq('subscriber_number', subscriberNumber)
+      .single();
+
+    if (!existing) {
+      isUnique = true;
+    }
+    attempts++;
+  }
+
+  if (!isUnique) {
+    subscriberNumber = (Date.now() % 900000000 + 100000000).toString();
+    console.warn(
+      'Could not generate unique subscriber number, using timestamp-based:',
+      subscriberNumber,
+    );
+  }
+
+  console.log('Generated subscriber number:', subscriberNumber);
+
+  const { data: updatedSubscription, error: updateError } = await supabase
+    .from('subscriptions')
+    .update({
+      status: 'verified',
+      subscriber_number: subscriberNumber,
+      verified_at: new Date().toISOString(),
+    })
+    .eq('id', subscription.id)
+    .select()
+    .single();
+
+  if (updateError) {
+    const err = new Error('Failed to verify subscription');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  return { updatedSubscription, subscriberNumber };
+}
+
 // ==================== SUBSCRIPTION ENDPOINTS ====================
 
 // Submit subscription form (all types: broker, company, professional)
@@ -342,21 +425,52 @@ app.post('/api/subscription/submit', upload.fields([
         }
       }
 
-      // Upload video
+      // Upload profile intro video (profile-vids; fallback to user-pohto-video if bucket missing)
       if (req.files.video && req.files.video[0]) {
         const videoFile = req.files.video[0];
-        const fileName = `video-${Date.now()}-${videoFile.originalname}`;
-        const { data, error } = await supabase.storage
-          .from('user-pohto-video')
-          .upload(`videos/${fileName}`, videoFile.buffer, {
-            contentType: videoFile.mimetype,
-            upsert: false
+        const safeVideoName = (videoFile.originalname || 'video.mp4')
+          .replace(/[^a-zA-Z0-9._-]/g, '_')
+          .replace(/^_+|_+$/g, '') || 'video.mp4';
+        const fileName = `video-${Date.now()}-${safeVideoName}`;
+        const objectPath = `profile-videos/${fileName}`;
+        let bucket = 'profile-vids';
+        let { data, error } = await supabase.storage
+          .from(bucket)
+          .upload(objectPath, videoFile.buffer, {
+            contentType: videoFile.mimetype || 'video/mp4',
+            upsert: false,
           });
-        
-        if (!error && data) {
+
+        if (error) {
+          console.warn(
+            '[subscription] profile-vids upload failed, trying user-pohto-video:',
+            error.message,
+          );
+          bucket = 'user-pohto-video';
+          const fallbackPath = `profile-videos/${fileName}`;
+          const r2 = await supabase.storage
+            .from(bucket)
+            .upload(fallbackPath, videoFile.buffer, {
+              contentType: videoFile.mimetype || 'video/mp4',
+              upsert: false,
+            });
+          data = r2.data;
+          error = r2.error;
+          if (!error && data) {
+            const { data: urlData } = supabase.storage
+              .from(bucket)
+              .getPublicUrl(fallbackPath);
+            fileUrls.video = urlData.publicUrl;
+          } else if (error) {
+            console.error(
+              'Profile video upload failed (profile-vids and fallback):',
+              error.message,
+            );
+          }
+        } else if (data) {
           const { data: urlData } = supabase.storage
-            .from('user-pohto-video')
-            .getPublicUrl(`videos/${fileName}`);
+            .from(bucket)
+            .getPublicUrl(objectPath);
           fileUrls.video = urlData.publicUrl;
         }
       }
@@ -537,53 +651,16 @@ app.post('/api/subscription/verify', async (req, res) => {
       }
     }
 
-    // Generate unique subscriber number (9 digits)
-    // Check for uniqueness to ensure it's a real, unique number
+    let updatedSubscription;
     let subscriberNumber;
-    let isUnique = false;
-    let attempts = 0;
-    const maxAttempts = 10;
-    
-    while (!isUnique && attempts < maxAttempts) {
-      subscriberNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
-      
-      // Check if this number already exists
-      const { data: existing } = await supabase
-        .from('subscriptions')
-        .select('id')
-        .eq('subscriber_number', subscriberNumber)
-        .single();
-      
-      if (!existing) {
-        isUnique = true;
-      }
-      attempts++;
-    }
-    
-    if (!isUnique) {
-      // Fallback: use timestamp-based number if we can't find a unique random one
-      subscriberNumber = (Date.now() % 900000000 + 100000000).toString();
-      console.warn('Could not generate unique subscriber number, using timestamp-based:', subscriberNumber);
-    }
-    
-    console.log('Generated subscriber number:', subscriberNumber);
-
-    // Update subscription status
-    const { data: updatedSubscription, error: updateError } = await supabase
-      .from('subscriptions')
-      .update({
-        status: 'verified',
-        subscriber_number: subscriberNumber,
-        verified_at: new Date().toISOString()
-      })
-      .eq('id', subscription.id)
-      .select()
-      .single();
-
-    if (updateError) {
-      return res.status(500).json({ 
-        success: false, 
-        error: 'Failed to verify subscription' 
+    try {
+      ({ updatedSubscription, subscriberNumber } =
+        await finalizeSubscriptionVerification(subscription));
+    } catch (finalizeErr) {
+      const code = finalizeErr.statusCode || 500;
+      return res.status(code).json({
+        success: false,
+        error: finalizeErr.message || 'Failed to verify subscription',
       });
     }
 
@@ -591,15 +668,81 @@ app.post('/api/subscription/verify', async (req, res) => {
       success: true,
       subscription: updatedSubscription,
       subscriberNumber: subscriberNumber,
-      message: 'Email verified successfully'
+      message: 'Email verified successfully',
     });
-
   } catch (error) {
     console.error('Error verifying subscription:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.status(500).json({
+      success: false,
+      error: error.message,
     });
+  }
+});
+
+// Dev/test only: verify without email code (set ALLOW_SKIP_EMAIL_VERIFICATION=1 in .env)
+app.post('/api/subscription/verify-skip-test', async (req, res) => {
+  try {
+    if (!allowSkipEmailVerificationTest()) {
+      return res.status(403).json({
+        success: false,
+        code: 'SKIP_VERIFY_DISABLED',
+        error:
+          'דילוג אימות (בדיקה) כבוי בשרת זה. להפעלה: הגדר ALLOW_SKIP_EMAIL_VERIFICATION=1 ב-.env של pi-back, או הרץ מקומית עם NODE_ENV שלא production.',
+      });
+    }
+    const { subscriptionId, email } = req.body || {};
+    if (!subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscriptionId is required',
+      });
+    }
+
+    const { data: subscription, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('id', subscriptionId)
+      .eq('status', 'pending_verification')
+      .single();
+
+    if (error || !subscription) {
+      return res.status(400).json({
+        success: false,
+        error: 'Subscription not found or already verified',
+      });
+    }
+
+    if (email && String(email).trim() && subscription.email !== String(email).trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email does not match this subscription',
+      });
+    }
+
+    let updatedSubscription;
+    let subscriberNumber;
+    try {
+      ({ updatedSubscription, subscriberNumber } =
+        await finalizeSubscriptionVerification(subscription));
+    } catch (finalizeErr) {
+      const code = finalizeErr.statusCode || 500;
+      return res.status(code).json({
+        success: false,
+        error: finalizeErr.message || 'Failed to verify subscription',
+      });
+    }
+
+    console.warn('[TEST] Email verification skipped for subscription', subscriptionId);
+
+    res.json({
+      success: true,
+      subscription: updatedSubscription,
+      subscriberNumber,
+      message: 'Verification skipped (test mode)',
+    });
+  } catch (error) {
+    console.error('Error in verify-skip-test:', error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -940,11 +1083,116 @@ app.get('/api/brokers/group-picker', async (req, res) => {
   }
 });
 
+// GET /api/users/group-picker?q=&exclude_email=&audience=regular|broker_only|non_regular|all
+// Used by "create group" picker:
+// - regular => only regular users
+// - broker_only => only brokers
+// - non_regular => only broker/company/professional
+app.get('/api/users/group-picker', async (req, res) => {
+  try {
+    const rawQ = req.query.q != null ? String(req.query.q).trim().toLowerCase() : '';
+    const excludeEmail = normEmail(req.query.exclude_email || '');
+    const audienceRaw = req.query.audience != null ? String(req.query.audience).trim().toLowerCase() : 'all';
+    const audience =
+      audienceRaw === 'regular' || audienceRaw === 'broker_only' || audienceRaw === 'non_regular'
+        ? audienceRaw
+        : 'all';
+    const limit = 120;
+
+    const isRegularType = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      if (!t) return true;
+      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+    };
+    const isNonRegularType = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      return t === 'broker' || t === 'company' || t === 'professional';
+    };
+    const typeLabel = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      if (t === 'broker') return 'מתווך';
+      if (t === 'company') return 'חברה';
+      if (t === 'professional') return 'בעל מקצוע';
+      return 'לקוח';
+    };
+
+    const { data: rows, error } = await supabase
+      .from('subscriptions')
+      .select(
+        'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, status',
+      )
+      .order('name', { ascending: true })
+      .limit(limit);
+
+    if (error) {
+      console.error('GET /api/users/group-picker:', error.message);
+      return res.status(500).json({ success: false, error: error.message, users: [] });
+    }
+
+    let list = (rows || []).filter((r) => {
+      const em = normEmail(r?.email);
+      if (!em) return false;
+      if (excludeEmail && em === excludeEmail) return false;
+      // Keep active/verified-like rows; also allow null status to avoid hiding older regular users.
+      const st = r?.status != null ? String(r.status).trim().toLowerCase() : '';
+      if (st && st === 'suspended') return false;
+      return true;
+    });
+
+    if (audience === 'regular') {
+      list = list.filter((r) => isRegularType(r?.subscription_type));
+    } else if (audience === 'broker_only') {
+      list = list.filter((r) => String(r?.subscription_type || '').trim().toLowerCase() === 'broker');
+    } else if (audience === 'non_regular') {
+      list = list.filter((r) => isNonRegularType(r?.subscription_type));
+    }
+
+    if (rawQ.length >= 1) {
+      list = list.filter((r) => {
+        const name = r?.name != null ? String(r.name).toLowerCase() : '';
+        const cp = r?.contact_person_name != null ? String(r.contact_person_name).toLowerCase() : '';
+        const bn = r?.business_name != null ? String(r.business_name).toLowerCase() : '';
+        const bo = r?.broker_office_name != null ? String(r.broker_office_name).toLowerCase() : '';
+        const em = r?.email != null ? String(r.email).toLowerCase() : '';
+        return (
+          name.includes(rawQ) ||
+          cp.includes(rawQ) ||
+          bn.includes(rawQ) ||
+          bo.includes(rawQ) ||
+          em.includes(rawQ)
+        );
+      });
+    }
+
+    const users = list.map((sub) => {
+      const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+      const email = normEmail(sub.email);
+      const title = (name && String(name).trim()) || email || 'משתמש';
+      return {
+        id: sub.id || email,
+        email,
+        title,
+        subtitle: typeLabel(sub.subscription_type),
+        profileImageUrl: imageUrl || null,
+        subscriptionType:
+          sub.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null,
+      };
+    });
+
+    res.json({ success: true, users });
+  } catch (err) {
+    console.error('GET /api/users/group-picker:', err);
+    res.status(500).json({ success: false, error: err.message, users: [] });
+  }
+});
+
 // GET /api/chat/direct-contacts?user_email=&q= — people from 1:1 chats (for customer group picker)
 app.get('/api/chat/direct-contacts', async (req, res) => {
   try {
     const userEmail = normEmail(req.query.user_email);
     const qRaw = req.query.q != null ? String(req.query.q).trim().toLowerCase() : '';
+    const audienceRaw = req.query.audience != null ? String(req.query.audience).trim().toLowerCase() : 'all';
+    const audience = audienceRaw === 'regular' || audienceRaw === 'non_regular' ? audienceRaw : 'all';
     if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
 
     const { data: myParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', userEmail);
@@ -972,10 +1220,66 @@ app.get('/api/chat/direct-contacts', async (req, res) => {
       const prev = byEmail.get(em);
       const title = prev ? disp || prev.title : disp || em;
       const profileImageUrl = (prev && prev.profileImageUrl) || pic;
-      byEmail.set(em, { email: em, title, subtitle: em, profileImageUrl });
+      const subscriptionType = prev?.subscriptionType || null;
+      byEmail.set(em, { email: em, title, subtitle: em, profileImageUrl, subscriptionType });
     });
 
+    const refs = [...byEmail.keys()];
+    const emailRefs = refs.filter((r) => r.includes('@'));
+    const idRefs = refs.filter((r) => !r.includes('@') && CHAT_UUID_RE.test(r));
+    const subsByRef = {};
+    if (emailRefs.length > 0) {
+      const orFilter = emailRefs.map((e) => `email.ilike.${e}`).join(',');
+      const { data: subsByEmail } = await supabase
+        .from('subscriptions')
+        .select(
+          'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .or(orFilter);
+      (subsByEmail || []).forEach((s) => {
+        const e = normEmail(s.email);
+        if (e) subsByRef[e] = s;
+      });
+    }
+    if (idRefs.length > 0) {
+      const { data: subsById } = await supabase
+        .from('subscriptions')
+        .select(
+          'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .in('id', idRefs);
+      (subsById || []).forEach((s) => {
+        if (s.id) subsByRef[String(s.id).toLowerCase()] = s;
+      });
+    }
+    for (const ref of refs) {
+      const sub = subsByRef[ref];
+      if (!sub) continue;
+      const row = byEmail.get(ref);
+      if (!row) continue;
+      const subName = subscriptionDisplayNameFromRow(sub);
+      const subPic = subscriptionProfilePicFromRow(sub);
+      const subType = sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : '';
+      if (subName) row.title = subName;
+      if (subPic) row.profileImageUrl = subPic;
+      row.subscriptionType = subType || null;
+      if ((!row.subtitle || row.subtitle === ref) && sub.email) {
+        row.subtitle = String(sub.email).trim();
+      }
+      byEmail.set(ref, row);
+    }
+
     let contacts = [...byEmail.values()];
+    const isRegularType = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      if (!t) return true;
+      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+    };
+    if (audience === 'regular') {
+      contacts = contacts.filter((c) => isRegularType(c?.subscriptionType));
+    } else if (audience === 'non_regular') {
+      contacts = contacts.filter((c) => !isRegularType(c?.subscriptionType));
+    }
     if (qRaw.length >= 1) {
       contacts = contacts.filter(
         (c) =>
@@ -1004,9 +1308,61 @@ app.post('/api/chat/groups', async (req, res) => {
       req.body.group_image_url != null && String(req.body.group_image_url).trim()
         ? String(req.body.group_image_url).trim().slice(0, 2000)
         : null;
+    const isRegularType = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      if (!t) return true;
+      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+    };
+    const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
 
     if (!creator) return res.status(400).json({ success: false, error: 'creator_email required' });
     if (memberEmails.length < 1) return res.status(400).json({ success: false, error: 'At least one member required' });
+
+    // Rule 1: only brokers can open any group.
+    const { data: creatorSub, error: creatorErr } = await supabase
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .ilike('email', creator)
+      .limit(1)
+      .maybeSingle();
+    if (creatorErr) {
+      return res.status(500).json({ success: false, error: creatorErr.message });
+    }
+    if (!isBrokerType(creatorSub?.subscription_type)) {
+      return res.status(403).json({ success: false, error: 'רק מתווכים יכולים לפתוח קבוצות' });
+    }
+
+    // Rule 2: enforce allowed member types by group kind.
+    const memberTypeByEmail = new Map();
+    if (memberEmails.length > 0) {
+      const orFilter = memberEmails.map((e) => `email.ilike.${e}`).join(',');
+      const { data: memberSubs, error: membersErr } = await supabase
+        .from('subscriptions')
+        .select('email, subscription_type')
+        .or(orFilter);
+      if (membersErr) {
+        return res.status(500).json({ success: false, error: membersErr.message });
+      }
+      (memberSubs || []).forEach((s) => {
+        const em = normEmail(s?.email);
+        if (!em) return;
+        memberTypeByEmail.set(em, s?.subscription_type || null);
+      });
+    }
+    const invalidMembers = memberEmails.filter((em) => {
+      const st = memberTypeByEmail.get(em);
+      if (kind === 'brokers') return !isBrokerType(st);
+      return !isRegularType(st);
+    });
+    if (invalidMembers.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error:
+          kind === 'brokers'
+            ? 'בקבוצת מתווכים ניתן לצרף רק מתווכים'
+            : 'בקבוצה רגילה ניתן לצרף רק משתמשים רגילים',
+      });
+    }
 
     const defaultTitle = kind === 'brokers' ? 'קבוצת מתווכים' : 'קבוצת לקוחות';
     const title = titleIn || defaultTitle;
@@ -1044,6 +1400,18 @@ app.post('/api/chat/groups', async (req, res) => {
       return res.status(500).json({ success: false, error: partErr.message });
     }
 
+    // Fallback persistence path when chat_conversations.group_image_url is unavailable:
+    // store group avatar URL on participants rows for this conversation only.
+    if (groupImageUrl && (!newConv?.group_image_url || isMissingGroupImageUrlColumnError(convErr))) {
+      const { error: participantPicErr } = await supabase
+        .from('chat_participants')
+        .update({ profile_picture_url: groupImageUrl })
+        .eq('conversation_id', convId);
+      if (participantPicErr) {
+        console.warn('POST /api/chat/groups participant group image fallback failed:', participantPicErr.message);
+      }
+    }
+
     res.json({
       success: true,
       conversation: {
@@ -1058,6 +1426,111 @@ app.post('/api/chat/groups', async (req, res) => {
     });
   } catch (err) {
     console.error('POST /api/chat/groups:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/groups/add-members — body: user_email, conversation_id, member_emails[]
+app.post('/api/chat/groups/add-members', async (req, res) => {
+  try {
+    const actorEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const rawMembers = Array.isArray(req.body.member_emails) ? req.body.member_emails : [];
+    const memberEmails = [...new Set(rawMembers.map(normEmail).filter(Boolean))];
+    const isRegularType = (st) => {
+      const t = st != null ? String(st).trim().toLowerCase() : '';
+      if (!t) return true;
+      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+    };
+    const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
+
+    if (!actorEmail || !convId) {
+      return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
+    }
+    if (memberEmails.length < 1) {
+      return res.status(400).json({ success: false, error: 'At least one member required' });
+    }
+
+    const { data: conv } = await supabase.from('chat_conversations').select('id, type, title').eq('id', convId).maybeSingle();
+    if (!conv || conv.type !== 'group') {
+      return res.status(400).json({ success: false, error: 'Not a group conversation' });
+    }
+
+    const { data: actorSub, error: actorErr } = await supabase
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .ilike('email', actorEmail)
+      .limit(1)
+      .maybeSingle();
+    if (actorErr) return res.status(500).json({ success: false, error: actorErr.message });
+    if (!isBrokerType(actorSub?.subscription_type)) {
+      return res.status(403).json({ success: false, error: 'Only brokers can add members to groups' });
+    }
+
+    const { data: parts, error: partsErr } = await supabase
+      .from('chat_participants')
+      .select('user_id')
+      .eq('conversation_id', convId);
+    if (partsErr) return res.status(500).json({ success: false, error: partsErr.message });
+    const existingMembers = [...new Set((parts || []).map((p) => normEmail(p.user_id)).filter(Boolean))];
+    if (!existingMembers.includes(actorEmail)) {
+      return res.status(403).json({ success: false, error: 'Not a participant' });
+    }
+
+    const currentEmails = [...new Set(existingMembers)];
+    const currentOrFilter = currentEmails.map((e) => `email.ilike.${e}`).join(',');
+    const { data: currentSubs, error: currentSubsErr } = await supabase
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .or(currentOrFilter);
+    if (currentSubsErr) return res.status(500).json({ success: false, error: currentSubsErr.message });
+    const currentTypeByEmail = new Map();
+    (currentSubs || []).forEach((s) => {
+      const e = normEmail(s?.email);
+      if (e) currentTypeByEmail.set(e, String(s?.subscription_type || '').trim().toLowerCase());
+    });
+    const currentKind =
+      currentEmails.some((e) => isRegularType(currentTypeByEmail.get(e))) ? 'customers' : 'brokers';
+
+    const targetMembers = memberEmails.filter((e) => !existingMembers.includes(e));
+    if (targetMembers.length === 0) {
+      return res.json({ success: true, added: 0 });
+    }
+
+    const addOrFilter = targetMembers.map((e) => `email.ilike.${e}`).join(',');
+    const { data: addSubs, error: addSubsErr } = await supabase
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .or(addOrFilter);
+    if (addSubsErr) return res.status(500).json({ success: false, error: addSubsErr.message });
+    const addTypeByEmail = new Map();
+    (addSubs || []).forEach((s) => {
+      const e = normEmail(s?.email);
+      if (e) addTypeByEmail.set(e, String(s?.subscription_type || '').trim().toLowerCase());
+    });
+
+    const invalid = targetMembers.filter((e) => {
+      const st = addTypeByEmail.get(e);
+      if (currentKind === 'brokers') return !isBrokerType(st);
+      return !isRegularType(st);
+    });
+    if (invalid.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error:
+          currentKind === 'brokers'
+            ? 'In broker groups, only brokers can be added'
+            : 'In regular groups, only regular users can be added',
+      });
+    }
+
+    const rows = targetMembers.map((e) => ({ conversation_id: convId, user_id: e }));
+    const { error: addErr } = await supabase.from('chat_participants').insert(rows);
+    if (addErr) return res.status(500).json({ success: false, error: addErr.message });
+
+    res.json({ success: true, added: targetMembers.length });
+  } catch (err) {
+    console.error('POST /api/chat/groups/add-members:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -1200,29 +1673,55 @@ app.get('/api/chat/group-messages', async (req, res) => {
       const em = normEmail(p.user_id);
       if (!em) continue;
       memberList.push({
+        userRef: p.user_id != null ? String(p.user_id).trim() : null,
         email: em,
         name: p.display_name != null && String(p.display_name).trim() ? String(p.display_name).trim() : null,
-        profileImageUrl:
+        participantProfileImageUrl:
           p.profile_picture_url != null && String(p.profile_picture_url).trim()
             ? String(p.profile_picture_url).trim()
             : null,
+        profileImageUrl: null,
+        subscriptionType: null,
       });
     }
+    const groupImageCache = new Map();
     await Promise.all(
       memberList.map(async (m) => {
-        if (m.name || m.profileImageUrl) return;
-        const { data: sub } = await supabase
-          .from('subscriptions')
-          .select(
-            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
-          )
-          .ilike('email', m.email)
-          .maybeSingle();
-        if (sub) {
-          m.name = subscriptionDisplayNameFromRow(sub);
-          m.profileImageUrl = subscriptionProfilePicFromRow(sub);
+        const ref = m.userRef && String(m.userRef).trim() ? String(m.userRef).trim() : m.email;
+        const refNorm = normEmail(ref);
+        let sub = null;
+        if (refNorm.includes('@')) {
+          const r = await supabase
+            .from('subscriptions')
+            .select(
+              'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+            )
+            .ilike('email', refNorm)
+            .maybeSingle();
+          sub = r.data || null;
+        } else if (CHAT_UUID_RE.test(String(refNorm))) {
+          const r = await supabase
+            .from('subscriptions')
+            .select(
+              'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+            )
+            .eq('id', refNorm)
+            .maybeSingle();
+          sub = r.data || null;
         }
-        if (!m.name) m.name = m.email.includes('@') ? m.email.split('@')[0] : m.email;
+        if (sub) {
+          if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
+          m.subscriptionType =
+            sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
+          m.profileImageUrl = await resolveExistingImageUrl(subscriptionProfilePicFromRow(sub), groupImageCache);
+        }
+        if (!m.profileImageUrl && m.participantProfileImageUrl) {
+          m.profileImageUrl = await resolveExistingImageUrl(
+            asPublicImageUrl(m.participantProfileImageUrl),
+            groupImageCache,
+          );
+        }
+        if (!m.name) m.name = refNorm.includes('@') ? refNorm.split('@')[0] : refNorm || m.email;
       }),
     );
     memberList.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
@@ -1686,7 +2185,21 @@ app.get('/api/listings', async (req, res) => {
         if (likeErr) {
           console.warn('ad_likes query (favorites):', likeErr.message);
         }
-        favoriteAdIds = (likeRows || []).map((r) => r.ad_id).filter(Boolean);
+        let postRows = [];
+        try {
+          const { data, error: postErr } = await supabase
+            .from('post_likes')
+            .select('ad_id')
+            .eq('user_id', userIdParam);
+          if (postErr) {
+            console.warn('post_likes query (favorites):', postErr.message);
+          } else {
+            postRows = data || [];
+          }
+        } catch (e) {
+          console.warn('post_likes favorites:', e.message);
+        }
+        favoriteAdIds = [...new Set([...(likeRows || []), ...postRows].map((r) => r.ad_id).filter(Boolean))];
       } catch (e) {
         console.warn('ad_likes favorites:', e.message);
         favoriteAdIds = [];
@@ -1796,20 +2309,42 @@ app.get('/api/listings', async (req, res) => {
 
     // Optionally get liked ad ids for this user (view_count/like_count are on row; ensure they exist)
     let likedAdIds = new Set();
+    let likedPostIds = new Set();
     if (favoritesOnly && adsRows && adsRows.length > 0) {
-      adsRows.forEach((r) => { if (r.id) likedAdIds.add(r.id); });
+      adsRows.forEach((r) => {
+        if (!r?.id) return;
+        if (isPostListingRow(r)) likedPostIds.add(r.id);
+        else likedAdIds.add(r.id);
+      });
     } else if (userIdParam && adsRows && adsRows.length > 0) {
       try {
         const adIds = adsRows.map(r => r.id).filter(Boolean);
+        const adRowById = new Map(adsRows.map(r => [r.id, r]));
         const { data: likesRows } = await supabase
           .from('ad_likes')
           .select('ad_id')
           .eq('user_id', userIdParam)
           .in('ad_id', adIds);
         if (likesRows && likesRows.length) {
-          likesRows.forEach(r => { if (r.ad_id) likedAdIds.add(r.ad_id); });
+          likesRows.forEach((r) => {
+            if (!r.ad_id) return;
+            const sourceRow = adRowById.get(r.ad_id);
+            if (isPostListingRow(sourceRow)) likedPostIds.add(r.ad_id);
+            else likedAdIds.add(r.ad_id);
+          });
         }
       } catch (_) { /* ad_likes table may not exist yet */ }
+      try {
+        const adIds = adsRows.map(r => r.id).filter(Boolean);
+        const { data: postRows } = await supabase
+          .from('post_likes')
+          .select('ad_id')
+          .eq('user_id', userIdParam)
+          .in('ad_id', adIds);
+        if (postRows && postRows.length) {
+          postRows.forEach(r => { if (r.ad_id) likedPostIds.add(r.ad_id); });
+        }
+      } catch (_) { /* post_likes table may not exist yet */ }
     }
 
     // Fetch creator (uploader) info from subscriptions for profile/chat display name
@@ -1924,6 +2459,7 @@ app.get('/api/listings', async (req, res) => {
 
     // Shape for frontend: add listing_images, listing_videos, view_count, like_count, liked, creator_*
     const listings = (adsRows || []).map((row) => {
+      const isPostRow = isPostListingRow(row);
       const creator = (row.subscription_id && creatorBySubId[row.subscription_id])
         ? creatorBySubId[row.subscription_id]
         : (row.owner_id && creatorBySubId[row.owner_id])
@@ -1943,7 +2479,13 @@ app.get('/api/listings', async (req, res) => {
         ...row,
         view_count: row.view_count != null ? Number(row.view_count) : 0,
         like_count: row.like_count != null ? Number(row.like_count) : 0,
-        liked: userIdParam ? likedAdIds.has(row.id) : undefined,
+        post_like_count:
+          row.post_like_count != null
+            ? Number(row.post_like_count)
+            : (row.like_count != null ? Number(row.like_count) : 0),
+        liked: userIdParam
+          ? (isPostRow ? likedPostIds.has(row.id) : likedAdIds.has(row.id))
+          : undefined,
         listing_images,
         listing_videos,
         is_frozen: row.is_frozen === true || row.is_frozen === 't',
@@ -2001,76 +2543,50 @@ function subscriptionDisplayNameForStory(sub) {
   return sub.name || sub.business_name || sub.contact_person_name || 'משתמש';
 }
 
-// GET /api/stories/feed — active story rings (last 24h), grouped by subscription
+// GET /api/stories/feed — home strip: users with a profile intro video (subscriptions.video_url)
 app.get('/api/stories/feed', async (req, res) => {
   try {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { data: rows, error } = await supabase
-      .from('stories')
-      .select('id, subscription_id, media_url, created_at')
-      .gte('created_at', since)
-      .order('created_at', { ascending: true });
+    const limit = Math.min(
+      80,
+      Math.max(1, parseInt(String(req.query.limit || '40'), 10) || 40),
+    );
+    const { data: subs, error } = await supabase
+      .from('subscriptions')
+      .select(
+        'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, status, updated_at',
+      )
+      .not('video_url', 'is', null)
+      .in('status', ['verified', 'active'])
+      .order('updated_at', { ascending: false })
+      .limit(limit);
 
     if (error) {
-      if (
-        String(error.message || '').includes('does not exist') ||
-        error.code === '42P01'
-      ) {
-        return res.json({
-          success: true,
-          rings: [],
-          message: 'stories table missing; run migration-stories.sql',
-        });
-      }
-      console.error('GET /api/stories/feed:', error);
+      console.error('GET /api/stories/feed (profile videos):', error);
       return res.status(500).json({ success: false, error: error.message });
     }
 
-    const bySub = {};
-    for (const row of rows || []) {
-      const sid = row.subscription_id;
-      if (!sid) continue;
-      if (!bySub[sid]) bySub[sid] = [];
-      bySub[sid].push({
-        id: row.id,
-        media_url: row.media_url,
-        created_at: row.created_at,
+    const rings = (subs || [])
+      .filter((s) => s.video_url && String(s.video_url).trim())
+      .map((s) => {
+        const st = (s.subscription_type || '').toLowerCase();
+        const pic =
+          s.profile_picture_url ||
+          (st === 'company' ? s.company_logo_url : null) ||
+          null;
+        const vid = String(s.video_url).trim();
+        return {
+          subscription_id: s.id,
+          display_name: subscriptionDisplayNameForStory(s),
+          profile_image_url: pic,
+          slides: [
+            {
+              id: `${s.id}-profile-video`,
+              media_url: vid,
+              media_type: 'video',
+            },
+          ],
+        };
       });
-    }
-    const subIds = Object.keys(bySub);
-    if (subIds.length === 0) {
-      return res.json({ success: true, rings: [] });
-    }
-
-    const { data: subs, error: subErr } = await supabase
-      .from('subscriptions')
-      .select(
-        'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
-      )
-      .in('id', subIds);
-
-    if (subErr) {
-      console.error('GET /api/stories/feed subscriptions:', subErr);
-    }
-    const subMap = {};
-    (subs || []).forEach((s) => {
-      subMap[s.id] = s;
-    });
-
-    const rings = subIds.map((sid) => {
-      const s = subMap[sid];
-      const st = (s?.subscription_type || '').toLowerCase();
-      const storyPic =
-        s?.profile_picture_url ||
-        (st === 'company' ? s?.company_logo_url : null) ||
-        null;
-      return {
-        subscription_id: sid,
-        display_name: subscriptionDisplayNameForStory(s),
-        profile_image_url: storyPic,
-        slides: bySub[sid],
-      };
-    });
 
     res.json({ success: true, rings });
   } catch (err) {
@@ -2110,11 +2626,168 @@ app.post('/api/stories', async (req, res) => {
   }
 });
 
+// GET /api/companies/directory — company subscriptions + listing counts (home "חפשו עוד")
+app.get('/api/companies/directory', async (req, res) => {
+  try {
+    const { data: companies, error } = await supabase
+      .from('subscriptions')
+      .select('id, business_name, name, company_logo_url, business_address, status')
+      .eq('subscription_type', 'company')
+      .in('status', ['verified', 'active'])
+      .order('business_name', { ascending: true });
+
+    if (error) {
+      console.error('GET /api/companies/directory:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const list = companies || [];
+    const ids = list.map((c) => c.id).filter(Boolean);
+    const countBySub = {};
+    if (ids.length > 0) {
+      const { data: adRows, error: adErr } = await supabase
+        .from('ads')
+        .select('subscription_id')
+        .in('subscription_id', ids);
+      if (adErr) {
+        console.warn('GET /api/companies/directory ads count:', adErr.message);
+      } else {
+        for (const row of adRows || []) {
+          const sid = row.subscription_id;
+          if (!sid) continue;
+          countBySub[sid] = (countBySub[sid] || 0) + 1;
+        }
+      }
+    }
+
+    const companiesOut = list.map((c) => ({
+      id: c.id,
+      name: (c.business_name && String(c.business_name).trim()) || (c.name && String(c.name).trim()) || 'חברה',
+      logo_url: c.company_logo_url && String(c.company_logo_url).trim() ? String(c.company_logo_url).trim() : null,
+      address_hint: c.business_address && String(c.business_address).trim() ? String(c.business_address).trim() : null,
+      project_count: countBySub[c.id] || 0,
+    }));
+
+    res.json({ success: true, companies: companiesOut });
+  } catch (err) {
+    console.error('GET /api/companies/directory:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ==================== CHAT ENDPOINTS ====================
 // Simple email-based chat: users identified by email (chat_participants.user_id and chat_messages.sender_id/receiver_id store normalized email).
 
 function normEmail(email) {
   return (email != null ? String(email).trim().toLowerCase() : '') || '';
+}
+const CHAT_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function asPublicImageUrl(value) {
+  const raw = value != null ? String(value).trim() : '';
+  if (!raw) return null;
+  if (/^https?:\/\//i.test(raw) || raw.startsWith('data:')) return raw;
+  if (raw.startsWith('//')) return `https:${raw}`;
+  // File/blob URLs from local devices are not shareable on web clients.
+  if (/^(file:|blob:)/i.test(raw)) return null;
+  if (!supabaseUrl || !String(supabaseUrl).trim()) return raw;
+  let origin = String(supabaseUrl).trim();
+  if (!/^https?:\/\//i.test(origin)) origin = `https://${origin}`;
+  try {
+    const u = new URL(origin);
+    origin = `${u.protocol}//${u.host}`;
+  } catch (_) {
+    origin = origin.replace(/\/+$/, '');
+  }
+  if (raw.startsWith('/storage/v1/object/public/')) return `${origin}${raw}`;
+  if (raw.startsWith('storage/v1/object/public/')) return `${origin}/${raw}`;
+  if (raw.startsWith('/storage/v1/object/sign/')) return `${origin}${raw}`;
+  if (raw.startsWith('storage/v1/object/sign/')) return `${origin}/${raw}`;
+  if (raw.startsWith('/object/public/')) return `${origin}/storage/v1${raw}`;
+  if (raw.startsWith('object/public/')) return `${origin}/storage/v1/${raw}`;
+  if (raw.startsWith('/public/')) return `${origin}/storage/v1/object${raw}`;
+  if (raw.startsWith('public/')) return `${origin}/storage/v1/object/${raw}`;
+  if (raw.startsWith('/profile-pics/')) return `${origin}/storage/v1/object/public${raw}`;
+  if (raw.startsWith('profile-pics/')) return `${origin}/storage/v1/object/public/${raw}`;
+  if (raw.startsWith('/company-logos/')) return `${origin}/storage/v1/object/public${raw}`;
+  if (raw.startsWith('company-logos/')) return `${origin}/storage/v1/object/public/${raw}`;
+  if (/^[^/]+\/.+/.test(raw)) return `${origin}/storage/v1/object/public/${raw}`;
+  return raw;
+}
+
+function getSupabaseHost() {
+  if (!supabaseUrl || !String(supabaseUrl).trim()) return null;
+  let origin = String(supabaseUrl).trim();
+  if (!/^https?:\/\//i.test(origin)) origin = `https://${origin}`;
+  try {
+    const u = new URL(origin);
+    return String(u.host || '').toLowerCase();
+  } catch (_) {
+    return null;
+  }
+}
+
+function extractBucketAndPath(value) {
+  const raw = value != null ? String(value).trim() : '';
+  if (!raw) return null;
+  let pathLike = raw;
+  if (/^https?:\/\//i.test(raw)) {
+    try {
+      const u = new URL(raw);
+      pathLike = decodeURIComponent(String(u.pathname || ''));
+    } catch (_) {
+      pathLike = raw;
+    }
+  }
+  if (!pathLike) return null;
+  const patterns = [
+    /\/storage\/v1\/object\/(?:public|sign)\/([^/]+)\/(.+)$/i,
+    /^storage\/v1\/object\/(?:public|sign)\/([^/]+)\/(.+)$/i,
+    /\/object\/public\/([^/]+)\/(.+)$/i,
+    /^object\/public\/([^/]+)\/(.+)$/i,
+    /\/public\/([^/]+)\/(.+)$/i,
+    /^public\/([^/]+)\/(.+)$/i,
+  ];
+  for (const re of patterns) {
+    const m = pathLike.match(re);
+    if (m && m[1] && m[2]) {
+      return { bucket: String(m[1]).trim(), path: String(m[2]).trim() };
+    }
+  }
+  const cleaned = pathLike.replace(/^\/+/, '');
+  const m2 = cleaned.match(/^([^/]+)\/(.+)$/);
+  if (!m2) return null;
+  const bucket = String(m2[1]).trim();
+  const path = String(m2[2]).trim();
+  if (!bucket || !path) return null;
+  return { bucket, path };
+}
+
+async function resolveExistingImageUrl(value, cache = null) {
+  const normalized = asPublicImageUrl(value);
+  if (!normalized) return null;
+  const k = String(normalized);
+  if (cache && cache.has(k)) return cache.get(k);
+  const bp = extractBucketAndPath(k);
+  if (!bp || !bp.bucket || !bp.path) {
+    if (cache) cache.set(k, normalized);
+    return normalized;
+  }
+  try {
+    const { data, error } = await supabase.storage
+      .from(bp.bucket)
+      .createSignedUrl(bp.path, 60 * 60);
+    const out =
+      !error && data?.signedUrl && String(data.signedUrl).trim()
+        ? String(data.signedUrl).trim()
+        : null;
+    if (cache) cache.set(k, out);
+    return out;
+  } catch (_) {
+    if (cache) cache.set(k, null);
+    return null;
+  }
 }
 
 function subscriptionDisplayNameFromRow(sub) {
@@ -2129,19 +2802,37 @@ function subscriptionDisplayNameFromRow(sub) {
 function subscriptionProfilePicFromRow(sub) {
   if (!sub) return null;
   const type = (sub.subscription_type || '').toLowerCase();
-  return sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+  return asPublicImageUrl(
+    sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null,
+  );
 }
 
 /** PostgREST/Postgres when `group_image_url` migration was not applied yet */
 function isMissingGroupImageUrlColumnError(err) {
   const msg = String((err && err.message) || (err && err.details) || err || '');
-  return /group_image_url/i.test(msg) && (/does not exist/i.test(msg) || /42703/i.test(msg) || /undefined column/i.test(msg));
+  const code = String((err && err.code) || '');
+  return (
+    /group_image_url/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
 }
 
 /** When `group_description` migration was not applied yet */
 function isMissingGroupDescriptionColumnError(err) {
   const msg = String((err && err.message) || (err && err.details) || err || '');
-  return /group_description/i.test(msg) && (/does not exist/i.test(msg) || /42703/i.test(msg) || /undefined column/i.test(msg));
+  const code = String((err && err.code) || '');
+  return (
+    /group_description/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
 }
 
 /** ads.category → Hebrew badge on chat list (when last message has listing_id) */
@@ -2188,6 +2879,21 @@ app.get('/api/chat/conversations', async (req, res) => {
   try {
     const userEmail = normEmail(req.query.user_email);
     if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
+    const selfRefs = new Set([userEmail]);
+    const { data: meSub } = await supabase
+      .from('subscriptions')
+      .select('id, email')
+      .ilike('email', userEmail)
+      .maybeSingle();
+    if (meSub?.id) selfRefs.add(String(meSub.id).trim().toLowerCase());
+    if (meSub?.email) selfRefs.add(normEmail(meSub.email));
+    const isSelfRef = (ref) => {
+      const v = ref != null ? String(ref).trim().toLowerCase() : '';
+      if (!v) return false;
+      if (selfRefs.has(v)) return true;
+      const em = normEmail(v);
+      return em ? selfRefs.has(em) : false;
+    };
 
     const { data: myParts } = await supabase
       .from('chat_participants')
@@ -2339,33 +3045,96 @@ app.get('/api/chat/conversations', async (req, res) => {
       }
     }
 
-    const otherEmails = [...new Set(
-      (convs || []).flatMap(c => (participantsByConv[c.id] || []).map(p => p.user_id).filter(e => normEmail(e) !== userEmail))
+    const otherRefs = [...new Set(
+      (convs || []).flatMap(c =>
+        (participantsByConv[c.id] || [])
+          .map(p => (p.user_id != null ? String(p.user_id).trim() : ''))
+          .filter((ref) => ref && !isSelfRef(ref)),
+      )
     )];
-    let displayByEmail = {};
-    if (otherEmails.length > 0) {
-      const orFilter = otherEmails.map(e => `email.ilike.${e}`).join(',');
-      const { data: subs } = await supabase.from('subscriptions').select('email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url').or(orFilter);
+    let displayByRef = {};
+    if (otherRefs.length > 0) {
+      const emailRefs = otherRefs.filter((r) => String(r).includes('@'));
+      const idRefs = otherRefs.filter(
+        (r) => !String(r).includes('@') && CHAT_UUID_RE.test(String(r)),
+      );
+      let subs = [];
+      if (emailRefs.length > 0) {
+        const orFilter = emailRefs.map(e => `email.ilike.${e}`).join(',');
+        const { data: subsByEmail } = await supabase
+          .from('subscriptions')
+          .select(
+            'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+          )
+          .or(orFilter);
+        subs.push(...(subsByEmail || []));
+      }
+      if (idRefs.length > 0) {
+        const { data: subsById } = await supabase
+          .from('subscriptions')
+          .select(
+            'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+          )
+          .in('id', idRefs);
+        subs.push(...(subsById || []));
+      }
       (subs || []).forEach(s => {
         const e = normEmail(s.email);
-        if (!otherEmails.includes(e)) return;
         const type = (s.subscription_type || '').toLowerCase();
         let name = null;
         if (type === 'company') name = s.business_name || s.name || s.contact_person_name || null;
         else if (type === 'broker') name = s.broker_office_name || s.name || s.contact_person_name || null;
         else if (type === 'professional') name = s.name || s.business_name || s.contact_person_name || null;
         else name = s.name || s.contact_person_name || s.business_name || null;
-        displayByEmail[e] = { name: name || null, profile_picture_url: s.profile_picture_url || (type === 'company' ? s.company_logo_url : null) || null };
+        const pic =
+          asPublicImageUrl(
+            s.profile_picture_url ||
+            (type === 'company' ? s.company_logo_url : null) ||
+            null,
+          ) ||
+          null;
+        if (e && otherRefs.some((r) => normEmail(r) === e)) {
+          displayByRef[e] = {name: name || null, profile_picture_url: pic};
+        }
+        if (s.id) {
+          const idKey = String(s.id).toLowerCase();
+          if (otherRefs.some((r) => String(r).trim().toLowerCase() === idKey)) {
+            displayByRef[idKey] = {
+              name: name || null,
+              profile_picture_url: pic,
+            };
+          }
+        }
       });
       (allParticipants || []).forEach(p => {
         const e = normEmail(p.user_id);
-        if (!displayByEmail[e] && (p.display_name || p.profile_picture_url)) {
-          displayByEmail[e] = { name: p.display_name || null, profile_picture_url: p.profile_picture_url || null };
+        if (!e) return;
+        const pName =
+          p.display_name != null && String(p.display_name).trim()
+            ? String(p.display_name).trim()
+            : null;
+        const pPic =
+          p.profile_picture_url != null && String(p.profile_picture_url).trim()
+            ? asPublicImageUrl(String(p.profile_picture_url).trim())
+            : null;
+        const existing = displayByRef[e];
+        if (!existing) {
+          if (pName || pPic) {
+            displayByRef[e] = {name: pName, profile_picture_url: pPic};
+          }
+          return;
+        }
+        if (!existing.profile_picture_url && pPic) {
+          displayByRef[e] = {...existing, profile_picture_url: pPic};
+        }
+        if (!existing.name && pName) {
+          displayByRef[e] = {...displayByRef[e], name: pName};
         }
       });
     }
 
-    const conversations = (convs || []).map(c => {
+    const imageUrlCache = new Map();
+    const conversations = await Promise.all((convs || []).map(async (c) => {
       const participants = participantsByConv[c.id] || [];
       const isGroup = (c.type === 'group') || participants.length > 2;
       if (isGroup) {
@@ -2387,12 +3156,39 @@ app.get('/api/chat/conversations', async (req, res) => {
           listingId != null ? listingUploadOrderById[String(listingId)] ?? null : null;
         const gTitle = (c.title && String(c.title).trim()) || 'קבוצה';
         const gPic = c.group_image_url != null && String(c.group_image_url).trim() ? String(c.group_image_url).trim() : null;
+        const participantPicCandidates = participants
+          .map((p) =>
+            p?.profile_picture_url != null && String(p.profile_picture_url).trim()
+              ? String(p.profile_picture_url).trim()
+              : null,
+          )
+          .filter(Boolean);
+        const isPlaceholderPic = (v) => {
+          const low = String(v || '').trim().toLowerCase();
+          if (!low) return true;
+          return (
+            low.includes('/assets/assets/image-copy-10.png') ||
+            low.endsWith('/image-copy-10.png') ||
+            low === 'image-copy-10.png'
+          );
+        };
+        const participantPicFreq = new Map();
+        for (const u of participantPicCandidates) {
+          if (isPlaceholderPic(u)) continue;
+          participantPicFreq.set(u, (participantPicFreq.get(u) || 0) + 1);
+        }
+        const participantGroupPic =
+          [...participantPicFreq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+        const groupProfileImageUrl = await resolveExistingImageUrl(
+          asPublicImageUrl(gPic || participantGroupPic),
+          imageUrlCache,
+        );
         return {
           id: c.id,
           isGroup: true,
           otherUserEmail: null,
           name: gTitle,
-          profileImageUrl: gPic,
+          profileImageUrl: groupProfileImageUrl,
           preview,
           time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
           lastMessageAt: last?.created_at || c.last_message_at || null,
@@ -2401,11 +3197,22 @@ app.get('/api/chat/conversations', async (req, res) => {
           listingCategoryLabel,
         };
       }
-      const other = participants.find(p => normEmail(p.user_id) !== userEmail);
-      const otherEmail = other ? normEmail(other.user_id) : null;
-      const display = otherEmail ? displayByEmail[otherEmail] : {};
+      const other =
+        participants.find((p) => !isSelfRef(p.user_id)) ||
+        participants.find((p) => p.user_id != null);
+      const otherRefRaw = other?.user_id != null ? String(other.user_id).trim() : null;
+      const otherRefNorm = otherRefRaw ? normEmail(otherRefRaw) : null;
+      const otherRefLower = otherRefRaw ? String(otherRefRaw).toLowerCase() : null;
+      const otherEmail = otherRefNorm || otherRefLower || null;
+      const display =
+        (otherRefNorm && displayByRef[otherRefNorm]) ||
+        (otherRefLower && displayByRef[otherRefLower]) ||
+        {};
       const name = display?.name || (other && other.display_name) || 'משתמש';
-      const profileImageUrl = display?.profile_picture_url || (other && other.profile_picture_url) || null;
+      const profileImageUrl = await resolveExistingImageUrl(
+        asPublicImageUrl(display?.profile_picture_url || (other && other.profile_picture_url) || null),
+        imageUrlCache,
+      );
       const last = lastByConv[c.id];
       let preview = '';
       if (last) {
@@ -2435,7 +3242,7 @@ app.get('/api/chat/conversations', async (req, res) => {
         listingDisplayNumber,
         listingCategoryLabel,
       };
-    });
+    }));
 
     const byOther = {};
     conversations.forEach(conv => {
@@ -2452,27 +3259,111 @@ app.get('/api/chat/conversations', async (req, res) => {
   }
 });
 
+// Resolve avatar URL (public/signed) to help web clients load mixed storage paths reliably.
+app.get('/api/chat/avatar-url', async (req, res) => {
+  try {
+    const src = req.query.src != null ? String(req.query.src).trim() : '';
+    if (!src) return res.status(400).json({ success: false, error: 'src required' });
+    let resolved = asPublicImageUrl(src);
+    const bp = extractBucketAndPath(src) || extractBucketAndPath(resolved);
+    let signedUrl = null;
+    if (bp && bp.bucket && bp.path) {
+      try {
+        const { data, error } = await supabase.storage.from(bp.bucket).createSignedUrl(bp.path, 60 * 60);
+        if (!error && data?.signedUrl && String(data.signedUrl).trim()) {
+          signedUrl = String(data.signedUrl).trim();
+          resolved = signedUrl;
+        }
+      } catch (_) { /* ignore and keep resolved */ }
+    }
+    console.log('[chat-avatar-url] resolve', {
+      src,
+      bucket: bp?.bucket || null,
+      path: bp?.path || null,
+      resolved,
+    });
+    if (!resolved) return res.status(404).json({ success: false, error: 'avatar not found' });
+    const allowedHost = getSupabaseHost();
+    if (/^https?:\/\//i.test(resolved) && allowedHost) {
+      try {
+        const u = new URL(resolved);
+        if (String(u.host || '').toLowerCase() !== allowedHost) {
+          return res.status(400).json({ success: false, error: 'unsupported host' });
+        }
+      } catch (_) { /* ignore */ }
+    }
+    // Prefer same-origin streaming for web clients (avoids cross-origin/public-bucket issues).
+    if (bp && bp.bucket && bp.path) {
+      try {
+        const { data, error } = await supabase.storage.from(bp.bucket).download(bp.path);
+        if (!error && data) {
+          const ab = await data.arrayBuffer();
+          const buf = Buffer.from(ab);
+          const contentType =
+            (typeof data.type === 'string' && data.type.trim()) ||
+            'application/octet-stream';
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Cache-Control', 'public, max-age=300');
+          return res.status(200).send(buf);
+        }
+      } catch (_) { /* ignore and fallback */ }
+    }
+
+    // If signed/public URL exists, fetch and stream it (still same-origin to browser).
+    const upstream = signedUrl || resolved;
+    if (/^https?:\/\//i.test(upstream)) {
+      try {
+        const r = await fetch(upstream);
+        if (r.ok) {
+          const ab = await r.arrayBuffer();
+          const buf = Buffer.from(ab);
+          const ct = r.headers.get('content-type') || 'application/octet-stream';
+          res.setHeader('Content-Type', ct);
+          res.setHeader('Cache-Control', 'public, max-age=300');
+          return res.status(200).send(buf);
+        }
+      } catch (_) { /* fallback redirect */ }
+    }
+
+    return res.redirect(302, upstream);
+  } catch (err) {
+    console.error('GET /api/chat/avatar-url:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET /api/chat/participant-display?user_email=...
 app.get('/api/chat/participant-display', async (req, res) => {
   try {
-    const userEmail = normEmail(req.query.user_email);
-    if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
-
-    const { data: participantRows } = await supabase
-      .from('chat_participants')
-      .select('display_name, profile_picture_url')
-      .eq('user_id', userEmail)
-      .limit(1);
-    const row = participantRows && participantRows[0];
-    if (row && (row.display_name || row.profile_picture_url)) {
-      return res.json({ success: true, name: row.display_name || null, profileImageUrl: row.profile_picture_url || null });
+    const userRefRaw = req.query.user_ref != null ? String(req.query.user_ref).trim() : '';
+    const userEmail = normEmail(req.query.user_email || userRefRaw);
+    const userRef = userRefRaw ? userRefRaw.toLowerCase() : userEmail;
+    if (!userRef) {
+      return res
+        .status(400)
+        .json({success: false, error: 'user_ref or user_email required'});
     }
 
-    const { data: sub } = await supabase
-      .from('subscriptions')
-      .select('name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url')
-      .ilike('email', userEmail)
-      .maybeSingle();
+    let sub = null;
+    if (userRef.includes('@')) {
+      const byEmail = await supabase
+        .from('subscriptions')
+        .select(
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .ilike('email', userRef)
+        .maybeSingle();
+      sub = byEmail.data || null;
+    } else if (CHAT_UUID_RE.test(userRef)) {
+      const byId = await supabase
+        .from('subscriptions')
+        .select(
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .eq('id', userRef)
+        .maybeSingle();
+      sub = byId.data || null;
+    }
     if (sub) {
       const type = (sub.subscription_type || '').toLowerCase();
       let displayName = null;
@@ -2481,7 +3372,27 @@ app.get('/api/chat/participant-display', async (req, res) => {
       else if (type === 'professional') displayName = sub.name || sub.business_name || sub.contact_person_name || null;
       else displayName = sub.name || sub.contact_person_name || sub.business_name || null;
       const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
-      return res.json({ success: true, name: displayName || null, profileImageUrl: profilePic || null });
+      const profileImageUrl = await resolveExistingImageUrl(asPublicImageUrl(profilePic), new Map());
+      return res.json({ success: true, name: displayName || null, profileImageUrl: profileImageUrl || null });
+    }
+
+    const participantRef = userRef.includes('@') ? userEmail : userRef;
+    const { data: participantRows } = await supabase
+      .from('chat_participants')
+      .select('display_name, profile_picture_url')
+      .eq('user_id', participantRef)
+      .limit(1);
+    const row = participantRows && participantRows[0];
+    if (row && (row.display_name || row.profile_picture_url)) {
+      const profileImageUrl = await resolveExistingImageUrl(
+        asPublicImageUrl(row.profile_picture_url || null),
+        new Map(),
+      );
+      return res.json({
+        success: true,
+        name: row.display_name || null,
+        profileImageUrl: profileImageUrl || null,
+      });
     }
     res.json({ success: true, name: null, profileImageUrl: null });
   } catch (err) {
@@ -2723,12 +3634,90 @@ app.post('/api/listings/:id/view', async (req, res) => {
   }
 });
 
+function isPostListingRow(row) {
+  if (!row) return false;
+  const type = String(row.property_type || '').toLowerCase();
+  if (type.includes('post')) return true;
+  if (row.feed_post === true) return true;
+  if (String(row.feed_post || '').toLowerCase() === 'true') return true;
+  if (String(row.feed_post || '').toLowerCase() === 't') return true;
+  const description = String(row.description || '').trim().toLowerCase();
+  return description === 'פוסט' || description === 'post';
+}
+
+function isMissingTableError(err) {
+  return err && (err.code === '42P01' || String(err.message || '').toLowerCase().includes('does not exist'));
+}
+
+function isMissingColumnError(err) {
+  return err && err.code === '42703';
+}
+
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || '').trim(),
+  );
+}
+
+async function fetchAdRowWithFallback(id, reqTag, selectVariants, defaults = {}) {
+  for (let i = 0; i < selectVariants.length; i += 1) {
+    const selectExpr = selectVariants[i];
+    const result = await supabase.from('ads').select(selectExpr).eq('id', id).maybeSingle();
+    if (!result.error) {
+      return { row: { ...defaults, ...(result.data || {}) }, error: null };
+    }
+    if (!isMissingColumnError(result.error) || i === selectVariants.length - 1) {
+      console.error(`${reqTag} select failed`, {
+        selectExpr,
+        code: result.error.code,
+        message: result.error.message,
+        details: result.error.details,
+        hint: result.error.hint,
+      });
+      return { row: null, error: result.error };
+    }
+    console.warn(`${reqTag} select fallback due to missing column`, {
+      from: selectExpr,
+      code: result.error.code,
+      message: result.error.message,
+    });
+  }
+  return { row: null, error: new Error('No select variants configured') };
+}
+
+async function fetchPostRowForLikeRoutes(id, reqTag) {
+  return fetchAdRowWithFallback(
+    id,
+    reqTag,
+    [
+      'property_type, feed_post, description, post_like_count',
+      'property_type, description, post_like_count',
+      'property_type, description',
+      'property_type',
+    ],
+    { feed_post: null, description: null, post_like_count: null },
+  );
+}
+
 // POST /api/listings/:id/like - add like (user_id in body); increment ads.like_count if column exists
 app.post('/api/listings/:id/like', async (req, res) => {
   try {
     const id = req.params.id;
     const user_id = (req.body && req.body.user_id != null) ? String(req.body.user_id).trim() : (req.query.user_id && String(req.query.user_id).trim());
     if (!id || !user_id) return res.status(400).json({ success: false, error: 'Missing listing id or user_id' });
+    const { row: targetRow, error: targetErr } = await fetchAdRowWithFallback(
+      id,
+      '[POST /api/listings/:id/like]',
+      ['property_type, feed_post, description', 'property_type, description', 'property_type'],
+      { feed_post: null, description: null },
+    );
+    if (targetErr) return res.status(500).json({ success: false, error: targetErr.message });
+    if (targetRow && isPostListingRow(targetRow)) {
+      return res.status(400).json({
+        success: false,
+        error: 'This listing is a post. Use /api/posts/:id/like for post likes.',
+      });
+    }
     const { error } = await supabase.from('ad_likes').insert({ ad_id: id, user_id });
     if (error && error.code !== '23505') return res.status(500).json({ success: false, error: error.message }); // 23505 = duplicate key, already liked
     if (!error) {
@@ -2751,6 +3740,19 @@ app.delete('/api/listings/:id/like', async (req, res) => {
     const id = req.params.id;
     const user_id = (req.body && req.body.user_id != null) ? String(req.body.user_id).trim() : (req.query && req.query.user_id && String(req.query.user_id).trim());
     if (!id || !user_id) return res.status(400).json({ success: false, error: 'Missing listing id or user_id' });
+    const { row: targetRow, error: targetErr } = await fetchAdRowWithFallback(
+      id,
+      '[DELETE /api/listings/:id/like]',
+      ['property_type, feed_post, description', 'property_type, description', 'property_type'],
+      { feed_post: null, description: null },
+    );
+    if (targetErr) return res.status(500).json({ success: false, error: targetErr.message });
+    if (targetRow && isPostListingRow(targetRow)) {
+      return res.status(400).json({
+        success: false,
+        error: 'This listing is a post. Use /api/posts/:id/like for post likes.',
+      });
+    }
     const { error } = await supabase.from('ad_likes').delete().eq('ad_id', id).eq('user_id', user_id);
     if (error) return res.status(500).json({ success: false, error: error.message });
     const { data: row, error: selectError } = await supabase.from('ads').select('like_count').eq('id', id).maybeSingle();
@@ -2761,6 +3763,468 @@ app.delete('/api/listings/:id/like', async (req, res) => {
     return res.json({ success: true });
   } catch (e) {
     console.error('Error removing like:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/posts/:id/like - add like (user_id in body); increment ads.post_like_count
+app.post('/api/posts/:id/like', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const user_id = (req.body && req.body.user_id != null)
+      ? String(req.body.user_id).trim()
+      : (req.query.user_id && String(req.query.user_id).trim());
+    const reqTag = `[POST /api/posts/${id}/like]`;
+    console.log(`${reqTag} start`, { user_id });
+    if (!id || !user_id) {
+      return res.status(400).json({ success: false, error: 'Missing post id or user_id' });
+    }
+    const { row: rowType, error: typeErr } = await fetchPostRowForLikeRoutes(id, reqTag);
+    if (typeErr) return res.status(500).json({ success: false, error: typeErr.message });
+    if (!rowType) return res.status(404).json({ success: false, error: 'Post not found' });
+    if (!isPostListingRow(rowType)) {
+      return res.status(400).json({ success: false, error: 'Listing is not a post' });
+    }
+    let duplicateLike = false;
+    let inserted = false;
+    const { error: postLikesErr } = await supabase.from('post_likes').insert({ ad_id: id, user_id });
+    if (postLikesErr) {
+      if (postLikesErr.code === '23505') {
+        duplicateLike = true;
+      } else if (isMissingTableError(postLikesErr)) {
+        console.warn(`${reqTag} post_likes table missing, fallback to ad_likes`, {
+          code: postLikesErr.code,
+          message: postLikesErr.message,
+          details: postLikesErr.details,
+          hint: postLikesErr.hint,
+        });
+        const { error: fallbackErr } = await supabase.from('ad_likes').insert({ ad_id: id, user_id });
+        if (fallbackErr && fallbackErr.code !== '23505') {
+          console.error(`${reqTag} fallback ad_likes insert failed`, fallbackErr);
+          return res.status(500).json({ success: false, error: fallbackErr.message });
+        }
+        duplicateLike = fallbackErr?.code === '23505';
+        inserted = !fallbackErr;
+      } else {
+        console.error(`${reqTag} post_likes insert failed`, postLikesErr);
+        return res.status(500).json({ success: false, error: postLikesErr.message });
+      }
+    } else {
+      inserted = true;
+    }
+    if (inserted && !duplicateLike) {
+      const currentPostLikeCount =
+        rowType.post_like_count != null ? Number(rowType.post_like_count) : 0;
+      const { error: postCountErr } = await supabase
+        .from('ads')
+        .update({ post_like_count: currentPostLikeCount + 1 })
+        .eq('id', id);
+      if (postCountErr) {
+        if (isMissingColumnError(postCountErr)) {
+          console.warn(`${reqTag} post_like_count column missing, fallback to like_count`, {
+            code: postCountErr.code,
+            message: postCountErr.message,
+          });
+          const { data: likeRow } = await supabase.from('ads').select('like_count').eq('id', id).maybeSingle();
+          const currentLikeCount = likeRow?.like_count != null ? Number(likeRow.like_count) : 0;
+          const { error: likeCountErr } = await supabase
+            .from('ads')
+            .update({ like_count: currentLikeCount + 1 })
+            .eq('id', id);
+          if (likeCountErr) {
+            console.error(`${reqTag} fallback like_count update failed`, likeCountErr);
+            return res.status(500).json({ success: false, error: likeCountErr.message });
+          }
+        } else {
+          console.error(`${reqTag} post_like_count update failed`, postCountErr);
+          return res.status(500).json({ success: false, error: postCountErr.message });
+        }
+      }
+    }
+    console.log(`${reqTag} success`, { duplicateLike });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error adding post like:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// DELETE /api/posts/:id/like - remove like; decrement ads.post_like_count
+app.delete('/api/posts/:id/like', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const user_id = (req.body && req.body.user_id != null)
+      ? String(req.body.user_id).trim()
+      : (req.query && req.query.user_id && String(req.query.user_id).trim());
+    const reqTag = `[DELETE /api/posts/${id}/like]`;
+    console.log(`${reqTag} start`, { user_id });
+    if (!id || !user_id) {
+      return res.status(400).json({ success: false, error: 'Missing post id or user_id' });
+    }
+    const { row: rowType, error: typeErr } = await fetchPostRowForLikeRoutes(id, reqTag);
+    if (typeErr) return res.status(500).json({ success: false, error: typeErr.message });
+    if (!rowType) return res.status(404).json({ success: false, error: 'Post not found' });
+    if (!isPostListingRow(rowType)) {
+      return res.status(400).json({ success: false, error: 'Listing is not a post' });
+    }
+    let removedLike = false;
+    const { data: deletedPostLikes, error: postLikesErr } = await supabase
+      .from('post_likes')
+      .delete()
+      .eq('ad_id', id)
+      .eq('user_id', user_id)
+      .select('ad_id');
+    if (postLikesErr) {
+      if (isMissingTableError(postLikesErr)) {
+        console.warn(`${reqTag} post_likes table missing, fallback delete from ad_likes`, {
+          code: postLikesErr.code,
+          message: postLikesErr.message,
+        });
+        const { data: deletedAdLikes, error: fallbackDelErr } = await supabase
+          .from('ad_likes')
+          .delete()
+          .eq('ad_id', id)
+          .eq('user_id', user_id)
+          .select('ad_id');
+        if (fallbackDelErr) {
+          console.error(`${reqTag} fallback ad_likes delete failed`, fallbackDelErr);
+          return res.status(500).json({ success: false, error: fallbackDelErr.message });
+        }
+        removedLike = Array.isArray(deletedAdLikes) && deletedAdLikes.length > 0;
+      } else {
+        console.error(`${reqTag} post_likes delete failed`, postLikesErr);
+        return res.status(500).json({ success: false, error: postLikesErr.message });
+      }
+    } else {
+      removedLike = Array.isArray(deletedPostLikes) && deletedPostLikes.length > 0;
+    }
+    if (!removedLike) {
+      console.log(`${reqTag} no like row deleted (already unliked)`);
+      return res.json({ success: true });
+    }
+    const current = rowType.post_like_count != null ? Number(rowType.post_like_count) : 0;
+    const { error: postCountErr } = await supabase
+      .from('ads')
+      .update({ post_like_count: Math.max(0, current - 1) })
+      .eq('id', id);
+    if (postCountErr) {
+      if (isMissingColumnError(postCountErr)) {
+        console.warn(`${reqTag} post_like_count column missing, fallback decrement like_count`, {
+          code: postCountErr.code,
+          message: postCountErr.message,
+        });
+        const { data: likeRow } = await supabase.from('ads').select('like_count').eq('id', id).maybeSingle();
+        const currentLikeCount = likeRow?.like_count != null ? Number(likeRow.like_count) : 0;
+        const { error: likeCountErr } = await supabase
+          .from('ads')
+          .update({ like_count: Math.max(0, currentLikeCount - 1) })
+          .eq('id', id);
+        if (likeCountErr) {
+          console.error(`${reqTag} fallback like_count decrement failed`, likeCountErr);
+          return res.status(500).json({ success: false, error: likeCountErr.message });
+        }
+      } else {
+        console.error(`${reqTag} post_like_count decrement failed`, postCountErr);
+        return res.status(500).json({ success: false, error: postCountErr.message });
+      }
+    }
+    console.log(`${reqTag} success`);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('Error removing post like:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /api/posts/:id/comments - comments list for a post listing
+app.get('/api/posts/:id/comments', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const userIdParam =
+      typeof req.query.user_id === 'string' ? req.query.user_id.trim() : '';
+    if (!id) return res.status(400).json({ success: false, error: 'Missing post id' });
+    const { row: postRow, error: postErr } = await fetchAdRowWithFallback(
+      id,
+      `[GET /api/posts/${id}/comments]`,
+      [
+        'id, property_type, feed_post, description',
+        'id, property_type, description',
+        'id, property_type',
+      ],
+      { feed_post: null, description: null },
+    );
+    if (postErr) return res.status(500).json({ success: false, error: postErr.message });
+    if (!postRow) return res.status(404).json({ success: false, error: 'Post not found' });
+    if (!isPostListingRow(postRow)) {
+      return res.status(400).json({ success: false, error: 'Listing is not a post' });
+    }
+    const { data: rows, error } = await supabase
+      .from('post_comments')
+      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, likes_count, dislikes_count, created_at')
+      .eq('ad_id', id)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    let reactionByCommentId = {};
+    if (userIdParam && rows && rows.length > 0) {
+      try {
+        const ids = rows.map(r => r.id).filter(Boolean);
+        const { data: reactionRows } = await supabase
+          .from('post_comment_reactions')
+          .select('comment_id, reaction_type')
+          .eq('user_id', userIdParam)
+          .in('comment_id', ids);
+        reactionByCommentId = (reactionRows || []).reduce((acc, r) => {
+          if (r.comment_id) acc[r.comment_id] = r.reaction_type || null;
+          return acc;
+        }, {});
+      } catch (_) { /* optional table may not exist yet */ }
+    }
+    return res.json({
+      success: true,
+      comments: (rows || []).map(r => ({
+        id: r.id,
+        ad_id: r.ad_id,
+        user_id: r.user_id,
+        comment_text: r.comment_text || '',
+        commenter_name: r.commenter_name || 'משתמש',
+        commenter_image_url: r.commenter_image_url || null,
+        likes_count: r.likes_count != null ? Number(r.likes_count) : 0,
+        dislikes_count: r.dislikes_count != null ? Number(r.dislikes_count) : 0,
+        my_reaction: reactionByCommentId[r.id] || null,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (e) {
+    console.error('GET /api/posts/:id/comments:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/posts/:id/comments - add comment and increment ads.comment_count
+app.post('/api/posts/:id/comments', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const user_id =
+      req.body && req.body.user_id != null ? String(req.body.user_id).trim() : null;
+    const text =
+      req.body && req.body.text != null ? String(req.body.text).trim() : '';
+    if (!id || !user_id) {
+      return res.status(400).json({ success: false, error: 'Missing post id or user_id' });
+    }
+    if (!text) {
+      return res.status(400).json({ success: false, error: 'Comment text is required' });
+    }
+    const { row: postRow, error: postErr } = await fetchAdRowWithFallback(
+      id,
+      `[POST /api/posts/${id}/comments]`,
+      [
+        'id, property_type, feed_post, description, comment_count',
+        'id, property_type, description, comment_count',
+        'id, property_type, description',
+        'id, property_type',
+      ],
+      { feed_post: null, description: null, comment_count: 0 },
+    );
+    if (postErr) return res.status(500).json({ success: false, error: postErr.message });
+    if (!postRow) return res.status(404).json({ success: false, error: 'Post not found' });
+    if (!isPostListingRow(postRow)) {
+      return res.status(400).json({ success: false, error: 'Listing is not a post' });
+    }
+
+    let commenterName = 'משתמש';
+    let commenterImageUrl = null;
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (uuidRegex.test(user_id)) {
+      const { data: sub } = await supabase
+        .from('subscriptions')
+        .select('subscription_type, name, business_name, contact_person_name, profile_picture_url, company_logo_url')
+        .eq('id', user_id)
+        .maybeSingle();
+      if (sub) {
+        const subType = String(sub.subscription_type || '').toLowerCase();
+        commenterName =
+          subType === 'company'
+            ? (sub.business_name || sub.name || sub.contact_person_name || commenterName)
+            : (sub.name || sub.contact_person_name || sub.business_name || commenterName);
+        commenterImageUrl = sub.profile_picture_url || sub.company_logo_url || null;
+      }
+    } else {
+      const { data: cp } = await supabase
+        .from('chat_participants')
+        .select('display_name, profile_picture_url')
+        .eq('user_id', user_id)
+        .maybeSingle();
+      if (cp) {
+        commenterName = cp.display_name || commenterName;
+        commenterImageUrl = cp.profile_picture_url || null;
+      }
+    }
+
+    const { data: inserted, error: insErr } = await supabase
+      .from('post_comments')
+      .insert({
+        ad_id: id,
+        user_id,
+        comment_text: text,
+        commenter_name: commenterName,
+        commenter_image_url: commenterImageUrl,
+      })
+      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, likes_count, dislikes_count, created_at')
+      .single();
+    if (insErr) return res.status(500).json({ success: false, error: insErr.message });
+
+    const currentCount = postRow.comment_count != null ? Number(postRow.comment_count) : 0;
+    await supabase.from('ads').update({ comment_count: currentCount + 1 }).eq('id', id);
+
+    return res.json({
+      success: true,
+      comment: {
+        id: inserted.id,
+        ad_id: inserted.ad_id,
+        user_id: inserted.user_id,
+        comment_text: inserted.comment_text || '',
+        commenter_name: inserted.commenter_name || commenterName,
+        commenter_image_url: inserted.commenter_image_url || commenterImageUrl,
+        likes_count: inserted.likes_count != null ? Number(inserted.likes_count) : 0,
+        dislikes_count: inserted.dislikes_count != null ? Number(inserted.dislikes_count) : 0,
+        my_reaction: null,
+        created_at: inserted.created_at,
+      },
+    });
+  } catch (e) {
+    console.error('POST /api/posts/:id/comments:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/posts/:id/comments/:commentId/reaction - set like/dislike reaction on comment
+app.post('/api/posts/:id/comments/:commentId/reaction', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const commentId = req.params.commentId;
+    const user_id =
+      req.body && req.body.user_id != null ? String(req.body.user_id).trim() : null;
+    const reaction_type =
+      req.body && req.body.reaction_type != null
+        ? String(req.body.reaction_type).trim().toLowerCase()
+        : '';
+    if (!id || !commentId || !user_id) {
+      return res.status(400).json({ success: false, error: 'Missing post id, comment id or user_id' });
+    }
+    if (!isUuidLike(commentId)) {
+      return res.status(400).json({ success: false, error: 'Invalid comment id' });
+    }
+    if (reaction_type !== 'like' && reaction_type !== 'dislike') {
+      return res.status(400).json({ success: false, error: 'reaction_type must be like/dislike' });
+    }
+
+    const { data: commentRow, error: commentErr } = await supabase
+      .from('post_comments')
+      .select('id, ad_id, likes_count, dislikes_count')
+      .eq('id', commentId)
+      .eq('ad_id', id)
+      .maybeSingle();
+    if (commentErr) return res.status(500).json({ success: false, error: commentErr.message });
+    if (!commentRow) return res.status(404).json({ success: false, error: 'Comment not found' });
+
+    const { data: existing } = await supabase
+      .from('post_comment_reactions')
+      .select('reaction_type')
+      .eq('comment_id', commentId)
+      .eq('user_id', user_id)
+      .maybeSingle();
+    const prevReaction = existing?.reaction_type || null;
+    if (prevReaction === reaction_type) {
+      return res.json({ success: true });
+    }
+
+    if (existing) {
+      const { error: upErr } = await supabase
+        .from('post_comment_reactions')
+        .update({ reaction_type })
+        .eq('comment_id', commentId)
+        .eq('user_id', user_id);
+      if (upErr) return res.status(500).json({ success: false, error: upErr.message });
+    } else {
+      const { error: insErr } = await supabase
+        .from('post_comment_reactions')
+        .insert({
+          comment_id: commentId,
+          ad_id: id,
+          user_id,
+          reaction_type,
+        });
+      if (insErr) return res.status(500).json({ success: false, error: insErr.message });
+    }
+
+    let likes = Number(commentRow.likes_count || 0);
+    let dislikes = Number(commentRow.dislikes_count || 0);
+    if (prevReaction === 'like') likes = Math.max(0, likes - 1);
+    if (prevReaction === 'dislike') dislikes = Math.max(0, dislikes - 1);
+    if (reaction_type === 'like') likes += 1;
+    if (reaction_type === 'dislike') dislikes += 1;
+
+    const { error: updCountErr } = await supabase
+      .from('post_comments')
+      .update({ likes_count: likes, dislikes_count: dislikes })
+      .eq('id', commentId);
+    if (updCountErr) return res.status(500).json({ success: false, error: updCountErr.message });
+
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('POST /api/posts/:id/comments/:commentId/reaction:', e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// DELETE /api/posts/:id/comments/:commentId/reaction - clear reaction
+app.delete('/api/posts/:id/comments/:commentId/reaction', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const commentId = req.params.commentId;
+    const user_id =
+      req.query && req.query.user_id != null ? String(req.query.user_id).trim() : null;
+    if (!id || !commentId || !user_id) {
+      return res.status(400).json({ success: false, error: 'Missing post id, comment id or user_id' });
+    }
+    if (!isUuidLike(commentId)) {
+      return res.status(400).json({ success: false, error: 'Invalid comment id' });
+    }
+    const { data: existing } = await supabase
+      .from('post_comment_reactions')
+      .select('reaction_type')
+      .eq('comment_id', commentId)
+      .eq('user_id', user_id)
+      .maybeSingle();
+    if (!existing) return res.json({ success: true });
+
+    const { data: commentRow } = await supabase
+      .from('post_comments')
+      .select('likes_count, dislikes_count')
+      .eq('id', commentId)
+      .eq('ad_id', id)
+      .maybeSingle();
+
+    const { error: delErr } = await supabase
+      .from('post_comment_reactions')
+      .delete()
+      .eq('comment_id', commentId)
+      .eq('user_id', user_id);
+    if (delErr) return res.status(500).json({ success: false, error: delErr.message });
+
+    if (commentRow) {
+      let likes = Number(commentRow.likes_count || 0);
+      let dislikes = Number(commentRow.dislikes_count || 0);
+      if (existing.reaction_type === 'like') likes = Math.max(0, likes - 1);
+      if (existing.reaction_type === 'dislike') dislikes = Math.max(0, dislikes - 1);
+      await supabase
+        .from('post_comments')
+        .update({ likes_count: likes, dislikes_count: dislikes })
+        .eq('id', commentId);
+    }
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('DELETE /api/posts/:id/comments/:commentId/reaction:', e);
     return res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -3109,6 +4573,54 @@ app.post('/api/chat/upload-media', upload.single('file'), async (req, res) => {
   }
 });
 
+// Group avatar image: bucket "group-pics" (expected public read)
+app.post('/api/chat/upload-group-image', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'No file provided. Use form field name "file".' });
+    }
+    if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
+      return res.status(503).json({ success: false, error: 'Server upload not configured.' });
+    }
+    const mime = (req.file.mimetype || '').toLowerCase();
+    if (!mime.startsWith('image/')) {
+      return res.status(400).json({ success: false, error: 'Only image files are allowed for group avatar.' });
+    }
+    const fromName = (req.file.originalname || '').match(/\.([a-zA-Z0-9]+)$/)?.[1];
+    const guessExt =
+      mime.includes('jpeg') || mime.includes('jpg')
+        ? 'jpg'
+        : mime.includes('png')
+          ? 'png'
+          : mime.includes('webp')
+            ? 'webp'
+            : mime.includes('gif')
+              ? 'gif'
+              : null;
+    const safeExt = String(fromName || guessExt || 'jpg').replace(/[^a-zA-Z0-9]/g, '') || 'jpg';
+    const fileName = `group-${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${safeExt}`;
+    const { error } = await supabase.storage
+      .from('group-pics')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype || 'image/jpeg',
+        upsert: false,
+      });
+    if (error) {
+      console.error('Group-pics bucket upload error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to upload to storage. Create a public "group-pics" bucket in Supabase if missing.',
+        details: error.message,
+      });
+    }
+    const { data: urlData } = supabase.storage.from('group-pics').getPublicUrl(fileName);
+    return res.json({ success: true, url: urlData.publicUrl });
+  } catch (err) {
+    console.error('POST /api/chat/upload-group-image:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Upload profile picture to bucket profile-pics (e.g. when moving from stage 1 to stage 2)
 app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req, res) => {
   try {
@@ -3199,4 +4711,9 @@ const HOST = process.env.HOST || '0.0.0.0';
 app.listen(PORT, HOST, () => {
   console.log(`Server is running on http://${HOST}:${PORT}`);
   console.log(`Supabase URL: ${process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}`);
+  if (allowSkipEmailVerificationTest()) {
+    console.warn(
+      '⚠️  ALLOW_SKIP_EMAIL_VERIFICATION is on — POST /api/subscription/verify-skip-test enabled (test only).',
+    );
+  }
 });
