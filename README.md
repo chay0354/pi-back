@@ -36,3 +36,7 @@ All environment variables are configured in `.env` file:
 ## Database
 
 This server is the only component that directly interacts with the Supabase/PostgreSQL database. The frontend should make API calls to this server for all database operations.
+
+---
+
+Trivial README edit to verify pushing to `origin/main` (safe to remove later).
