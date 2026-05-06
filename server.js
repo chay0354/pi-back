@@ -9,8 +9,8 @@ const { Resend } = require('resend');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
+// Middleware — reflect Origin so browser CORS matches the requesting page (esp. web + localhost dev servers)
+app.use(cors({ origin: true }));
 app.use(express.json({
   limit: '50mb',
   verify: (req, _res, buf) => {
@@ -52,6 +52,7 @@ if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey, { global: { fetch: customFetch } });
+const { buildAdRecordFromListingBody } = require('./listingAdRecord');
 
 /** Direct Postgres for broker search when REST/RLS returns no rows (set DATABASE_URL from Supabase → Settings → Database). */
 let brokerSearchPgPool = null;
@@ -328,15 +329,16 @@ app.post('/api/subscription/submit', upload.fields([
       specializations, // Array of selected specializations (for professional)
       activityRegions, // Array of selected regions (for broker)
       agreedToTerms,
-      profile_picture_url // Optional: URL from stage-1 upload (profile-pics bucket)
+      profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
+      company_logo_url // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
     } = req.body;
 
     // Validate required fields based on subscription type
     if (subscriptionType === 'company') {
-      if (!businessName || !contactPersonName || !email || !officePhone) {
+      if (!businessName || !contactPersonName || !email || !officePhone || !companyWebsite) {
         return res.status(400).json({ 
           success: false, 
-          error: 'Missing required fields for company subscription' 
+          error: 'Missing required fields for company subscription (businessName, contactPersonName, email, officePhone, companyWebsite)' 
         });
       }
     } else if (subscriptionType === 'broker') {
@@ -361,6 +363,9 @@ app.post('/api/subscription/submit', upload.fields([
     const fileUrls = {};
     if (profile_picture_url && typeof profile_picture_url === 'string' && profile_picture_url.trim()) {
       fileUrls.profilePicture = profile_picture_url.trim();
+    }
+    if (company_logo_url && typeof company_logo_url === 'string' && company_logo_url.trim()) {
+      fileUrls.companyLogo = company_logo_url.trim();
     }
     if (req.files) {
       // Upload profile picture only if not already provided (e.g. uploaded when moving stage 1 → 2)
@@ -406,8 +411,9 @@ app.post('/api/subscription/submit', upload.fields([
         }
       }
 
-      // Upload company logo
-      if (req.files.companyLogo && req.files.companyLogo[0]) {
+      // Upload company logo (applies to all 3 subscription types: company, broker, professional).
+      // Saved URL is stored in the `company_logo_url` column below.
+      if (!fileUrls.companyLogo && req.files.companyLogo && req.files.companyLogo[0]) {
         const logoFile = req.files.companyLogo[0];
         const fileName = `logo-${Date.now()}-${logoFile.originalname}`;
         const { data, error } = await supabase.storage
@@ -579,7 +585,7 @@ app.post('/api/subscription/verify', async (req, res) => {
       .eq('verification_code', verificationCode)
       .eq('status', 'pending_verification');
     
-    const { data: subscription, error } = await query.single();
+    const { data: subscription, error } = await query.maybeSingle();
 
     if (error || !subscription) {
       return res.status(400).json({ 
@@ -865,8 +871,118 @@ app.post('/api/subscription/recover-subscriber-code', async (req, res) => {
   }
 });
 
+// POST /api/users/register-regular – upsert a regular (subscription_type='user') verified subscription by email
+// Returns the existing or newly created subscription so the client always gets a real UUID `id`.
+app.post('/api/users/register-regular', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const emailRaw = body.email != null ? String(body.email).trim() : '';
+    const emailNorm = emailRaw.toLowerCase();
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm);
+    console.log('[users/register-regular] incoming', {
+      hasEmail: !!emailNorm,
+      emailPreview: emailNorm ? `${emailNorm.slice(0, 3)}***` : null,
+      hasName: !!(body.name && String(body.name).trim()),
+      hasPhone: !!(body.phone && String(body.phone).trim()),
+      hasProfilePicture: !!(body.profile_picture_url && String(body.profile_picture_url).trim()),
+    });
+    if (!emailOk) {
+      console.warn('[users/register-regular] rejected: invalid email');
+      return res.status(400).json({success: false, error: 'Invalid email'});
+    }
+
+    const name = body.name != null && String(body.name).trim() ? String(body.name).trim() : null;
+    const phone = body.phone != null && String(body.phone).trim() ? String(body.phone).trim() : null;
+    const profilePictureUrl =
+      body.profile_picture_url != null && String(body.profile_picture_url).trim()
+        ? String(body.profile_picture_url).trim()
+        : null;
+
+    // Check if a subscription already exists for this email.
+    const { data: existing, error: existingErr } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .ilike('email', emailNorm)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingErr) {
+      console.error('[users/register-regular] existing lookup error:', existingErr);
+      return res.status(500).json({success: false, error: existingErr.message});
+    }
+
+    if (existing) {
+      // Promote/refresh fields if needed but keep a stable UUID id.
+      const updates = {};
+      if (existing.status !== 'verified') updates.status = 'verified';
+      if (!existing.subscription_type) updates.subscription_type = 'user';
+      if (name && !existing.name) updates.name = name;
+      if (phone && !existing.phone) updates.phone = phone;
+      if (profilePictureUrl && !existing.profile_picture_url) {
+        updates.profile_picture_url = profilePictureUrl;
+      }
+      if (Object.keys(updates).length > 0) {
+        const { data: updated, error: updErr } = await supabase
+          .from('subscriptions')
+          .update(updates)
+          .eq('id', existing.id)
+          .select('*')
+          .maybeSingle();
+        if (updErr) {
+          console.warn('[users/register-regular] update warn:', updErr.message);
+        }
+        console.log('[users/register-regular] existing user updated', {
+          id: existing.id,
+          updatedKeys: Object.keys(updates),
+        });
+        return res.json({ success: true, subscription: updated || existing, created: false });
+      }
+      console.log('[users/register-regular] existing user returned (no changes)', {
+        id: existing.id,
+      });
+      return res.json({ success: true, subscription: existing, created: false });
+    }
+
+    const insertRow = {
+      subscription_type: 'user',
+      email: emailNorm,
+      name,
+      phone,
+      profile_picture_url: profilePictureUrl,
+      status: 'verified',
+      verified_at: new Date().toISOString(),
+    };
+
+    const { data: inserted, error: insertErr } = await supabase
+      .from('subscriptions')
+      .insert(insertRow)
+      .select('*')
+      .single();
+
+    if (insertErr) {
+      console.error('[users/register-regular] insert error:', insertErr);
+      return res.status(500).json({ success: false, error: insertErr.message });
+    }
+
+    console.log('[users/register-regular] created new subscription', {
+      id: inserted?.id || null,
+      subscription_type: inserted?.subscription_type || null,
+      status: inserted?.status || null,
+    });
+    return res.json({ success: true, subscription: inserted, created: true });
+  } catch (err) {
+    console.error('[users/register-regular] unexpected:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Unexpected error' });
+  }
+});
+
 // Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
-const SUBSCRIPTION_SELECT = 'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, specializations, activity_regions, types, description, phone, mobile_phone, office_phone';
+const SUBSCRIPTION_SELECT =
+  'id, email, name, subscription_type, status, subscriber_number, ' +
+  'business_name, contact_person_name, company_id, office_phone, mobile_phone, company_website, ' +
+  'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
+  'profile_picture_url, company_logo_url, video_url, additional_images_urls, ' +
+  'specializations, activity_regions, types, description, phone, created_at, updated_at';
 app.get('/api/subscription/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1296,6 +1412,46 @@ app.get('/api/chat/direct-contacts', async (req, res) => {
   }
 });
 
+/**
+ * Load subscriptions by normalized emails. PostgREST `.or('email.ilike.x@y.com')` is unsafe — `@`
+ * breaks filter parsing — so we use `.in('email', …)` with a per-email ilike fallback.
+ */
+async function fetchSubscriptionsByEmails(emails) {
+  const unique = [...new Set((emails || []).map(normEmail).filter(Boolean))];
+  if (unique.length === 0) return [];
+  const { data: batch, error } = await supabase
+    .from('subscriptions')
+    .select('email, subscription_type')
+    .in('email', unique);
+  const out = [];
+  const seen = new Set();
+  if (!error && Array.isArray(batch)) {
+    for (const row of batch) {
+      if (!row?.email) continue;
+      const k = normEmail(row.email);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(row);
+    }
+  } else if (error) {
+    console.warn('[fetchSubscriptionsByEmails] .in failed, using per-email lookup:', error.message);
+  }
+  const missing = unique.filter((e) => !seen.has(e));
+  for (const e of missing) {
+    const { data: row, error: oneErr } = await supabase
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .ilike('email', e)
+      .maybeSingle();
+    if (oneErr || !row?.email) continue;
+    const k = normEmail(row.email);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(row);
+  }
+  return out;
+}
+
 // POST /api/chat/groups — create group conversation + participants
 app.post('/api/chat/groups', async (req, res) => {
   try {
@@ -1335,15 +1491,8 @@ app.post('/api/chat/groups', async (req, res) => {
     // Rule 2: enforce allowed member types by group kind.
     const memberTypeByEmail = new Map();
     if (memberEmails.length > 0) {
-      const orFilter = memberEmails.map((e) => `email.ilike.${e}`).join(',');
-      const { data: memberSubs, error: membersErr } = await supabase
-        .from('subscriptions')
-        .select('email, subscription_type')
-        .or(orFilter);
-      if (membersErr) {
-        return res.status(500).json({ success: false, error: membersErr.message });
-      }
-      (memberSubs || []).forEach((s) => {
+      const memberSubs = await fetchSubscriptionsByEmails(memberEmails);
+      memberSubs.forEach((s) => {
         const em = normEmail(s?.email);
         if (!em) return;
         memberTypeByEmail.set(em, s?.subscription_type || null);
@@ -1400,6 +1549,22 @@ app.post('/api/chat/groups', async (req, res) => {
       return res.status(500).json({ success: false, error: partErr.message });
     }
 
+    const setCreator = await supabase
+      .from('chat_conversations')
+      .update({ group_creator_email: creator })
+      .eq('id', convId);
+    if (setCreator.error && !isMissingGroupCreatorEmailColumnError(setCreator.error)) {
+      console.warn('POST /api/chat/groups set group_creator_email:', setCreator.error.message);
+    }
+    const markOwner = await supabase
+      .from('chat_participants')
+      .update({ group_role: 'owner' })
+      .eq('conversation_id', convId)
+      .eq('user_id', creator);
+    if (markOwner.error && !isMissingGroupRoleColumnError(markOwner.error)) {
+      console.warn('POST /api/chat/groups set creator group_role:', markOwner.error.message);
+    }
+
     // Fallback persistence path when chat_conversations.group_image_url is unavailable:
     // store group avatar URL on participants rows for this conversation only.
     if (groupImageUrl && (!newConv?.group_image_url || isMissingGroupImageUrlColumnError(convErr))) {
@@ -1452,7 +1617,7 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     }
 
     const { data: conv } = await supabase.from('chat_conversations').select('id, type, title').eq('id', convId).maybeSingle();
-    if (!conv || conv.type !== 'group') {
+    if (!conv || String(conv.type || '').trim().toLowerCase() !== 'group') {
       return res.status(400).json({ success: false, error: 'Not a group conversation' });
     }
 
@@ -1478,12 +1643,7 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     }
 
     const currentEmails = [...new Set(existingMembers)];
-    const currentOrFilter = currentEmails.map((e) => `email.ilike.${e}`).join(',');
-    const { data: currentSubs, error: currentSubsErr } = await supabase
-      .from('subscriptions')
-      .select('email, subscription_type')
-      .or(currentOrFilter);
-    if (currentSubsErr) return res.status(500).json({ success: false, error: currentSubsErr.message });
+    const currentSubs = await fetchSubscriptionsByEmails(currentEmails);
     const currentTypeByEmail = new Map();
     (currentSubs || []).forEach((s) => {
       const e = normEmail(s?.email);
@@ -1497,12 +1657,7 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
       return res.json({ success: true, added: 0 });
     }
 
-    const addOrFilter = targetMembers.map((e) => `email.ilike.${e}`).join(',');
-    const { data: addSubs, error: addSubsErr } = await supabase
-      .from('subscriptions')
-      .select('email, subscription_type')
-      .or(addOrFilter);
-    if (addSubsErr) return res.status(500).json({ success: false, error: addSubsErr.message });
+    const addSubs = await fetchSubscriptionsByEmails(targetMembers);
     const addTypeByEmail = new Map();
     (addSubs || []).forEach((s) => {
       const e = normEmail(s?.email);
@@ -1581,6 +1736,268 @@ app.patch('/api/chat/group-description', async (req, res) => {
   }
 });
 
+// PATCH /api/chat/group-title — body: user_email, conversation_id, title
+app.patch('/api/chat/group-title', async (req, res) => {
+  try {
+    const actorEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const titleIn = req.body.title != null ? String(req.body.title).trim().slice(0, 120) : '';
+
+    if (!actorEmail || !convId) {
+      return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
+    }
+    if (!titleIn) return res.status(400).json({ success: false, error: 'title required' });
+
+    const { data: actorSub } = await supabase
+      .from('subscriptions')
+      .select('subscription_type')
+      .ilike('email', actorEmail)
+      .maybeSingle();
+    const actorBroker = String(actorSub?.subscription_type || '').trim().toLowerCase() === 'broker';
+    if (!actorBroker) return res.status(403).json({ success: false, error: 'רק מתווכים יכולים לערוך את שם הקבוצה' });
+
+    let partsSel = await supabase
+      .from('chat_participants')
+      .select('user_id, group_role')
+      .eq('conversation_id', convId);
+    if (partsSel.error && isMissingGroupRoleColumnError(partsSel.error)) {
+      partsSel = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
+    }
+    if (partsSel.error) return res.status(500).json({ success: false, error: partsSel.error.message });
+
+    const partsRows = partsSel.data || [];
+    const actorRow = partsRows.find((p) => normEmail(p.user_id) === actorEmail);
+    if (!actorRow) return res.status(403).json({ success: false, error: 'Not a participant' });
+
+    let convMeta = await supabase
+      .from('chat_conversations')
+      .select('type, group_creator_email')
+      .eq('id', convId)
+      .maybeSingle();
+    if (convMeta.error && isMissingGroupCreatorEmailColumnError(convMeta.error)) {
+      convMeta = await supabase.from('chat_conversations').select('type').eq('id', convId).maybeSingle();
+    }
+    const conv = convMeta.data;
+    if (!conv || String(conv.type || '').trim().toLowerCase() !== 'group') {
+      return res.status(400).json({ success: false, error: 'Not a group conversation' });
+    }
+
+    const creatorEm = conv.group_creator_email != null ? normEmail(conv.group_creator_email) : '';
+    const ar = resolvedGroupRole({ user_id: actorRow.user_id, group_role: actorRow.group_role }, creatorEm);
+    if (ar !== 'owner' && ar !== 'manager') {
+      return res.status(403).json({ success: false, error: 'רק יוצר או מנהל יכולים לערוך את שם הקבוצה' });
+    }
+
+    const { error: upErr } = await supabase.from('chat_conversations').update({ title: titleIn }).eq('id', convId);
+    if (upErr) {
+      console.error('PATCH /api/chat/group-title:', upErr);
+      return res.status(500).json({ success: false, error: upErr.message });
+    }
+    res.json({ success: true, title: titleIn });
+  } catch (err) {
+    console.error('PATCH /api/chat/group-title:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/groups/remove-member — body: user_email, conversation_id, member_email
+app.post('/api/chat/groups/remove-member', async (req, res) => {
+  try {
+    const actorEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const targetEmail = normEmail(req.body.member_email);
+
+    if (!actorEmail || !convId || !targetEmail) {
+      return res.status(400).json({ success: false, error: 'user_email, conversation_id, and member_email required' });
+    }
+
+    const { data: convRow } = await supabase.from('chat_conversations').select('id, type').eq('id', convId).maybeSingle();
+    if (!convRow || String(convRow.type || '').trim().toLowerCase() !== 'group') {
+      return res.status(400).json({ success: false, error: 'Not a group conversation' });
+    }
+
+    let convFull = await supabase
+      .from('chat_conversations')
+      .select('group_creator_email')
+      .eq('id', convId)
+      .maybeSingle();
+    if (convFull.error && isMissingGroupCreatorEmailColumnError(convFull.error)) {
+      convFull = { data: {} };
+    }
+    const creatorEmailStored =
+      convFull.data?.group_creator_email != null ? normEmail(convFull.data.group_creator_email) : '';
+
+    let pSel = await supabase
+      .from('chat_participants')
+      .select('user_id, group_role, joined_at')
+      .eq('conversation_id', convId);
+    if (pSel.error && isMissingGroupRoleColumnError(pSel.error)) {
+      pSel = await supabase.from('chat_participants').select('user_id, joined_at').eq('conversation_id', convId);
+    }
+    if (pSel.error) return res.status(500).json({ success: false, error: pSel.error.message });
+
+    const allParts = pSel.data || [];
+    const actorPart = allParts.find((p) => normEmail(p.user_id) === actorEmail);
+    const targetPart = allParts.find((p) => normEmail(p.user_id) === targetEmail);
+    if (!actorPart) return res.status(403).json({ success: false, error: 'Not a participant' });
+    if (!targetPart) return res.status(400).json({ success: false, error: 'Member not in group' });
+
+    const actorRole = resolvedGroupRole(actorPart, creatorEmailStored);
+    const targetRole = resolvedGroupRole(targetPart, creatorEmailStored);
+
+    const isSelf = actorEmail === targetEmail;
+    if (!isSelf) {
+      const { data: actorSub } = await supabase
+        .from('subscriptions')
+        .select('subscription_type')
+        .ilike('email', actorEmail)
+        .maybeSingle();
+      const actorBroker = String(actorSub?.subscription_type || '').trim().toLowerCase() === 'broker';
+      if (!actorBroker) return res.status(403).json({ success: false, error: 'רק מתווכים יכולים להסיר משתתפים אחרים' });
+      if (targetRole === 'owner') {
+        return res.status(403).json({ success: false, error: 'לא ניתן להסיר את יוצר הקבוצה' });
+      }
+      if (actorRole !== 'owner' && actorRole !== 'manager') {
+        return res.status(403).json({ success: false, error: 'רק יוצר או מנהל יכולים להסיר חברים' });
+      }
+    }
+
+    const { error: delErr } = await supabase
+      .from('chat_participants')
+      .delete()
+      .eq('conversation_id', convId)
+      .eq('user_id', targetPart.user_id);
+
+    if (delErr) return res.status(500).json({ success: false, error: delErr.message });
+
+    const { count: remainingCount } = await supabase
+      .from('chat_participants')
+      .select('*', { count: 'exact', head: true })
+      .eq('conversation_id', convId);
+
+    if (!remainingCount || remainingCount === 0) {
+      await supabase.from('chat_conversations').delete().eq('id', convId);
+      return res.json({ success: true, removed: true, conversationDeleted: true });
+    }
+
+    if (targetRole === 'owner' || (creatorEmailStored && targetEmail === creatorEmailStored)) {
+      let rest = await supabase
+        .from('chat_participants')
+        .select('user_id, joined_at, group_role')
+        .eq('conversation_id', convId)
+        .order('joined_at', { ascending: true, nullsFirst: true });
+      if (rest.error && isMissingGroupRoleColumnError(rest.error)) {
+        rest = await supabase
+          .from('chat_participants')
+          .select('user_id, joined_at')
+          .eq('conversation_id', convId)
+          .order('joined_at', { ascending: true, nullsFirst: true });
+      }
+      const restRows = rest.data || [];
+      const successor = restRows[0];
+      if (successor) {
+        const succEmail = normEmail(successor.user_id);
+        const upRole = await supabase
+          .from('chat_participants')
+          .update({ group_role: 'owner' })
+          .eq('conversation_id', convId)
+          .eq('user_id', successor.user_id);
+        if (upRole.error && !isMissingGroupRoleColumnError(upRole.error)) {
+          console.warn('succession group_role update:', upRole.error.message);
+        }
+        const upCr = await supabase
+          .from('chat_conversations')
+          .update({ group_creator_email: succEmail })
+          .eq('id', convId);
+        if (upCr.error && !isMissingGroupCreatorEmailColumnError(upCr.error)) {
+          console.warn('succession group_creator_email update:', upCr.error.message);
+        }
+      }
+    }
+
+    res.json({ success: true, removed: true, conversationDeleted: false });
+  } catch (err) {
+    console.error('POST /api/chat/groups/remove-member:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/groups/member-role — body: user_email, conversation_id, target_email, role: manager | member
+app.post('/api/chat/groups/member-role', async (req, res) => {
+  try {
+    const actorEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const targetEmail = normEmail(req.body.target_email);
+    const roleRaw = req.body.role != null ? String(req.body.role).trim().toLowerCase() : '';
+    const nextRole = roleRaw === 'manager' || roleRaw === 'member' ? roleRaw : null;
+
+    if (!actorEmail || !convId || !targetEmail || !nextRole) {
+      return res.status(400).json({
+        success: false,
+        error: 'user_email, conversation_id, target_email, and role (manager|member) required',
+      });
+    }
+
+    let convFull = await supabase
+      .from('chat_conversations')
+      .select('type, group_creator_email')
+      .eq('id', convId)
+      .maybeSingle();
+    if (convFull.error && isMissingGroupCreatorEmailColumnError(convFull.error)) {
+      convFull = await supabase.from('chat_conversations').select('type').eq('id', convId).maybeSingle();
+    }
+    const conv = convFull.data;
+    if (!conv || String(conv.type || '').trim().toLowerCase() !== 'group') {
+      return res.status(400).json({ success: false, error: 'Not a group conversation' });
+    }
+    const creatorEmailStored =
+      conv.group_creator_email != null ? normEmail(conv.group_creator_email) : '';
+
+    let pSel = await supabase
+      .from('chat_participants')
+      .select('user_id, group_role')
+      .eq('conversation_id', convId);
+    if (pSel.error && isMissingGroupRoleColumnError(pSel.error)) {
+      return res.status(500).json({
+        success: false,
+        error: 'Database column group_role missing — run migration-chat-group-management.sql',
+      });
+    }
+    if (pSel.error) return res.status(500).json({ success: false, error: pSel.error.message });
+
+    const rows = pSel.data || [];
+    const actorPart = rows.find((p) => normEmail(p.user_id) === actorEmail);
+    const targetPart = rows.find((p) => normEmail(p.user_id) === targetEmail);
+    if (!actorPart || !targetPart) return res.status(403).json({ success: false, error: 'Not a participant' });
+
+    const actorRole = resolvedGroupRole(actorPart, creatorEmailStored);
+    if (actorRole !== 'owner') {
+      return res.status(403).json({ success: false, error: 'רק יוצר הקבוצה יכול לנהל תפקידי מנהל' });
+    }
+
+    const targetRole = resolvedGroupRole(targetPart, creatorEmailStored);
+    if (targetRole === 'owner') {
+      return res.status(400).json({ success: false, error: 'לא ניתן לשנות את תפקיד יוצר הקבוצה' });
+    }
+
+    const { error: upErr } = await supabase
+      .from('chat_participants')
+      .update({ group_role: nextRole })
+      .eq('conversation_id', convId)
+      .eq('user_id', targetPart.user_id);
+
+    if (upErr) {
+      console.error('POST /api/chat/groups/member-role:', upErr);
+      return res.status(500).json({ success: false, error: upErr.message });
+    }
+
+    res.json({ success: true, group_role: nextRole });
+  } catch (err) {
+    console.error('POST /api/chat/groups/member-role:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET /api/chat/group-messages?user_email=&conversation_id=
 app.get('/api/chat/group-messages', async (req, res) => {
   try {
@@ -1588,18 +2005,21 @@ app.get('/api/chat/group-messages', async (req, res) => {
     const convId = req.query.conversation_id != null ? String(req.query.conversation_id).trim() : '';
     if (!userEmail || !convId) return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
 
-    const { data: parts } = await supabase
+    let partsRes = await supabase
       .from('chat_participants')
-      .select('user_id, display_name, profile_picture_url')
+      .select('user_id, display_name, profile_picture_url, group_role')
       .eq('conversation_id', convId);
+    if (partsRes.error && isMissingGroupRoleColumnError(partsRes.error)) {
+      partsRes = await supabase
+        .from('chat_participants')
+        .select('user_id, display_name, profile_picture_url')
+        .eq('conversation_id', convId);
+    }
+    if (partsRes.error) return res.status(500).json({ success: false, error: partsRes.error.message });
+    const parts = partsRes.data;
+
     const members = (parts || []).map((p) => normEmail(p.user_id)).filter(Boolean);
     if (!members.includes(userEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
-
-    let { data: messages, error: msgErr } = await supabase
-      .from('chat_messages')
-      .select('id, sender_id, body, created_at, media_type, media_url')
-      .eq('conversation_id', convId)
-      .order('created_at', { ascending: true });
 
     const mapRow = (m, withMedia) => {
       const isMe = normEmail(m.sender_id) === userEmail;
@@ -1609,22 +2029,46 @@ app.get('/api/chat/group-messages', async (req, res) => {
         body: m.body,
         mediaType: withMedia ? (m.media_type || null) : null,
         mediaUrl: withMedia ? (m.media_url || null) : null,
+        listingId: m.listing_id != null ? String(m.listing_id) : null,
+        listingShare:
+          m.is_listing_share === true
+            ? true
+            : m.is_listing_share === false
+              ? false
+              : undefined,
         createdAt: m.created_at,
         isMe,
       };
     };
 
+    const msgSelectVariants = [
+      'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share',
+      'id, sender_id, body, created_at, media_type, media_url, listing_id',
+      'id, sender_id, body, created_at, media_type, media_url',
+      'id, sender_id, body, created_at, listing_id',
+      'id, sender_id, body, created_at',
+    ];
     let list;
-    if (msgErr) {
-      const fb = await supabase
+    let loaded = false;
+    for (let vi = 0; vi < msgSelectVariants.length; vi++) {
+      const sel = msgSelectVariants[vi];
+      const r = await supabase
         .from('chat_messages')
-        .select('id, sender_id, body, created_at')
+        .select(sel)
         .eq('conversation_id', convId)
         .order('created_at', { ascending: true });
-      if (fb.error) return res.status(500).json({ success: false, error: fb.error.message });
-      list = (fb.data || []).map((m) => mapRow(m, false));
-    } else {
-      list = (messages || []).map((m) => mapRow(m, true));
+      if (!r.error) {
+        const withMedia = sel.includes('media_type');
+        list = (r.data == null ? [] : r.data).map((m) => mapRow(m, withMedia));
+        loaded = true;
+        break;
+      }
+      if (!isMissingColumnError(r.error)) {
+        return res.status(500).json({ success: false, error: r.error.message });
+      }
+    }
+    if (!loaded) {
+      return res.status(500).json({ success: false, error: 'Unable to load group messages' });
     }
 
     let group = { title: 'קבוצה', profileImageUrl: null, description: null };
@@ -1651,6 +2095,16 @@ app.get('/api/chat/group-messages', async (req, res) => {
         convMeta = r3.data ? { ...r3.data, group_image_url: null, group_description: null } : null;
       }
     }
+    let creatorEmailForRoles = '';
+    const rCreator = await supabase
+      .from('chat_conversations')
+      .select('group_creator_email')
+      .eq('id', convId)
+      .maybeSingle();
+    if (!rCreator.error && rCreator.data?.group_creator_email) {
+      creatorEmailForRoles = normEmail(rCreator.data.group_creator_email);
+    }
+
     if (convMeta) {
       const t = convMeta.title != null ? String(convMeta.title).trim() : '';
       const pic =
@@ -1665,7 +2119,10 @@ app.get('/api/chat/group-messages', async (req, res) => {
         title: t || 'קבוצה',
         profileImageUrl: pic,
         description: desc,
+        creatorEmail: creatorEmailForRoles || null,
       };
+    } else if (creatorEmailForRoles) {
+      group = { ...group, creatorEmail: creatorEmailForRoles };
     }
 
     const memberList = [];
@@ -1675,6 +2132,7 @@ app.get('/api/chat/group-messages', async (req, res) => {
       memberList.push({
         userRef: p.user_id != null ? String(p.user_id).trim() : null,
         email: em,
+        groupRole: resolvedGroupRole(p, creatorEmailForRoles),
         name: p.display_name != null && String(p.display_name).trim() ? String(p.display_name).trim() : null,
         participantProfileImageUrl:
           p.profile_picture_url != null && String(p.profile_picture_url).trim()
@@ -1743,6 +2201,14 @@ app.post('/api/chat/group-messages', async (req, res) => {
     const mediaUrlRaw = req.body.media_url != null ? String(req.body.media_url).trim() : '';
     const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'audio' ? mediaTypeRaw : '';
     const mediaUrl = mediaUrlRaw;
+    const listingIdRaw = req.body.listing_id != null ? String(req.body.listing_id).trim() : '';
+    const listingIdForMessage =
+      listingIdRaw && CHAT_LISTING_ID_UUID_RE.test(listingIdRaw) ? listingIdRaw : null;
+    const listingShareToStore =
+      req.body.listing_share === true ||
+      req.body.listing_share === 'true' ||
+      req.body.listing_share === 1 ||
+      req.body.listing_share === '1';
 
     if (!senderEmail || !convId) return res.status(400).json({ success: false, error: 'sender_email and conversation_id required' });
     if (!bodyRaw && !mediaUrl) return res.status(400).json({ success: false, error: 'body or media_url required' });
@@ -1751,6 +2217,20 @@ app.post('/api/chat/group-messages', async (req, res) => {
     const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
     const members = (parts || []).map((p) => normEmail(p.user_id));
     if (!members.includes(senderEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
+
+    let listingToStore = null;
+    if (listingIdForMessage) {
+      if (listingShareToStore) {
+        listingToStore = listingIdForMessage;
+      } else {
+        const { data: adRow } = await supabase
+          .from('ads')
+          .select('id')
+          .eq('id', listingIdForMessage)
+          .maybeSingle();
+        if (adRow?.id) listingToStore = listingIdForMessage;
+      }
+    }
 
     const insertPayload = {
       conversation_id: convId,
@@ -1762,15 +2242,31 @@ app.post('/api/chat/group-messages', async (req, res) => {
       insertPayload.media_type = mediaType;
       insertPayload.media_url = mediaUrl;
     }
+    if (listingToStore) {
+      insertPayload.listing_id = listingToStore;
+    }
+    if (listingShareToStore) {
+      insertPayload.is_listing_share = true;
+    }
 
     const { data: msg, error } = await supabase
       .from('chat_messages')
       .insert(insertPayload)
-      .select('id, sender_id, body, created_at, media_type, media_url')
+      .select('id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share')
       .single();
     if (error) {
       const fallbackRow = { conversation_id: convId, sender_id: senderEmail, receiver_id: null, body: bodyRaw || '' };
-      const fallback = await supabase.from('chat_messages').insert(fallbackRow).select('id, sender_id, body, created_at').single();
+      if (listingToStore) fallbackRow.listing_id = listingToStore;
+      if (listingShareToStore) fallbackRow.is_listing_share = true;
+      if (mediaType && mediaUrl) {
+        fallbackRow.media_type = mediaType;
+        fallbackRow.media_url = mediaUrl;
+      }
+      const fallback = await supabase
+        .from('chat_messages')
+        .insert(fallbackRow)
+        .select('id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share')
+        .single();
       if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
       await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
       const fd = fallback.data;
@@ -1780,8 +2276,10 @@ app.post('/api/chat/group-messages', async (req, res) => {
           id: fd.id,
           senderId: fd.sender_id,
           body: fd.body,
-          mediaType: null,
-          mediaUrl: null,
+          mediaType: fd.media_type || null,
+          mediaUrl: fd.media_url || null,
+          listingId: fd.listing_id != null ? String(fd.listing_id) : null,
+          listingShare: fd.is_listing_share === true,
           createdAt: fd.created_at,
           isMe: true,
         },
@@ -1796,6 +2294,8 @@ app.post('/api/chat/group-messages', async (req, res) => {
         body: msg.body,
         mediaType: msg.media_type || null,
         mediaUrl: msg.media_url || null,
+        listingId: msg.listing_id != null ? String(msg.listing_id) : null,
+        listingShare: msg.is_listing_share === true,
         createdAt: msg.created_at,
         isMe: true,
       },
@@ -1807,6 +2307,882 @@ app.post('/api/chat/group-messages', async (req, res) => {
 });
 
 // ==================== PROFILE REVIEWS ====================
+// POST /api/improvements-feedback – save product improvement suggestions
+app.post('/api/improvements-feedback', async (req, res) => {
+  try {
+    const {
+      rating,
+      improvement_text,
+      created_by_subscription_id,
+      created_by_email,
+      created_by_name,
+      created_by_subscription_type,
+      created_by_subscriber_number,
+      source_screen,
+    } = req.body || {};
+
+    const numRating = rating != null ? parseInt(rating, 10) : null;
+    if (numRating == null || Number.isNaN(numRating) || numRating < 1 || numRating > 5) {
+      return res.status(400).json({ success: false, error: 'rating must be 1–5' });
+    }
+
+    const improvementText = improvement_text != null ? String(improvement_text).trim() : '';
+    if (!improvementText) {
+      return res.status(400).json({ success: false, error: 'improvement_text is required' });
+    }
+
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const creatorSubId =
+      created_by_subscription_id && uuidRegex.test(String(created_by_subscription_id).trim())
+        ? String(created_by_subscription_id).trim()
+        : null;
+
+    let creatorEmail =
+      created_by_email && String(created_by_email).trim()
+        ? String(created_by_email).trim().toLowerCase()
+        : null;
+    let creatorName =
+      created_by_name && String(created_by_name).trim()
+        ? String(created_by_name).trim()
+        : null;
+    let creatorType =
+      created_by_subscription_type && String(created_by_subscription_type).trim()
+        ? String(created_by_subscription_type).trim().toLowerCase()
+        : null;
+    let creatorSubscriberNumber =
+      created_by_subscriber_number && String(created_by_subscriber_number).trim()
+        ? String(created_by_subscriber_number).trim()
+        : null;
+
+    // Prefer canonical identity fields from subscriptions when we have a valid subscription id.
+    if (creatorSubId) {
+      const { data: sub } = await supabase
+        .from('subscriptions')
+        .select(
+          'id, email, subscription_type, subscriber_number, name, contact_person_name, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .eq('id', creatorSubId)
+        .maybeSingle();
+      if (sub) {
+        const { name } = getSubscriptionDisplayNameAndImage(sub);
+        if (sub.email && String(sub.email).trim()) creatorEmail = String(sub.email).trim().toLowerCase();
+        if (sub.subscription_type && String(sub.subscription_type).trim()) {
+          creatorType = String(sub.subscription_type).trim().toLowerCase();
+        }
+        if (sub.subscriber_number && String(sub.subscriber_number).trim()) {
+          creatorSubscriberNumber = String(sub.subscriber_number).trim();
+        }
+        if (name) creatorName = name;
+      }
+    }
+
+    const rowToInsert = {
+      rating: numRating,
+      improvement_text: improvementText,
+      created_by_subscription_id: creatorSubId,
+      created_by_email: creatorEmail,
+      created_by_name: creatorName,
+      created_by_subscription_type: creatorType,
+      created_by_subscriber_number: creatorSubscriberNumber,
+      source_screen:
+        source_screen && String(source_screen).trim() ? String(source_screen).trim() : 'feedbackSuggestion',
+    };
+
+    const { data: inserted, error } = await supabase
+      .from('improvements_feedback')
+      .insert(rowToInsert)
+      .select(
+        'id, rating, improvement_text, created_by_subscription_id, created_by_email, created_by_name, created_by_subscription_type, created_by_subscriber_number, source_screen, created_at',
+      )
+      .single();
+
+    if (error) {
+      console.error('POST /api/improvements-feedback error:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    return res.json({ success: true, feedback: inserted });
+  } catch (err) {
+    console.error('POST /api/improvements-feedback:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/company-reports — report a company profile (saved to company_reports)
+app.post('/api/company-reports', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const reportedSubscriptionId =
+      body.reported_subscription_id && uuidRegex.test(String(body.reported_subscription_id).trim())
+        ? String(body.reported_subscription_id).trim()
+        : null;
+    if (!reportedSubscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'reported_subscription_id (uuid) is required',
+      });
+    }
+
+    const reasonKeysIn = Array.isArray(body.reason_keys) ? body.reason_keys : [];
+    const subjectTypeRaw = String(body.subject_type || 'company')
+      .trim()
+      .toLowerCase();
+    const subject_type =
+      subjectTypeRaw === 'broker'
+        ? 'broker'
+        : subjectTypeRaw === 'professional'
+          ? 'professional'
+          : 'company';
+
+    const allowedCompany = new Set([
+      'construction_quality',
+      'delivery_deadline',
+      'apartment_spec',
+      'plan_changed_no_notice',
+      'marketing_promises',
+      'other',
+    ]);
+    const allowedProfessional = new Set([
+      'fictitious_listing',
+      'listing_error',
+      'listing_not_current',
+      'wrong_phone_in_listing',
+      'offensive_content',
+      'other',
+    ]);
+    /** Figma 34:9182 — broker profile דווח על מתווך זה */
+    const allowedBroker = new Set([
+      'fictitious_listing',
+      'listing_error',
+      'listing_not_current',
+      'wrong_phone_in_listing',
+      'offensive_content',
+      'broker_exclusivity_deadline',
+      'price_or_details_mismatch',
+      'business_listing_as_private',
+      'other',
+    ]);
+    const allowed =
+      subject_type === 'broker'
+        ? allowedBroker
+        : subject_type === 'professional'
+          ? allowedProfessional
+          : allowedCompany;
+
+    const reason_keys = [
+      ...new Set(
+        reasonKeysIn
+          .map(k => String(k || '').trim())
+          .filter(k => allowed.has(k)),
+      ),
+    ];
+
+    const description =
+      body.description != null ? String(body.description).trim() : '';
+    if (reason_keys.length === 0 && !description) {
+      return res.status(400).json({
+        success: false,
+        error: 'Select at least one reason or enter a description',
+      });
+    }
+
+    const reporter_name =
+      body.reporter_name != null && String(body.reporter_name).trim()
+        ? String(body.reporter_name).trim()
+        : null;
+    const reporter_email =
+      body.reporter_email != null && String(body.reporter_email).trim()
+        ? String(body.reporter_email).trim().toLowerCase()
+        : null;
+    if (!reporter_name || !reporter_email) {
+      return res.status(400).json({
+        success: false,
+        error: 'reporter_name and reporter_email are required',
+      });
+    }
+
+    const reporter_phone =
+      body.reporter_phone != null && String(body.reporter_phone).trim()
+        ? String(body.reporter_phone).trim()
+        : null;
+
+    const reported_listing_id =
+      body.reported_listing_id && uuidRegex.test(String(body.reported_listing_id).trim())
+        ? String(body.reported_listing_id).trim()
+        : null;
+
+    const reporter_subscription_id =
+      body.reporter_subscription_id &&
+      uuidRegex.test(String(body.reporter_subscription_id).trim())
+        ? String(body.reporter_subscription_id).trim()
+        : null;
+
+    const company_display_name =
+      body.company_display_name != null && String(body.company_display_name).trim()
+        ? String(body.company_display_name).trim()
+        : null;
+
+    const row = {
+      reported_subscription_id: reportedSubscriptionId,
+      reported_listing_id,
+      company_display_name,
+      subject_type,
+      reason_keys,
+      description: description || null,
+      reporter_name,
+      reporter_phone,
+      reporter_email,
+      reporter_subscription_id,
+    };
+
+    const { data: inserted, error } = await supabase
+      .from('company_reports')
+      .insert(row)
+      .select(
+        'id, created_at, reported_subscription_id, reported_listing_id, subject_type, reason_keys, description, reporter_email',
+      )
+      .single();
+
+    if (error) {
+      console.error('POST /api/company-reports error:', error);
+      const msg = error.message || 'insert failed';
+      if (/relation|does not exist|schema cache/i.test(msg)) {
+        return res.status(503).json({
+          success: false,
+          error:
+            'Reports table not ready. Run migration-company-reports.sql in Supabase.',
+        });
+      }
+      return res.status(500).json({ success: false, error: msg });
+    }
+
+    return res.json({ success: true, report: inserted });
+  } catch (err) {
+    console.error('POST /api/company-reports:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+const FOLLOW_UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const normalizeFollowSubId = value => {
+  const s = value != null ? String(value).trim() : '';
+  return s && FOLLOW_UUID_REGEX.test(s) ? s : null;
+};
+const followTypeLabel = type => {
+  const t = String(type || '')
+    .trim()
+    .toLowerCase();
+  if (t === 'broker') return 'תיווך';
+  if (t === 'company') return 'חברה';
+  if (t === 'professional') return 'מקצועי';
+  return 'משתמש';
+};
+
+// POST /api/follows/request – create or refresh a follow request
+app.post('/api/follows/request', async (req, res) => {
+  try {
+    const requesterId = normalizeFollowSubId(req.body?.requester_subscription_id);
+    const targetId = normalizeFollowSubId(req.body?.target_subscription_id);
+    if (!requesterId || !targetId) {
+      return res.status(400).json({
+        success: false,
+        error: 'requester_subscription_id and target_subscription_id are required',
+      });
+    }
+    if (requesterId === targetId) {
+      return res.status(400).json({ success: false, error: 'cannot follow yourself' });
+    }
+
+    const { data: alreadyFollow } = await supabase
+      .from('user_follows')
+      .select('follower_subscription_id')
+      .eq('follower_subscription_id', requesterId)
+      .eq('following_subscription_id', targetId)
+      .maybeSingle();
+    if (alreadyFollow) {
+      return res.json({ success: true, already_following: true, request: null });
+    }
+
+    const { data: row, error } = await supabase
+      .from('user_follow_requests')
+      .upsert(
+        {
+          requester_subscription_id: requesterId,
+          target_subscription_id: targetId,
+          status: 'pending',
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'requester_subscription_id,target_subscription_id' },
+      )
+      .select(
+        'id, requester_subscription_id, target_subscription_id, status, created_at, updated_at',
+      )
+      .single();
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    return res.json({ success: true, already_following: false, request: row });
+  } catch (err) {
+    console.error('POST /api/follows/request:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/follows/requests/respond – accept/reject incoming request
+app.post('/api/follows/requests/respond', async (req, res) => {
+  try {
+    const requestId = req.body?.request_id ? String(req.body.request_id).trim() : '';
+    const actorId = normalizeFollowSubId(req.body?.actor_subscription_id);
+    const action = String(req.body?.action || '')
+      .trim()
+      .toLowerCase();
+    if (!requestId || !actorId || !['accept', 'reject'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'request_id, actor_subscription_id and valid action are required' });
+    }
+
+    const { data: reqRow, error: reqErr } = await supabase
+      .from('user_follow_requests')
+      .select('id, requester_subscription_id, target_subscription_id, status')
+      .eq('id', requestId)
+      .maybeSingle();
+    if (reqErr) return res.status(500).json({ success: false, error: reqErr.message });
+    if (!reqRow) return res.status(404).json({ success: false, error: 'request not found' });
+    if (String(reqRow.target_subscription_id) !== actorId) {
+      return res.status(403).json({ success: false, error: 'not allowed to respond this request' });
+    }
+    if (reqRow.status !== 'pending') {
+      return res.json({ success: true, request: reqRow, already_resolved: true });
+    }
+
+    if (action === 'accept') {
+      const { error: followErr } = await supabase
+        .from('user_follows')
+        .upsert(
+          {
+            follower_subscription_id: reqRow.requester_subscription_id,
+            following_subscription_id: reqRow.target_subscription_id,
+          },
+          { onConflict: 'follower_subscription_id,following_subscription_id' },
+        );
+      if (followErr) return res.status(500).json({ success: false, error: followErr.message });
+    }
+
+    const nextStatus = action === 'accept' ? 'accepted' : 'rejected';
+    const { data: updated, error: updErr } = await supabase
+      .from('user_follow_requests')
+      .update({ status: nextStatus, updated_at: new Date().toISOString() })
+      .eq('id', requestId)
+      .select('id, requester_subscription_id, target_subscription_id, status, created_at, updated_at')
+      .single();
+    if (updErr) return res.status(500).json({ success: false, error: updErr.message });
+    return res.json({ success: true, request: updated });
+  } catch (err) {
+    console.error('POST /api/follows/requests/respond:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/follows/requests/cancel – requester withdraws a pending outgoing follow request
+app.post('/api/follows/requests/cancel', async (req, res) => {
+  try {
+    const requesterId = normalizeFollowSubId(req.body?.requester_subscription_id);
+    const targetId = normalizeFollowSubId(req.body?.target_subscription_id);
+    if (!requesterId || !targetId) {
+      return res.status(400).json({
+        success: false,
+        error: 'requester_subscription_id and target_subscription_id are required',
+      });
+    }
+    if (requesterId === targetId) {
+      return res.status(400).json({ success: false, error: 'invalid target' });
+    }
+    const { data: deleted, error: delErr } = await supabase
+      .from('user_follow_requests')
+      .delete()
+      .eq('requester_subscription_id', requesterId)
+      .eq('target_subscription_id', targetId)
+      .eq('status', 'pending')
+      .select('id');
+    if (delErr) {
+      return res.status(500).json({ success: false, error: delErr.message });
+    }
+    if (!Array.isArray(deleted) || deleted.length === 0) {
+      return res.json({ success: true, cancelled: false });
+    }
+    return res.json({ success: true, cancelled: true, id: deleted[0]?.id || null });
+  } catch (err) {
+    console.error('POST /api/follows/requests/cancel:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/follows/unfollow – remove follow relation
+app.post('/api/follows/unfollow', async (req, res) => {
+  try {
+    const followerId = normalizeFollowSubId(req.body?.follower_subscription_id);
+    const followingId = normalizeFollowSubId(req.body?.following_subscription_id);
+    if (!followerId || !followingId) {
+      return res.status(400).json({
+        success: false,
+        error: 'follower_subscription_id and following_subscription_id are required',
+      });
+    }
+    if (followerId === followingId) {
+      return res.status(400).json({success: false, error: 'cannot unfollow yourself'});
+    }
+
+    const {error} = await supabase
+      .from('user_follows')
+      .delete()
+      .eq('follower_subscription_id', followerId)
+      .eq('following_subscription_id', followingId);
+    if (error) return res.status(500).json({success: false, error: error.message});
+
+    return res.json({success: true});
+  } catch (err) {
+    console.error('POST /api/follows/unfollow:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+// GET /api/follows/status?viewer_id=...&target_id=...
+app.get('/api/follows/status', async (req, res) => {
+  try {
+    const viewerId = normalizeFollowSubId(req.query?.viewer_id);
+    const targetId = normalizeFollowSubId(req.query?.target_id);
+    if (!viewerId || !targetId) {
+      return res.status(400).json({ success: false, error: 'viewer_id and target_id are required' });
+    }
+    if (viewerId === targetId) {
+      return res.json({
+        success: true,
+        is_self: true,
+        is_following: false,
+        has_pending_request: false,
+      });
+    }
+
+    const { data: followRow } = await supabase
+      .from('user_follows')
+      .select('follower_subscription_id')
+      .eq('follower_subscription_id', viewerId)
+      .eq('following_subscription_id', targetId)
+      .maybeSingle();
+    const { data: pendingRow } = await supabase
+      .from('user_follow_requests')
+      .select('id')
+      .eq('requester_subscription_id', viewerId)
+      .eq('target_subscription_id', targetId)
+      .eq('status', 'pending')
+      .maybeSingle();
+
+    return res.json({
+      success: true,
+      is_self: false,
+      is_following: !!followRow,
+      has_pending_request: !!pendingRow,
+    });
+  } catch (err) {
+    console.error('GET /api/follows/status:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/follows/mutual-batch — { viewer_id, target_ids: string[] }
+// For each target: true iff both follow each other in user_follows and no pending request from viewer.
+app.post('/api/follows/mutual-batch', async (req, res) => {
+  try {
+    const viewerId = normalizeFollowSubId(req.body?.viewer_id);
+    const rawIds = req.body?.target_ids;
+    const list = Array.isArray(rawIds) ? rawIds : [];
+    if (!viewerId) {
+      return res.status(400).json({ success: false, error: 'viewer_id is required' });
+    }
+    const targetIds = [
+      ...new Set(
+        list
+          .map(x => (x != null ? String(x).trim() : ''))
+          .filter(s => s !== '' && s !== viewerId)
+          .slice(0, 200),
+      ),
+    ];
+    if (targetIds.length === 0) {
+      return res.json({ success: true, mutual: {} });
+    }
+
+    const [{ data: iFollow }, { data: theyFollow }, { data: pendingOut }] = await Promise.all([
+      supabase
+        .from('user_follows')
+        .select('following_subscription_id')
+        .eq('follower_subscription_id', viewerId)
+        .in('following_subscription_id', targetIds),
+      supabase
+        .from('user_follows')
+        .select('follower_subscription_id')
+        .eq('following_subscription_id', viewerId)
+        .in('follower_subscription_id', targetIds),
+      supabase
+        .from('user_follow_requests')
+        .select('target_subscription_id')
+        .eq('requester_subscription_id', viewerId)
+        .eq('status', 'pending')
+        .in('target_subscription_id', targetIds),
+    ]);
+
+    const iFollowSet = new Set(
+      (iFollow || [])
+        .map(r => String(r?.following_subscription_id || ''))
+        .filter(Boolean),
+    );
+    const theyFollowSet = new Set(
+      (theyFollow || [])
+        .map(r => String(r?.follower_subscription_id || ''))
+        .filter(Boolean),
+    );
+    const pendingSet = new Set(
+      (pendingOut || [])
+        .map(r => String(r?.target_subscription_id || ''))
+        .filter(Boolean),
+    );
+
+    const mutual = {};
+    for (const id of targetIds) {
+      if (
+        iFollowSet.has(id) &&
+        theyFollowSet.has(id) &&
+        !pendingSet.has(id)
+      ) {
+        mutual[id] = true;
+      }
+    }
+    return res.json({ success: true, mutual });
+  } catch (err) {
+    console.error('POST /api/follows/mutual-batch:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/follows/stats?user_id=...
+app.get('/api/follows/stats', async (req, res) => {
+  try {
+    const userId = normalizeFollowSubId(req.query?.user_id);
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'user_id is required' });
+    }
+
+    const [
+      { count: followers },
+      { count: following },
+      { count: pendingRequests },
+      { count: followingOutgoingPending },
+    ] = await Promise.all([
+      supabase
+        .from('user_follows')
+        .select('following_subscription_id', { count: 'exact', head: true })
+        .eq('following_subscription_id', userId),
+      supabase
+        .from('user_follows')
+        .select('follower_subscription_id', { count: 'exact', head: true })
+        .eq('follower_subscription_id', userId),
+      supabase
+        .from('user_follow_requests')
+        .select('id', { count: 'exact', head: true })
+        .eq('target_subscription_id', userId)
+        .eq('status', 'pending'),
+      supabase
+        .from('user_follow_requests')
+        .select('id', { count: 'exact', head: true })
+        .eq('requester_subscription_id', userId)
+        .eq('status', 'pending'),
+    ]);
+
+    let likes = 0;
+    try {
+      const { data: likesRows } = await supabase
+        .from('ads')
+        .select('like_count')
+        .eq('subscription_id', userId);
+      likes = (likesRows || []).reduce(
+        (sum, row) => sum + (Number(row?.like_count) || 0),
+        0,
+      );
+    } catch (_) {}
+
+    let mutualFollows = 0;
+    try {
+      const [{ data: whoFollowsMe }, { data: whoIFollow }] = await Promise.all([
+        supabase
+          .from('user_follows')
+          .select('follower_subscription_id')
+          .eq('following_subscription_id', userId),
+        supabase
+          .from('user_follows')
+          .select('following_subscription_id')
+          .eq('follower_subscription_id', userId),
+      ]);
+      const followerSet = new Set(
+        (whoFollowsMe || [])
+          .map(r => String(r?.follower_subscription_id || ''))
+          .filter(Boolean),
+      );
+      (whoIFollow || []).forEach(r => {
+        const id = String(r?.following_subscription_id || '');
+        if (id && followerSet.has(id)) {
+          mutualFollows += 1;
+        }
+      });
+    } catch (_) {
+      mutualFollows = 0;
+    }
+
+    return res.json({
+      success: true,
+      stats: {
+        likes,
+        followers: Number(followers || 0),
+        // user_follows only (accepted). Pending outgoing requests are in following_outgoing_pending.
+        following: Number(following || 0),
+        pending_requests: Number(pendingRequests || 0),
+        following_outgoing_pending: Number(followingOutgoingPending || 0),
+        /** You follow them and they follow you (for עוקבים / highlights). */
+        mutual_follows: Number(mutualFollows || 0),
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/follows/stats:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/follows/hub?user_id=...&viewer_id=...&tab=requests|followers|following&q=...
+app.get('/api/follows/hub', async (req, res) => {
+  try {
+    const userId = normalizeFollowSubId(req.query?.user_id);
+    const viewerId = normalizeFollowSubId(req.query?.viewer_id);
+    const tab = String(req.query?.tab || 'followers')
+      .trim()
+      .toLowerCase();
+    const q = String(req.query?.q || '')
+      .trim()
+      .toLowerCase();
+    if (!userId) return res.status(400).json({ success: false, error: 'user_id is required' });
+    if (!['requests', 'followers', 'following'].includes(tab)) {
+      return res.status(400).json({ success: false, error: 'tab must be requests|followers|following' });
+    }
+    if (tab === 'requests' && viewerId !== userId) {
+      return res.status(403).json({ success: false, error: 'requests are private to account owner' });
+    }
+
+    let relationRows = [];
+    if (tab === 'followers') {
+      const { data, error } = await supabase
+        .from('user_follows')
+        .select('follower_subscription_id, created_at')
+        .eq('following_subscription_id', userId)
+        .order('created_at', { ascending: false });
+      if (error) return res.status(500).json({ success: false, error: error.message });
+      relationRows = data || [];
+    } else if (tab === 'following') {
+      const [{ data: followRows, error: fErr }, { data: pendingRows, error: pErr }] =
+        await Promise.all([
+          supabase
+            .from('user_follows')
+            .select('following_subscription_id, created_at')
+            .eq('follower_subscription_id', userId)
+            .order('created_at', { ascending: false }),
+          supabase
+            .from('user_follow_requests')
+            .select('id, target_subscription_id, created_at')
+            .eq('requester_subscription_id', userId)
+            .eq('status', 'pending')
+            .order('created_at', { ascending: false }),
+        ]);
+      if (fErr) {
+        return res.status(500).json({ success: false, error: fErr.message });
+      }
+      if (pErr) {
+        return res.status(500).json({ success: false, error: pErr.message });
+      }
+      const byTarget = new Map();
+      (followRows || []).forEach(r => {
+        if (!r?.following_subscription_id) {
+          return;
+        }
+        const id = String(r.following_subscription_id);
+        if (!byTarget.has(id)) {
+          byTarget.set(id, {
+            following_subscription_id: r.following_subscription_id,
+            created_at: r.created_at,
+            pending_request_id: null,
+          });
+        }
+      });
+      (pendingRows || []).forEach(r => {
+        if (!r?.target_subscription_id) {
+          return;
+        }
+        const id = String(r.target_subscription_id);
+        if (!byTarget.has(id)) {
+          byTarget.set(id, {
+            following_subscription_id: r.target_subscription_id,
+            created_at: r.created_at,
+            pending_request_id: r.id,
+          });
+        }
+      });
+      relationRows = [...byTarget.values()].sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at),
+      );
+    } else {
+      const { data, error } = await supabase
+        .from('user_follow_requests')
+        .select('id, requester_subscription_id, created_at')
+        .eq('target_subscription_id', userId)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false });
+      if (error) return res.status(500).json({ success: false, error: error.message });
+      relationRows = data || [];
+    }
+
+    const idField =
+      tab === 'followers'
+        ? 'follower_subscription_id'
+        : tab === 'following'
+          ? 'following_subscription_id'
+          : 'requester_subscription_id';
+    const idsInOrder = relationRows.map(r => String(r[idField]));
+    const uniqueIds = [...new Set(idsInOrder)];
+    if (uniqueIds.length === 0) {
+      return res.json({ success: true, tab, rows: [] });
+    }
+
+    const { data: subs, error: subsErr } = await supabase
+      .from('subscriptions')
+      .select(
+        'id, email, subscription_type, name, contact_person_name, business_name, broker_office_name, profile_picture_url, company_logo_url',
+      )
+      .in('id', uniqueIds);
+    if (subsErr) return res.status(500).json({ success: false, error: subsErr.message });
+    const byId = {};
+    (subs || []).forEach(s => {
+      byId[String(s.id)] = s;
+    });
+
+    /** Subset of uniqueIds who follow `userId` (the profile) — for mutual on the "following" tab. */
+    const theyFollowUserIdSet = new Set();
+    {
+      const { data: theyFollowMe } = await supabase
+        .from('user_follows')
+        .select('follower_subscription_id')
+        .eq('following_subscription_id', userId)
+        .in('follower_subscription_id', uniqueIds);
+      (theyFollowMe || []).forEach(r => {
+        const sid = String(r?.follower_subscription_id || '');
+        if (sid) {
+          theyFollowUserIdSet.add(sid);
+        }
+      });
+    }
+
+    const viewerFollowingSet = new Set();
+    const viewerPendingSet = new Set();
+    const viewerRatingAvgByTargetId = {};
+    if (viewerId) {
+      const { data: viewerFollowing } = await supabase
+        .from('user_follows')
+        .select('following_subscription_id')
+        .eq('follower_subscription_id', viewerId)
+        .in('following_subscription_id', uniqueIds);
+      (viewerFollowing || []).forEach(r =>
+        viewerFollowingSet.add(String(r.following_subscription_id)),
+      );
+
+      const { data: viewerPending } = await supabase
+        .from('user_follow_requests')
+        .select('target_subscription_id')
+        .eq('requester_subscription_id', viewerId)
+        .eq('status', 'pending')
+        .in('target_subscription_id', uniqueIds);
+      (viewerPending || []).forEach(r =>
+        viewerPendingSet.add(String(r.target_subscription_id)),
+      );
+
+      const { data: viewerRatings } = await supabase
+        .from('profile_reviews')
+        .select('target_subscription_id, rating')
+        .eq('reviewer_subscription_id', viewerId)
+        .in('target_subscription_id', uniqueIds);
+      const agg = {};
+      (viewerRatings || []).forEach(r => {
+        const target = String(r?.target_subscription_id || '');
+        if (!target) return;
+        if (!agg[target]) agg[target] = { sum: 0, count: 0 };
+        agg[target].sum += Number(r?.rating) || 0;
+        agg[target].count += 1;
+      });
+      Object.keys(agg).forEach(target => {
+        const { sum, count } = agg[target];
+        if (count > 0) viewerRatingAvgByTargetId[target] = sum / count;
+      });
+    }
+
+    const rows = idsInOrder
+      .map(id => {
+        const sub = byId[id];
+        if (!sub) return null;
+        const relation = relationRows.find(r => String(r[idField]) === id);
+        const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+        const subtitle = followTypeLabel(sub?.subscription_type);
+        const isSelf = viewerId && viewerId === id;
+        const isMutualFollow =
+          (tab === 'followers' || tab === 'following') &&
+          !!viewerId &&
+          viewerId === userId &&
+          !viewerPendingSet.has(id) &&
+          (tab === 'followers'
+            ? !!viewerFollowingSet.has(id) && !!theyFollowUserIdSet.has(id)
+            : !!theyFollowUserIdSet.has(id) && !relation?.pending_request_id);
+        return {
+          id,
+          request_id: tab === 'requests' ? relation?.id || null : null,
+          /** Following tab: set when this row is an unapproved outgoing follow request. */
+          outgoing_follow_pending:
+            tab === 'following' && !!relation?.pending_request_id,
+          /**
+           * Own profile: "followers" — you follow this follower back;
+           * "following" — this account also follows you. Not pending-only.
+           */
+          is_mutual_follow: isMutualFollow,
+          name: name || 'משתמש',
+          subtitle,
+          viewer_rating_avg:
+            viewerRatingAvgByTargetId[id] != null
+              ? Number(viewerRatingAvgByTargetId[id])
+              : null,
+          image_url: imageUrl,
+          is_self: !!isSelf,
+          is_following_by_viewer: !!viewerFollowingSet.has(id),
+          has_pending_request_by_viewer: !!viewerPendingSet.has(id),
+          created_at: relation?.created_at || null,
+        };
+      })
+      .filter(Boolean)
+      .filter(row => {
+        if (!q) return true;
+        const hay = `${row.name} ${row.subtitle}`.toLowerCase();
+        return hay.includes(q);
+      });
+
+    return res.json({ success: true, tab, rows });
+  } catch (err) {
+    console.error('GET /api/follows/hub:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET /api/reviews?target_subscription_id=uuid – list reviews for a profile
 app.get('/api/reviews', async (req, res) => {
   try {
@@ -1814,11 +3190,21 @@ app.get('/api/reviews', async (req, res) => {
     if (!targetId) {
       return res.status(400).json({ success: false, error: 'target_subscription_id required' });
     }
-    const { data: rows, error } = await supabase
+    let { data: rows, error } = await supabase
       .from('profile_reviews')
-      .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+      .select('id, target_subscription_id, listing_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
       .eq('target_subscription_id', targetId)
       .order('created_at', { ascending: false });
+
+    if (error && String(error.message || '').includes('listing_id')) {
+      const retry = await supabase
+        .from('profile_reviews')
+        .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+        .eq('target_subscription_id', targetId)
+        .order('created_at', { ascending: false });
+      rows = retry.data;
+      error = retry.error;
+    }
 
     if (error) {
       console.error('GET /api/reviews error:', error);
@@ -1869,10 +3255,40 @@ function getSubscriptionDisplayNameAndImage(sub) {
 // POST /api/reviews – add a review (rating 1–5 + optional comment)
 app.post('/api/reviews', async (req, res) => {
   try {
-    const { target_subscription_id, rating, comment, reviewer_name, reviewer_image_url, reviewer_subscription_id } = req.body || {};
+    const {
+      target_subscription_id,
+      rating,
+      comment,
+      reviewer_name,
+      reviewer_image_url,
+      reviewer_subscription_id,
+      listing_id: listingIdRaw,
+    } = req.body || {};
     const targetId = target_subscription_id && String(target_subscription_id).trim() ? String(target_subscription_id).trim() : null;
     if (!targetId) {
       return res.status(400).json({ success: false, error: 'target_subscription_id required' });
+    }
+    const uuidRegexReviews = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    let listingIdForReview = null;
+    if (listingIdRaw != null && String(listingIdRaw).trim() !== '') {
+      const cand = String(listingIdRaw).trim();
+      if (uuidRegexReviews.test(cand)) {
+        const { data: adRow, error: adErr } = await supabase
+          .from('ads')
+          .select('id, subscription_id, owner_id')
+          .eq('id', cand)
+          .maybeSingle();
+        if (!adErr && adRow?.id) {
+          const sub = adRow.subscription_id != null ? String(adRow.subscription_id).trim() : '';
+          const owner = adRow.owner_id != null ? String(adRow.owner_id).trim() : '';
+          if (
+            (sub && sub === targetId) ||
+            (owner && owner === targetId)
+          ) {
+            listingIdForReview = cand;
+          }
+        }
+      }
     }
     const numRating = rating != null ? parseInt(rating, 10) : null;
     if (numRating == null || isNaN(numRating) || numRating < 1 || numRating > 5) {
@@ -1897,18 +3313,40 @@ app.post('/api/reviews', async (req, res) => {
       if (imageUrl) finalReviewerImageUrl = imageUrl;
     }
 
-    const { data: row, error } = await supabase
+    const insertPayload = {
+      target_subscription_id: targetId,
+      reviewer_subscription_id: reviewerSubId || null,
+      rating: numRating,
+      comment: commentStr || null,
+      reviewer_name: finalReviewerName,
+      reviewer_image_url: finalReviewerImageUrl,
+    };
+    if (listingIdForReview) {
+      insertPayload.listing_id = listingIdForReview;
+    }
+
+    let { data: row, error } = await supabase
       .from('profile_reviews')
-      .insert({
-        target_subscription_id: targetId,
-        reviewer_subscription_id: reviewerSubId || null,
-        rating: numRating,
-        comment: commentStr || null,
-        reviewer_name: finalReviewerName,
-        reviewer_image_url: finalReviewerImageUrl,
-      })
-      .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+      .insert(insertPayload)
+      .select('id, target_subscription_id, listing_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
       .single();
+
+    if (
+      error &&
+      insertPayload.listing_id &&
+      (String(error.message || '').includes('listing_id') ||
+        String(error.message || '').includes('schema cache'))
+    ) {
+      const fallbackPayload = { ...insertPayload };
+      delete fallbackPayload.listing_id;
+      const retry = await supabase
+        .from('profile_reviews')
+        .insert(fallbackPayload)
+        .select('id, target_subscription_id, reviewer_subscription_id, reviewer_name, reviewer_image_url, rating, comment, created_at')
+        .single();
+      row = retry.data;
+      error = retry.error;
+    }
 
     if (error) {
       console.error('POST /api/reviews error:', error);
@@ -1925,8 +3363,24 @@ app.post('/api/reviews', async (req, res) => {
 app.get('/api/user/current', async (req, res) => {
   try {
     const { email, subscriberNumber } = req.query;
+    const normalizedEmail =
+      email && String(email).trim() ? String(email).trim().toLowerCase() : '';
+    const normalizedSubscriberNumber =
+      subscriberNumber && String(subscriberNumber).trim()
+        ? String(subscriberNumber).trim()
+        : '';
 
-    if (!email && !subscriberNumber) {
+    console.log('[user/current] incoming lookup', {
+      hasEmail: !!normalizedEmail,
+      emailPreview: normalizedEmail ? normalizedEmail.slice(0, 3) : null,
+      hasSubscriberNumber: !!normalizedSubscriberNumber,
+      subscriberNumberPreview: normalizedSubscriberNumber
+        ? `${normalizedSubscriberNumber.slice(0, 2)}***`
+        : null,
+    });
+
+    if (!normalizedEmail && !normalizedSubscriberNumber) {
+      console.warn('[user/current] rejected: missing email and subscriberNumber');
       return res.status(400).json({ 
         success: false, 
         error: 'Email or subscriber number is required' 
@@ -1938,20 +3392,43 @@ app.get('/api/user/current', async (req, res) => {
       .select('*')
       .eq('status', 'verified'); // Only return verified subscriptions
     
-    if (subscriberNumber) {
-      query = query.eq('subscriber_number', subscriberNumber);
+    if (normalizedSubscriberNumber) {
+      query = query.eq('subscriber_number', normalizedSubscriberNumber);
+      console.log('[user/current] querying by subscriber_number');
     } else {
-      query = query.eq('email', email);
+      query = query.eq('email', normalizedEmail);
+      console.log('[user/current] querying by email');
     }
     
-    const { data: subscription, error } = await query.single();
+    const { data: subscription, error } = await query.maybeSingle();
 
-    if (error || !subscription) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'User not found' 
+    if (error) {
+      console.warn('[user/current] query error', {
+        errorCode: error?.code || null,
+        errorMessage: error?.message || null,
+        lookedUpBy: normalizedSubscriberNumber ? 'subscriber_number' : 'email',
+      });
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Query error',
       });
     }
+
+    if (!subscription) {
+      console.log('[user/current] not found', {
+        lookedUpBy: normalizedSubscriberNumber ? 'subscriber_number' : 'email',
+      });
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    console.log('[user/current] success', {
+      subscriptionId: subscription?.id || null,
+      subscriptionType: subscription?.subscription_type || null,
+      status: subscription?.status || null,
+    });
 
     res.json({
       success: true,
@@ -1959,7 +3436,10 @@ app.get('/api/user/current', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error fetching current user:', error);
+    console.error('[user/current] unexpected error', {
+      message: error?.message || String(error),
+      stack: error?.stack || null,
+    });
     res.status(500).json({ 
       success: false, 
       error: error.message 
@@ -1969,144 +3449,289 @@ app.get('/api/user/current', async (req, res) => {
 
 // ==================== LISTINGS ENDPOINTS ====================
 
-// Build preference profile from ads the user liked (price, location, category, purpose, rooms, area)
-function buildPreferenceFromLikedAds(likedAdsRows) {
-  if (!likedAdsRows || likedAdsRows.length === 0) return null;
-  const prices = likedAdsRows.map(r => r.price).filter(p => p != null && !isNaN(Number(p)));
-  const categories = likedAdsRows.map(r => r.category).filter(c => c != null);
-  const purposes = likedAdsRows.map(r => r.purpose).filter(p => p != null && String(p).trim());
-  const rooms = likedAdsRows.map(r => r.rooms).filter(r => r != null && !isNaN(Number(r)));
-  const areas = likedAdsRows.map(r => r.area).filter(a => a != null && !isNaN(Number(a)));
-  const addresses = likedAdsRows.map(r => (r.address || '').trim()).filter(Boolean);
+// ===== Smart feed ranking algorithm =====
+//
+// Goal:
+//   Order ads/posts in the TikTok-style feed by:
+//     final_score = match_score(0..1) × exposure_multiplier
+//
+// Match score is a per-user score derived from the items the user showed
+// "high interest" in (favorites for listings, likes for posts, plus highly
+// viewed/shared items). Exposure multiplier is the publisher-controlled
+// reach knob saved on each ad.
+//
+// Notes that match the product spec:
+//  - Listings (properties): users CAN'T like; saving to favorites (ad_likes)
+//    counts as the strong positive signal.
+//  - Posts: users CAN like (post_likes) but CAN'T favorite. Likes count as
+//    the strong positive signal for posts.
+//  - Private (regular-user) posts can't receive likes, so they don't drive
+//    preference.
+//  - Items with view_count / share_count / post_like_count above a threshold
+//    are also treated as engaged interactions.
+//  - Optional `feed_intent` ('properties' | 'entertainment') biases ranking
+//    toward listings or posts.
+//
+// Public API used elsewhere in this file:
+//   - buildUserPreferenceProfile(rows)                  -> profile
+//   - scoreAdMatch(ad, profile)                         -> 0..1
+//   - EXPOSURE_MULTIPLIER                               -> { low, medium, high }
+//   - sortListingsByFeedAlgorithm(rows, userId, supa,
+//                                 { intent } )         -> rows sorted
 
-  const freq = (arr) => {
-    const m = {};
-    arr.forEach((x) => { m[x] = (m[x] || 0) + 1; });
-    return Object.entries(m).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ value: k, count: v }));
-  };
-  const median = (arr) => {
-    if (arr.length === 0) return null;
-    const s = [...arr].sort((a, b) => Number(a) - Number(b));
-    const mid = Math.floor(s.length / 2);
-    return s.length % 2 ? Number(s[mid]) : (Number(s[mid - 1]) + Number(s[mid])) / 2;
-  };
+const EXPOSURE_MULTIPLIER = { low: 0.5, medium: 1, high: 1.5 };
 
-  const priceMin = prices.length ? Math.min(...prices) : null;
-  const priceMax = prices.length ? Math.max(...prices) : null;
-  const priceMedian = median(prices);
-  const categoryFreq = freq(categories);
-  const purposeFreq = freq(purposes);
-  const roomsMedian = median(rooms);
-  const areaMedian = median(areas);
-  const locationWords = new Set();
-  addresses.forEach((addr) => {
-    String(addr).split(/\s+|,|;/).forEach((w) => {
-      const t = w.trim().replace(/[^\w\u0590-\u05FF]/g, '');
-      if (t.length >= 2) locationWords.add(t.toLowerCase());
-    });
+// Threshold for considering an item "engaged with" via passive signals.
+const FEED_ENGAGEMENT_THRESHOLDS = {
+  minViewCount: 8,    // listing view counts are tracked via /listings/:id/view
+  minShareCount: 1,
+  minPostLikeCount: 5,
+};
+
+const median = (arr) => {
+  if (!arr || arr.length === 0) return null;
+  const s = [...arr].sort((a, b) => Number(a) - Number(b));
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? Number(s[mid]) : (Number(s[mid - 1]) + Number(s[mid])) / 2;
+};
+
+const freq = (arr) => {
+  const m = {};
+  (arr || []).forEach((x) => {
+    if (x == null || x === '') return;
+    m[x] = (m[x] || 0) + 1;
   });
+  return Object.entries(m)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => ({ value: k, count: v }));
+};
+
+const tokenizeAddress = (addr) => {
+  if (!addr) return [];
+  return String(addr)
+    .split(/\s+|,|;/)
+    .map((w) => w.trim().replace(/[^\w\u0590-\u05FF]/g, '').toLowerCase())
+    .filter((w) => w.length >= 2);
+};
+
+// Build a preference profile from "engaged" ad rows.
+// rows must include: price, category, purpose, rooms, area, address, feed_post
+function buildUserPreferenceProfile(rows) {
+  if (!rows || rows.length === 0) return null;
+  const prices = [];
+  const categories = [];
+  const purposes = [];
+  const roomsArr = [];
+  const areas = [];
+  const locationWords = new Set();
+  let postCount = 0;
+  let listingCount = 0;
+
+  for (const r of rows) {
+    if (r == null) continue;
+    const p = r.price != null ? Number(r.price) : null;
+    if (Number.isFinite(p)) prices.push(p);
+    if (r.category != null) categories.push(r.category);
+    if (r.purpose != null && String(r.purpose).trim()) purposes.push(r.purpose);
+    if (r.rooms != null && Number.isFinite(Number(r.rooms))) roomsArr.push(Number(r.rooms));
+    if (r.area != null && Number.isFinite(Number(r.area))) areas.push(Number(r.area));
+    tokenizeAddress(r.address).forEach((w) => locationWords.add(w));
+    if (r.feed_post === true || r.description === 'פוסט') postCount += 1;
+    else listingCount += 1;
+  }
 
   return {
-    priceMin,
-    priceMax,
-    priceMedian,
-    categoryFreq,
-    purposeFreq,
-    roomsMedian,
-    areaMedian,
+    priceMin: prices.length ? Math.min(...prices) : null,
+    priceMax: prices.length ? Math.max(...prices) : null,
+    priceMedian: median(prices),
+    categoryFreq: freq(categories),
+    purposeFreq: freq(purposes),
+    roomsMedian: median(roomsArr),
+    areaMedian: median(areas),
     locationWords,
-    likedCount: likedAdsRows.length,
+    sampleSize: rows.length,
+    postCount,
+    listingCount,
   };
 }
 
-// Score one ad against preference profile (0..1). Higher = better match.
+// Score how well a single ad matches the user's preference profile.
+// Returns a number in [0, 1].
 function scoreAdMatch(ad, pref) {
-  if (!pref || pref.likedCount === 0) return 0.5;
-  let score = 0;
-  let weightSum = 0;
+  if (!pref || pref.sampleSize === 0) return 0.5;
+
+  const partials = []; // { score, weight }
 
   const adPrice = ad.price != null ? Number(ad.price) : null;
-  if (pref.priceMin != null && pref.priceMax != null && adPrice != null) {
-    const range = pref.priceMax - pref.priceMin || 1;
-    const dist = Math.min(Math.abs(adPrice - pref.priceMedian) / range, 1);
-    score += (1 - dist) * 0.3;
-    weightSum += 0.3;
-  } else weightSum += 0.3;
+  if (pref.priceMedian != null && Number.isFinite(adPrice)) {
+    const span = Math.max((pref.priceMax || pref.priceMedian) - (pref.priceMin || pref.priceMedian), 1);
+    const dist = Math.min(Math.abs(adPrice - pref.priceMedian) / span, 1);
+    partials.push({ score: 1 - dist, weight: 0.30 });
+  }
 
   if (pref.categoryFreq.length > 0 && ad.category != null) {
     const top = pref.categoryFreq[0].value;
-    const match = Number(ad.category) === Number(top) ? 1 : (pref.categoryFreq.some(c => Number(c.value) === Number(ad.category)) ? 0.5 : 0.1);
-    score += match * 0.25;
-    weightSum += 0.25;
-  } else weightSum += 0.25;
+    const inSet = pref.categoryFreq.some((c) => Number(c.value) === Number(ad.category));
+    const score = Number(ad.category) === Number(top) ? 1 : inSet ? 0.5 : 0.1;
+    partials.push({ score, weight: 0.20 });
+  }
 
   if (pref.purposeFreq.length > 0 && ad.purpose) {
-    const top = pref.purposeFreq[0].value;
-    const match = String(ad.purpose).toLowerCase() === String(top).toLowerCase() ? 1 : (pref.purposeFreq.some(p => String(p.value).toLowerCase() === String(ad.purpose).toLowerCase()) ? 0.5 : 0.1);
-    score += match * 0.2;
-    weightSum += 0.2;
-  } else weightSum += 0.2;
+    const top = String(pref.purposeFreq[0].value).toLowerCase();
+    const inSet = pref.purposeFreq.some(
+      (p) => String(p.value).toLowerCase() === String(ad.purpose).toLowerCase(),
+    );
+    const score = String(ad.purpose).toLowerCase() === top ? 1 : inSet ? 0.5 : 0.1;
+    partials.push({ score, weight: 0.15 });
+  }
 
   if (pref.locationWords.size > 0 && ad.address) {
-    const adWords = String(ad.address).split(/\s+|,|;/).map(w => w.trim().replace(/[^\w\u0590-\u05FF]/g, '').toLowerCase()).filter(w => w.length >= 2);
-    const overlap = adWords.filter(w => pref.locationWords.has(w)).length;
-    const locationMatch = adWords.length ? Math.min(1, overlap / Math.max(adWords.length, 1) + 0.3) : 0.3;
-    score += locationMatch * 0.15;
-    weightSum += 0.15;
-  } else weightSum += 0.15;
+    const adWords = tokenizeAddress(ad.address);
+    if (adWords.length > 0) {
+      const overlap = adWords.filter((w) => pref.locationWords.has(w)).length;
+      const score = Math.min(1, overlap / adWords.length + 0.2);
+      partials.push({ score, weight: 0.20 });
+    }
+  }
 
   if (pref.roomsMedian != null && ad.rooms != null) {
-    const r = Number(ad.rooms);
-    const diff = Math.abs(r - pref.roomsMedian);
-    score += Math.max(0, 1 - diff / 4) * 0.1;
-    weightSum += 0.1;
-  } else weightSum += 0.1;
+    const diff = Math.abs(Number(ad.rooms) - pref.roomsMedian);
+    partials.push({ score: Math.max(0, 1 - diff / 4), weight: 0.10 });
+  }
 
   if (pref.areaMedian != null && ad.area != null) {
-    const a = Number(ad.area);
     const range = Math.max(pref.areaMedian * 0.5, 1);
-    const diff = Math.min(Math.abs(a - pref.areaMedian) / range, 1);
-    score += (1 - diff) * 0.05;
-    weightSum += 0.05;
-  } else weightSum += 0.05;
+    const diff = Math.min(Math.abs(Number(ad.area) - pref.areaMedian) / range, 1);
+    partials.push({ score: 1 - diff, weight: 0.05 });
+  }
 
-  return weightSum > 0 ? Math.min(1, score / (weightSum * 0.8)) : 0.5;
+  if (partials.length === 0) return 0.5;
+  const totalWeight = partials.reduce((s, p) => s + p.weight, 0);
+  const weighted = partials.reduce((s, p) => s + p.score * p.weight, 0);
+  return Math.max(0, Math.min(1, weighted / totalWeight));
 }
 
-// Exposure multiplier: low = fewer impressions, medium = default, high = more
-const EXPOSURE_MULTIPLIER = { low: 0.5, medium: 1, high: 1.5 };
+// Detect intent based on engaged signals. If user mostly favorites listings -> 'properties'.
+// If user mostly likes posts -> 'entertainment'. Returns null if not enough signal.
+function detectFeedIntent(profile) {
+  if (!profile || profile.sampleSize === 0) return null;
+  const { postCount, listingCount } = profile;
+  if (postCount + listingCount < 3) return null;
+  if (postCount > listingCount * 1.5) return 'entertainment';
+  if (listingCount > postCount * 1.5) return 'properties';
+  return null;
+}
 
-// Sort listings by smart feed: preference match × exposure level (only when user_id provided and not owner view)
-function sortListingsByFeedAlgorithm(adsRows, userIdParam, supabaseClient) {
-  if (!adsRows || adsRows.length === 0 || !userIdParam) return Promise.resolve(adsRows);
-  return (async () => {
-    const { data: likesRows } = await supabaseClient.from('ad_likes').select('ad_id').eq('user_id', userIdParam);
-    const likedAdIds = (likesRows || []).map(r => r.ad_id).filter(Boolean);
-    if (likedAdIds.length === 0) {
-      const withExp = adsRows.map((row) => {
-        const lvl = (row.exposure_level || 'medium').toLowerCase();
-        const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
-        return { row, score: mult };
-      });
-      withExp.sort((a, b) => b.score - a.score);
-      return withExp.map(x => x.row);
-    }
-    const { data: likedAdsRows } = await supabaseClient.from('ads').select('id, price, category, purpose, rooms, area, address').in('id', likedAdIds);
-    const pref = buildPreferenceFromLikedAds(likedAdsRows || []);
+function intentBias(row, intent) {
+  if (!intent) return 1;
+  const isPost = row.feed_post === true || row.description === 'פוסט';
+  if (intent === 'properties') return isPost ? 0.7 : 1.1;
+  if (intent === 'entertainment') return isPost ? 1.1 : 0.7;
+  return 1;
+}
 
-    const withScore = adsRows.map((row) => {
-      const matchScore = scoreAdMatch(row, pref);
+// Smart feed sort.
+// `options.intent` can be 'properties' | 'entertainment' | null (auto-detected).
+async function sortListingsByFeedAlgorithm(adsRows, userIdParam, supabaseClient, options = {}) {
+  if (!adsRows || adsRows.length === 0) return adsRows;
+
+  // Without a user we can only rank by exposure.
+  if (!userIdParam) {
+    const ranked = adsRows.map((row) => {
       const lvl = (row.exposure_level || 'medium').toLowerCase();
       const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
-      const finalScore = matchScore * mult;
-      return { row, finalScore };
+      return { row, finalScore: mult };
     });
-    withScore.sort((a, b) => b.finalScore - a.finalScore);
-    return withScore.map(x => x.row);
-  })();
+    ranked.sort((a, b) => b.finalScore - a.finalScore);
+    return ranked.map((x) => x.row);
+  }
+
+  // Collect "engaged" ad ids: favorites (ad_likes) + post likes (post_likes).
+  let favoriteAdIds = [];
+  try {
+    const { data } = await supabaseClient
+      .from('ad_likes')
+      .select('ad_id')
+      .eq('user_id', userIdParam);
+    favoriteAdIds = (data || []).map((r) => r.ad_id).filter(Boolean);
+  } catch (_) {
+    favoriteAdIds = [];
+  }
+
+  let likedPostAdIds = [];
+  try {
+    const { data } = await supabaseClient
+      .from('post_likes')
+      .select('ad_id')
+      .eq('user_id', userIdParam);
+    likedPostAdIds = (data || []).map((r) => r.ad_id).filter(Boolean);
+  } catch (_) {
+    likedPostAdIds = [];
+  }
+
+  const directEngagedIds = [...new Set([...favoriteAdIds, ...likedPostAdIds])];
+
+  // Add highly engaged items (passive signals) within the current candidate set.
+  const passiveEngagedIds = adsRows
+    .filter((row) => {
+      const views = Number(row.view_count || 0);
+      const shares = Number(row.share_count || 0);
+      const postLikes = Number(row.post_like_count || 0);
+      return (
+        views >= FEED_ENGAGEMENT_THRESHOLDS.minViewCount ||
+        shares >= FEED_ENGAGEMENT_THRESHOLDS.minShareCount ||
+        postLikes >= FEED_ENGAGEMENT_THRESHOLDS.minPostLikeCount
+      );
+    })
+    .map((row) => row.id);
+
+  const engagedIdSet = new Set([...directEngagedIds, ...passiveEngagedIds]);
+
+  // No signal at all -> rank by exposure only (per spec).
+  if (engagedIdSet.size === 0) {
+    const ranked = adsRows.map((row) => {
+      const lvl = (row.exposure_level || 'medium').toLowerCase();
+      const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
+      return { row, finalScore: mult };
+    });
+    ranked.sort((a, b) => b.finalScore - a.finalScore);
+    return ranked.map((x) => x.row);
+  }
+
+  // Fetch the engaged rows (need price/category/purpose/rooms/area/address/feed_post).
+  let engagedRows = [];
+  try {
+    const ids = Array.from(engagedIdSet);
+    const { data } = await supabaseClient
+      .from('ads')
+      .select('id, price, category, purpose, rooms, area, address, feed_post, description')
+      .in('id', ids);
+    engagedRows = data || [];
+  } catch (_) {
+    engagedRows = adsRows.filter((row) => engagedIdSet.has(row.id));
+  }
+
+  const profile = buildUserPreferenceProfile(engagedRows);
+  const intent = options.intent || detectFeedIntent(profile);
+
+  const ranked = adsRows.map((row) => {
+    const matchScore = scoreAdMatch(row, profile);
+    const lvl = (row.exposure_level || 'medium').toLowerCase();
+    const mult = EXPOSURE_MULTIPLIER[lvl] ?? 1;
+    const bias = intentBias(row, intent);
+    const finalScore = matchScore * mult * bias;
+    return { row, finalScore };
+  });
+  ranked.sort((a, b) => b.finalScore - a.finalScore);
+  return ranked.map((x) => x.row);
 }
 
-// GET /api/listings - optional: category, subscription_type, has_video, condition, search_purpose, feed_post, hospitality_nature
+// Backwards-compatible alias used elsewhere in this file.
+function buildPreferenceFromLikedAds(rows) {
+  return buildUserPreferenceProfile(rows);
+}
+
+// GET /api/listings - optional: category, subscription_type, has_video, condition, search_purpose, feed_post, hospitality_nature, land_in_mortgage, permit
 // Optional query: user_id - if provided, each listing gets liked: true/false and feed is sorted by smart algorithm (preferences from likes + exposure level).
 // Media (images/video) are stored in bucket user-photo-video; URLs are in ads row.
 app.get('/api/listings', async (req, res) => {
@@ -2127,6 +3752,13 @@ app.get('/api/listings', async (req, res) => {
     };
     const subscriptionIdParam = typeof req.query.subscription_id === 'string' ? req.query.subscription_id.trim() : null;
     const userIdParam = typeof req.query.user_id === 'string' ? req.query.user_id.trim() : null;
+    // 'properties' | 'entertainment' (caller-controlled). When omitted the algorithm tries to detect intent.
+    const feedIntentParam = typeof req.query.feed_intent === 'string'
+      ? req.query.feed_intent.trim().toLowerCase()
+      : '';
+    const feedIntent = ['properties', 'entertainment'].includes(feedIntentParam)
+      ? feedIntentParam
+      : null;
     // שותפים (category 3) feed: filter by roommate search intent or graphic posts
     const searchPurposeParam =
       typeof req.query.search_purpose === 'string' ? req.query.search_purpose.trim().toLowerCase() : '';
@@ -2139,7 +3771,10 @@ app.get('/api/listings', async (req, res) => {
         out = out.eq('search_purpose', searchPurposeParam);
       }
       if (feedPostOnly) {
-        out = out.eq('description', 'פוסט');
+        // Match feed posts like `isPostListingRow` / client `isFeedPost` — not only description = 'פוסט'
+        out = out.or(
+          'feed_post.eq.true,description.eq.פוסט,description.eq.post,property_type.ilike.*post*',
+        );
       }
       return out;
     };
@@ -2163,6 +3798,32 @@ app.get('/api/listings', async (req, res) => {
         return q;
       }
       return q.eq('hospitality_nature', hospitalityNatureParam);
+    };
+    // קרקעות (category 7) sidebar: מושב / היתר — match ads.land_in_mortgage / ads.permit (canonical codes: yes, there_is, …)
+    const landInMortgageParam =
+      typeof req.query.land_in_mortgage === 'string'
+        ? req.query.land_in_mortgage.trim()
+        : '';
+    const permitParam =
+      typeof req.query.permit === 'string' ? req.query.permit.trim() : '';
+    const applyLandSidebar = (q) => {
+      let out = q;
+      if (landInMortgageParam) {
+        if (landInMortgageParam === 'yes') {
+          // Canonical code + legacy Hebrew from older clients
+          out = out.or('land_in_mortgage.eq.yes,land_in_mortgage.eq.כן');
+        } else {
+          out = out.eq('land_in_mortgage', landInMortgageParam);
+        }
+      }
+      if (permitParam) {
+        if (permitParam === 'there_is') {
+          out = out.or('permit.eq.there_is,permit.eq.יש');
+        } else {
+          out = out.eq('permit', permitParam);
+        }
+      }
+      return out;
     };
     const favoritesOnly =
       req.query.favorites_only === 'true' ||
@@ -2224,20 +3885,25 @@ app.get('/api/listings', async (req, res) => {
       query = query.in('id', favoriteAdIds);
     }
 
+    // Favorites: optional category (from feed) narrows to that category; omit for all categories.
     if (category && !isNaN(category)) {
       query = query.eq('category', category);
     }
-    if (subscriptionTypes.length === 1) {
-      query = query.eq('subscription_type', subscriptionTypes[0]);
-    } else if (subscriptionTypes.length > 1) {
-      query = query.in('subscription_type', subscriptionTypes);
+    // Other feed-only filters never apply to favorites_only (avoid hiding cross-category likes).
+    if (!favoritesOnly) {
+      if (subscriptionTypes.length === 1) {
+        query = query.eq('subscription_type', subscriptionTypes[0]);
+      } else if (subscriptionTypes.length > 1) {
+        query = query.in('subscription_type', subscriptionTypes);
+      }
+      if (hasVideo) {
+        query = query.not('video_url', 'is', null);
+      }
+      query = applyConditionFilter(query);
+      query = applySearchPurposeAndFeedPost(query);
+      query = applyHospitalityNature(query);
+      query = applyLandSidebar(query);
     }
-    if (hasVideo) {
-      query = query.not('video_url', 'is', null);
-    }
-    query = applyConditionFilter(query);
-    query = applySearchPurposeAndFeedPost(query);
-    query = applyHospitalityNature(query);
     // subscription_id param = "owner view" (Edit/Publish Ad): show that owner's ads including frozen
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     const validSubscriptionId = subscriptionIdParam && uuidRegex.test(subscriptionIdParam) ? subscriptionIdParam : null;
@@ -2273,13 +3939,23 @@ app.get('/api/listings', async (req, res) => {
       if (favoriteAdIds && favoriteAdIds.length > 0) {
         fallbackQuery = fallbackQuery.in('id', favoriteAdIds);
       }
-      if (category && !isNaN(category)) fallbackQuery = fallbackQuery.eq('category', category);
-      if (subscriptionTypes.length === 1) fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
-      else if (subscriptionTypes.length > 1) fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
-      if (hasVideo) fallbackQuery = fallbackQuery.not('video_url', 'is', null);
-      fallbackQuery = applyConditionFilter(fallbackQuery);
-      fallbackQuery = applySearchPurposeAndFeedPost(fallbackQuery);
-      fallbackQuery = applyHospitalityNature(fallbackQuery);
+      if (category && !isNaN(category)) {
+        fallbackQuery = fallbackQuery.eq('category', category);
+      }
+      if (!favoritesOnly) {
+        if (subscriptionTypes.length === 1) {
+          fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
+        } else if (subscriptionTypes.length > 1) {
+          fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
+        }
+        if (hasVideo) {
+          fallbackQuery = fallbackQuery.not('video_url', 'is', null);
+        }
+        fallbackQuery = applyConditionFilter(fallbackQuery);
+        fallbackQuery = applySearchPurposeAndFeedPost(fallbackQuery);
+        fallbackQuery = applyHospitalityNature(fallbackQuery);
+        fallbackQuery = applyLandSidebar(fallbackQuery);
+      }
       if (isOwnerView) {
         if (validSubscriptionId) fallbackQuery = fallbackQuery.eq('subscription_id', validSubscriptionId);
         else fallbackQuery = fallbackQuery.eq('owner_id', subscriptionIdParam.trim());
@@ -2301,7 +3977,9 @@ app.get('/api/listings', async (req, res) => {
     // Smart feed: when user_id provided and not owner view, sort by preference match (from liked ads) × exposure level
     if (userIdParam && !isOwnerView && adsRows && adsRows.length > 0 && !favoritesOnly) {
       try {
-        adsRows = await sortListingsByFeedAlgorithm(adsRows, userIdParam, supabase);
+        adsRows = await sortListingsByFeedAlgorithm(adsRows, userIdParam, supabase, {
+          intent: feedIntent,
+        });
       } catch (err) {
         console.warn('Feed algorithm sort failed, using default order:', err.message);
       }
@@ -2413,10 +4091,18 @@ app.get('/api/listings', async (req, res) => {
                 s.profile_picture_url ||
                 (type === 'company' ? s.company_logo_url : null) ||
                 null,
+              creator_subscription_type:
+                s.subscription_type != null && String(s.subscription_type).trim() !== ''
+                  ? String(s.subscription_type).trim()
+                  : null,
               creator_specialties: creatorSpecialties || null,
               creator_activity_regions: creatorActivityRegions || null,
               creator_types: creatorTypes || null,
-              creator_bio: (s.description && String(s.description).trim()) ? String(s.description).trim() : null
+              creator_bio: (s.description && String(s.description).trim()) ? String(s.description).trim() : null,
+              creator_business_address:
+                s.business_address && String(s.business_address).trim()
+                  ? String(s.business_address).trim()
+                  : null,
             };
           });
         }
@@ -2424,12 +4110,19 @@ app.get('/api/listings', async (req, res) => {
         try {
           const { data: subs } = await supabase
             .from('subscriptions')
-            .select('id, email, name, contact_person_name')
+            .select('id, email, name, contact_person_name, subscription_type')
             .in('id', subIds);
           if (subs && subs.length) {
             subs.forEach(s => {
               const name = s.name || s.contact_person_name || null;
-              creatorBySubId[s.id] = { creator_email: s.email || null, creator_name: name || null };
+              creatorBySubId[s.id] = {
+                creator_email: s.email || null,
+                creator_name: name || null,
+                creator_subscription_type:
+                  s.subscription_type != null && String(s.subscription_type).trim() !== ''
+                    ? String(s.subscription_type).trim()
+                    : null,
+              };
             });
           }
         } catch (_) { /* ignore */ }
@@ -2457,6 +4150,28 @@ app.get('/api/listings', async (req, res) => {
       }
     }
 
+    /** Per-ad profile reviews (listing_id set on profile_reviews). Omit if column/table unavailable. */
+    const reviewCountByListingId = {};
+    try {
+      const listingIdsForReviews = [...new Set((adsRows || []).map((r) => r.id).filter(Boolean))];
+      if (listingIdsForReviews.length > 0) {
+        const { data: rcRows, error: rcErr } = await supabase
+          .from('profile_reviews')
+          .select('listing_id')
+          .in('listing_id', listingIdsForReviews)
+          .not('listing_id', 'is', null);
+        if (!rcErr && rcRows && rcRows.length > 0) {
+          rcRows.forEach((r) => {
+            const lid = r.listing_id != null ? String(r.listing_id) : '';
+            if (!lid) return;
+            reviewCountByListingId[lid] = (reviewCountByListingId[lid] || 0) + 1;
+          });
+        }
+      }
+    } catch (_) {
+      /* missing listing_id column or profile_reviews */
+    }
+
     // Shape for frontend: add listing_images, listing_videos, view_count, like_count, liked, creator_*
     const listings = (adsRows || []).map((row) => {
       const isPostRow = isPostListingRow(row);
@@ -2475,8 +4190,10 @@ app.get('/api/listings', async (req, res) => {
         if (url) listing_images.push({ image_url: url, image_type: 'additional' });
       });
       const listing_videos = row.video_url ? [{ video_url: row.video_url }] : [];
+      const lidStr = row.id != null ? String(row.id) : '';
       return {
         ...row,
+        review_count: lidStr ? (reviewCountByListingId[lidStr] ?? 0) : 0,
         view_count: row.view_count != null ? Number(row.view_count) : 0,
         like_count: row.like_count != null ? Number(row.like_count) : 0,
         post_like_count:
@@ -2492,10 +4209,12 @@ app.get('/api/listings', async (req, res) => {
         creator_name: row.creator_name ?? creator.creator_name ?? null,
         creator_email: row.creator_email ?? creator.creator_email ?? null,
         creator_profile_image_url: row.profile_image_url ?? creator.creator_profile_image_url ?? null,
+        creator_subscription_type: creator.creator_subscription_type ?? null,
         creator_specialties: creator.creator_specialties || null,
         creator_activity_regions: creator.creator_activity_regions || null,
         creator_types: creator.creator_types || null,
-        creator_bio: creator.creator_bio || null
+        creator_bio: creator.creator_bio || null,
+        creator_business_address: creator.creator_business_address || null
       };
     });
 
@@ -2543,52 +4262,177 @@ function subscriptionDisplayNameForStory(sub) {
   return sub.name || sub.business_name || sub.contact_person_name || 'משתמש';
 }
 
-// GET /api/stories/feed — home strip: users with a profile intro video (subscriptions.video_url)
+/** Aligns with TikTok feed “post” rows — only those rows qualify as video posts in stories (not full property ads). */
+function adRowIsFeedPostForStories(row) {
+  if (!row) return false;
+  if (row.feed_post === true || row.feed_post === 'true' || row.feed_post === 't') return true;
+  const d = String(row.description || '').trim().toLowerCase();
+  if (d === 'פוסט' || d === 'post') return true;
+  const pt = String(row.property_type || '').toLowerCase();
+  if (pt.includes('post')) return true;
+  return false;
+}
+
+function storyHasVideoUrl(u) {
+  return u != null && String(u).trim().length > 0;
+}
+
+const SUBSCRIPTION_SELECT_STORY =
+  'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, status, updated_at';
+
+// GET /api/stories/feed — strip: profile intro video first, then video feed-posts; omit users with neither
 app.get('/api/stories/feed', async (req, res) => {
   try {
     const limit = Math.min(
       80,
       Math.max(1, parseInt(String(req.query.limit || '40'), 10) || 40),
     );
-    const { data: subs, error } = await supabase
-      .from('subscriptions')
-      .select(
-        'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, status, updated_at',
-      )
-      .not('video_url', 'is', null)
-      .in('status', ['verified', 'active'])
-      .order('updated_at', { ascending: false })
-      .limit(limit);
 
-    if (error) {
-      console.error('GET /api/stories/feed (profile videos):', error);
-      return res.status(500).json({ success: false, error: error.message });
+    const adsSelect =
+      'id, subscription_id, video_url, created_at, feed_post, description, property_type, is_frozen';
+
+    let adsQuery = supabase
+      .from('ads')
+      .select(adsSelect)
+      .eq('status', 'published')
+      .not('video_url', 'is', null)
+      .or('is_frozen.is.null,is_frozen.eq.false')
+      .order('created_at', { ascending: false })
+      .limit(1200);
+
+    let { data: adsRows, error: adsError } = await adsQuery;
+
+    const frozenColMissing =
+      adsError &&
+      (adsError.code === '42703' ||
+        adsError.code === 'PGRST204' ||
+        (adsError.message && String(adsError.message).includes('is_frozen')));
+
+    if (frozenColMissing) {
+      const retry = await supabase
+        .from('ads')
+        .select(adsSelect.replace(', is_frozen', ''))
+        .eq('status', 'published')
+        .not('video_url', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(1200);
+      adsRows = retry.data;
+      adsError = retry.error;
     }
 
-    const rings = (subs || [])
-      .filter((s) => s.video_url && String(s.video_url).trim())
-      .map((s) => {
-        const st = (s.subscription_type || '').toLowerCase();
-        const pic =
-          s.profile_picture_url ||
-          (st === 'company' ? s.company_logo_url : null) ||
-          null;
-        const vid = String(s.video_url).trim();
-        return {
-          subscription_id: s.id,
-          display_name: subscriptionDisplayNameForStory(s),
-          profile_image_url: pic,
-          slides: [
-            {
-              id: `${s.id}-profile-video`,
-              media_url: vid,
-              media_type: 'video',
-            },
-          ],
-        };
-      });
+    if (adsError && !frozenColMissing) {
+      console.error('GET /api/stories/feed (ads):', adsError);
+      return res.status(500).json({ success: false, error: adsError.message });
+    }
 
-    res.json({ success: true, rings });
+    const videoPosts = (adsRows || []).filter(
+      (r) =>
+        storyHasVideoUrl(r.video_url) &&
+        adRowIsFeedPostForStories(r) &&
+        r.subscription_id &&
+        (r.is_frozen !== true && String(r.is_frozen || '').toLowerCase() !== 'true'),
+    );
+
+    const postsBySubId = new Map();
+    for (const row of videoPosts) {
+      const sid = row.subscription_id;
+      if (!postsBySubId.has(sid)) postsBySubId.set(sid, []);
+      postsBySubId.get(sid).push(row);
+    }
+    for (const [, arr] of postsBySubId) {
+      arr.sort(
+        (a, b) =>
+          new Date(b.created_at || 0).getTime() -
+          new Date(a.created_at || 0).getTime(),
+      );
+    }
+
+    const idsFromVideoPosts = [...postsBySubId.keys()];
+
+    const { data: subsProfileVideo, error: profErr } = await supabase
+      .from('subscriptions')
+      .select(SUBSCRIPTION_SELECT_STORY)
+      .in('status', ['verified', 'active'])
+      .not('video_url', 'is', null)
+      .order('updated_at', { ascending: false })
+      .limit(400);
+
+    if (profErr) {
+      console.error('GET /api/stories/feed (subscriptions profile video):', profErr);
+      return res.status(500).json({ success: false, error: profErr.message });
+    }
+
+    const subById = new Map();
+    for (const s of subsProfileVideo || []) {
+      if (s?.id) subById.set(s.id, s);
+    }
+
+    const chunkSize = 80;
+    for (let i = 0; i < idsFromVideoPosts.length; i += chunkSize) {
+      const chunk = idsFromVideoPosts.slice(i, i + chunkSize);
+      const { data: chunkSubs, error: chErr } = await supabase
+        .from('subscriptions')
+        .select(SUBSCRIPTION_SELECT_STORY)
+        .in('id', chunk)
+        .in('status', ['verified', 'active']);
+      if (chErr) {
+        console.warn('GET /api/stories/feed chunk subs:', chErr.message);
+        continue;
+      }
+      for (const s of chunkSubs || []) {
+        if (s?.id && !subById.has(s.id)) subById.set(s.id, s);
+      }
+    }
+
+    const rings = [];
+    for (const s of subById.values()) {
+      const slides = [];
+      if (storyHasVideoUrl(s.video_url)) {
+        slides.push({
+          id: `${s.id}-profile-video`,
+          media_url: String(s.video_url).trim(),
+          media_type: 'video',
+          kind: 'profile',
+        });
+      }
+      const posts = postsBySubId.get(s.id) || [];
+      for (const p of posts) {
+        slides.push({
+          id: `${s.id}-post-${p.id}`,
+          media_url: String(p.video_url).trim(),
+          media_type: 'video',
+          kind: 'post',
+        });
+      }
+      if (slides.length === 0) continue;
+
+      const st = (s.subscription_type || '').toLowerCase();
+      const pic =
+        s.profile_picture_url ||
+        (st === 'company' ? s.company_logo_url : null) ||
+        null;
+
+      rings.push({
+        subscription_id: s.id,
+        display_name: subscriptionDisplayNameForStory(s),
+        profile_image_url: pic,
+        slides,
+        updated_at: s.updated_at,
+      });
+    }
+
+    rings.sort((a, b) => {
+      const aProf = a.slides.some((sl) => sl.kind === 'profile') ? 1 : 0;
+      const bProf = b.slides.some((sl) => sl.kind === 'profile') ? 1 : 0;
+      if (bProf !== aProf) return bProf - aProf;
+      const ta = new Date(a.updated_at || 0).getTime();
+      const tb = new Date(b.updated_at || 0).getTime();
+      return tb - ta;
+    });
+
+    const out = rings.slice(0, limit).map(({ updated_at, ...rest }) => rest);
+
+    res.json({ success: true, rings: out });
   } catch (err) {
     console.error('GET /api/stories/feed:', err);
     res.status(500).json({ success: false, error: err.message });
@@ -2671,6 +4515,112 @@ app.get('/api/companies/directory', async (req, res) => {
     res.json({ success: true, companies: companiesOut });
   } catch (err) {
     console.error('GET /api/companies/directory:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/professionals/directory — professional subscriptions for home "חפשו עוד"
+app.get('/api/professionals/directory', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('subscriptions')
+      .select(
+        'id, email, name, contact_person_name, business_name, business_address, description, profile_picture_url, video_url, specializations, types, status, updated_at',
+      )
+      .eq('subscription_type', 'professional')
+      .in('status', ['verified', 'active'])
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      console.error('GET /api/professionals/directory:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const list = rows || [];
+    const ids = list.map(r => r.id).filter(Boolean);
+    const listingCountBySub = {};
+    const ratingBySub = {};
+    if (ids.length > 0) {
+      const { data: adRows, error: adErr } = await supabase
+        .from('ads')
+        .select('subscription_id')
+        .in('subscription_id', ids);
+      if (adErr) {
+        console.warn('GET /api/professionals/directory ads count:', adErr.message);
+      } else {
+        for (const row of adRows || []) {
+          const sid = row.subscription_id;
+          if (!sid) continue;
+          listingCountBySub[sid] = (listingCountBySub[sid] || 0) + 1;
+        }
+      }
+
+      const { data: reviewRows, error: reviewErr } = await supabase
+        .from('profile_reviews')
+        .select('target_subscription_id, rating')
+        .in('target_subscription_id', ids);
+      if (reviewErr) {
+        console.warn('GET /api/professionals/directory ratings:', reviewErr.message);
+      } else {
+        const agg = {};
+        for (const row of reviewRows || []) {
+          const sid = row?.target_subscription_id ? String(row.target_subscription_id) : '';
+          if (!sid) continue;
+          if (!agg[sid]) agg[sid] = {sum: 0, count: 0};
+          agg[sid].sum += Number(row?.rating) || 0;
+          agg[sid].count += 1;
+        }
+        for (const sid of Object.keys(agg)) {
+          if (agg[sid].count > 0) ratingBySub[sid] = agg[sid].sum / agg[sid].count;
+        }
+      }
+    }
+
+    const parseJsonArray = value => {
+      if (Array.isArray(value)) return value.filter(Boolean).map(v => String(v));
+      if (typeof value === 'string') {
+        const raw = value.trim();
+        if (!raw) return [];
+        try {
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed)
+            ? parsed.filter(Boolean).map(v => String(v))
+            : [];
+        } catch (_) {
+          return [raw];
+        }
+      }
+      return [];
+    };
+
+    const professionals = list.map(row => {
+      const displayName =
+        (row.name && String(row.name).trim()) ||
+        (row.business_name && String(row.business_name).trim()) ||
+        (row.contact_person_name && String(row.contact_person_name).trim()) ||
+        'בעל מקצוע';
+      const specializations = parseJsonArray(row.specializations);
+      const types = parseJsonArray(row.types);
+      return {
+        id: row.id,
+        email: row.email || null,
+        subscription_type: 'professional',
+        display_name: displayName,
+        profile_image_url: asPublicImageUrl(row.profile_picture_url),
+        video_url: asPublicImageUrl(row.video_url),
+        address: row.business_address && String(row.business_address).trim() ? String(row.business_address).trim() : null,
+        bio: row.description && String(row.description).trim() ? String(row.description).trim() : null,
+        specializations,
+        types,
+        listing_count: listingCountBySub[row.id] || 0,
+        average_rating: ratingBySub[row.id] != null ? Number(ratingBySub[row.id]) : 5,
+        updated_at: row.updated_at || null,
+      };
+    });
+
+    res.json({ success: true, professionals });
+  } catch (err) {
+    console.error('GET /api/professionals/directory:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2835,6 +4785,42 @@ function isMissingGroupDescriptionColumnError(err) {
   );
 }
 
+function isMissingGroupCreatorEmailColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  const code = String((err && err.code) || '');
+  return (
+    /group_creator_email/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
+}
+
+function isMissingGroupRoleColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  const code = String((err && err.code) || '');
+  return (
+    /group_role/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
+}
+
+/** Normalize participant role; infer owner from conversation creator email when column absent in row. */
+function resolvedGroupRole(partRow, creatorEmailNorm) {
+  const raw = partRow?.group_role != null ? String(partRow.group_role).trim().toLowerCase() : '';
+  if (raw === 'owner' || raw === 'manager' || raw === 'member') return raw;
+  const uid = normEmail(partRow?.user_id);
+  const cr = creatorEmailNorm ? normEmail(creatorEmailNorm) : '';
+  if (cr && uid && cr === uid) return 'owner';
+  return 'member';
+}
+
 /** ads.category → Hebrew badge on chat list (when last message has listing_id) */
 const CHAT_LISTING_CATEGORY_LABELS = {
   1: 'חדש מקבלן',
@@ -2853,6 +4839,42 @@ const CHAT_LISTING_CATEGORY_LABELS = {
 /** Accept standard hyphenated UUIDs from clients (any version). */
 const CHAT_LISTING_ID_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Matches Pi Chat exclusive-offer template body — sync with pi-front ChatScreen EXCLUSIVE_OFFER_BODY_MARKER */
+const CHAT_EXCLUSIVE_OFFER_BODY_MARKER = 'להציע בלעדיות על הנכס';
+
+function isMissingExclusiveOfferTableError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  const code = String((err && err.code) || '');
+  return (
+    /chat_exclusive_offers/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined (column|table)/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST205/i.test(code) ||
+      /PGRST204/i.test(code))
+  );
+}
+
+async function upsertExclusiveOfferPending(supabase, { convId, body, listingId, brokerEmail, ownerEmail }) {
+  if (!convId || !listingId || !body || !String(body).includes(CHAT_EXCLUSIVE_OFFER_BODY_MARKER)) return;
+  const monthsMatch = String(body).match(/בתוך\s+(\d+)\s+חודשים/);
+  const months = monthsMatch ? parseInt(monthsMatch[1], 10) : null;
+  const row = {
+    conversation_id: convId,
+    listing_id: listingId,
+    broker_email: brokerEmail,
+    owner_email: ownerEmail,
+    status: 'pending',
+    months_committed: Number.isFinite(months) ? months : null,
+    updated_at: new Date().toISOString(),
+  };
+  const r = await supabase.from('chat_exclusive_offers').upsert(row, { onConflict: 'conversation_id' });
+  if (r.error && !isMissingExclusiveOfferTableError(r.error)) {
+    console.warn('[chat] exclusive offer upsert:', r.error.message);
+  }
+}
 
 // GET /api/chat/unread-count?user_email=...&after=:iso_timestamp
 app.get('/api/chat/unread-count', async (req, res) => {
@@ -2873,6 +4895,45 @@ app.get('/api/chat/unread-count', async (req, res) => {
     res.json({ success: true, count: 0 });
   }
 });
+
+/** Inbox list preview for shared feed posts (not plain body "פוסט"). */
+const CHAT_SHARED_POST_LIST_PREVIEW = 'פוסט משותף';
+
+function chatLastMessageIsSharedPost(row) {
+  if (!row) return false;
+  if (row.is_listing_share === true || row.is_listing_share === 'true') return true;
+  const lid = row.listing_id != null && String(row.listing_id).trim() !== '';
+  if (!lid) return false;
+  const mt = String(row.media_type || '').trim().toLowerCase();
+  const body = String(row.body || '').trim();
+  if (mt === 'image') return true;
+  if (!body) return true;
+  if (body === 'פוסט' || body === CHAT_SHARED_POST_LIST_PREVIEW) return true;
+  if (/^פוסט\s*$/u.test(body)) return true;
+  return false;
+}
+
+function chatPreviewFromLastMessage(row) {
+  if (!row) return { preview: '', lastMessageIsSharedPost: false };
+  const shared = chatLastMessageIsSharedPost(row);
+  const body = String(row.body || '').trim();
+  if (shared) {
+    const generic =
+      !body ||
+      body === 'פוסט' ||
+      body === CHAT_SHARED_POST_LIST_PREVIEW ||
+      /^פוסט\s*$/u.test(body);
+    if (generic) {
+      return { preview: CHAT_SHARED_POST_LIST_PREVIEW, lastMessageIsSharedPost: true };
+    }
+    return { preview: body.slice(0, 120), lastMessageIsSharedPost: true };
+  }
+  if (body) return { preview: body.slice(0, 120), lastMessageIsSharedPost: false };
+  const mt = String(row.media_type || '').trim().toLowerCase();
+  if (mt === 'image') return { preview: 'תמונה', lastMessageIsSharedPost: false };
+  if (mt === 'audio') return { preview: 'הודעה קולית', lastMessageIsSharedPost: false };
+  return { preview: '', lastMessageIsSharedPost: false };
+}
 
 // GET /api/chat/conversations?user_email=...
 app.get('/api/chat/conversations', async (req, res) => {
@@ -2912,6 +4973,16 @@ app.get('/api/chat/conversations', async (req, res) => {
       participantsByConv[p.conversation_id].push(p);
     });
 
+    let offerStatusByConvId = {};
+    const eoList = await supabase.from('chat_exclusive_offers').select('conversation_id, status').in('conversation_id', convIds);
+    if (!eoList.error && eoList.data) {
+      eoList.data.forEach((r) => {
+        offerStatusByConvId[r.conversation_id] = r.status;
+      });
+    } else if (eoList.error && !isMissingExclusiveOfferTableError(eoList.error)) {
+      console.warn('GET /api/chat/conversations exclusive offers:', eoList.error.message);
+    }
+
     let { data: convs, error: convsSelectErr } = await supabase
       .from('chat_conversations')
       .select('id, last_message_at, type, title, group_image_url')
@@ -2927,9 +4998,12 @@ app.get('/api/chat/conversations', async (req, res) => {
     }
 
     let lastMessages;
+    /** Include is_listing_share when column exists so inbox preview matches shared-post format (see chatPreviewFromLastMessage). */
     const lm1 = await supabase
       .from('chat_messages')
-      .select('conversation_id, body, created_at, sender_id, media_type, listing_id')
+      .select(
+        'conversation_id, body, created_at, sender_id, media_type, listing_id, is_listing_share',
+      )
       .in('conversation_id', convIds);
     if (lm1.error) {
       const lm2 = await supabase
@@ -2941,7 +5015,10 @@ app.get('/api/chat/conversations', async (req, res) => {
           .from('chat_messages')
           .select('conversation_id, body, created_at, sender_id, listing_id')
           .in('conversation_id', convIds);
-        lastMessages = lm3.data;
+        lastMessages = lm3.error ? [] : lm3.data;
+        if (lm3.error && !isMissingColumnError(lm3.error)) {
+          console.error('GET /api/chat/conversations last messages:', lm3.error.message);
+        }
       } else {
         lastMessages = lm2.data;
       }
@@ -3141,10 +5218,7 @@ app.get('/api/chat/conversations', async (req, res) => {
         const last = lastByConv[c.id];
         let preview = '';
         if (last) {
-          const t = (last.body || '').trim();
-          if (t) preview = t.slice(0, 120);
-          else if (last.media_type === 'image') preview = 'תמונה';
-          else if (last.media_type === 'audio') preview = 'הודעה קולית';
+          preview = chatPreviewFromLastMessage(last).preview;
         }
         const lastLid =
           last?.listing_id != null && String(last.listing_id).trim() !== '' ? last.listing_id : null;
@@ -3195,6 +5269,7 @@ app.get('/api/chat/conversations', async (req, res) => {
           listingId,
           listingDisplayNumber,
           listingCategoryLabel,
+          exclusiveOfferStatus: null,
         };
       }
       const other =
@@ -3216,10 +5291,7 @@ app.get('/api/chat/conversations', async (req, res) => {
       const last = lastByConv[c.id];
       let preview = '';
       if (last) {
-        const t = (last.body || '').trim();
-        if (t) preview = t.slice(0, 120);
-        else if (last.media_type === 'image') preview = 'תמונה';
-        else if (last.media_type === 'audio') preview = 'הודעה קולית';
+        preview = chatPreviewFromLastMessage(last).preview;
       }
       const lastLid =
         last?.listing_id != null && String(last.listing_id).trim() !== '' ? last.listing_id : null;
@@ -3241,6 +5313,7 @@ app.get('/api/chat/conversations', async (req, res) => {
         listingId,
         listingDisplayNumber,
         listingCategoryLabel,
+        exclusiveOfferStatus: offerStatusByConvId[c.id] || null,
       };
     }));
 
@@ -3344,12 +5417,21 @@ app.get('/api/chat/participant-display', async (req, res) => {
         .json({success: false, error: 'user_ref or user_email required'});
     }
 
+    const pickSubscriptionPhone = (row) => {
+      if (!row) return null;
+      const cands = [row.phone, row.mobile_phone, row.office_phone];
+      for (const p of cands) {
+        if (p != null && String(p).trim() !== '') return String(p).trim();
+      }
+      return null;
+    };
+
     let sub = null;
     if (userRef.includes('@')) {
       const byEmail = await supabase
         .from('subscriptions')
         .select(
-          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
         )
         .ilike('email', userRef)
         .maybeSingle();
@@ -3358,7 +5440,7 @@ app.get('/api/chat/participant-display', async (req, res) => {
       const byId = await supabase
         .from('subscriptions')
         .select(
-          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
         )
         .eq('id', userRef)
         .maybeSingle();
@@ -3373,7 +5455,8 @@ app.get('/api/chat/participant-display', async (req, res) => {
       else displayName = sub.name || sub.contact_person_name || sub.business_name || null;
       const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
       const profileImageUrl = await resolveExistingImageUrl(asPublicImageUrl(profilePic), new Map());
-      return res.json({ success: true, name: displayName || null, profileImageUrl: profileImageUrl || null });
+      const phone = pickSubscriptionPhone(sub);
+      return res.json({ success: true, name: displayName || null, profileImageUrl: profileImageUrl || null, phone: phone || null });
     }
 
     const participantRef = userRef.includes('@') ? userEmail : userRef;
@@ -3411,7 +5494,35 @@ app.get('/api/chat/messages', async (req, res) => {
     const { data: myParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail);
     const { data: otherParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', otherEmail);
     const myConvIds = new Set((myParts || []).map(p => p.conversation_id));
-    let sharedConvId = (otherParts || []).find(p => myConvIds.has(p.conversation_id))?.conversation_id || null;
+    /** All conversations shared by both users (there may be duplicates from earlier bugs). */
+    const sharedConvIds = (otherParts || [])
+      .map(p => p.conversation_id)
+      .filter(id => myConvIds.has(id));
+    let sharedConvId = null;
+    if (sharedConvIds.length > 0) {
+      if (sharedConvIds.length === 1) {
+        sharedConvId = sharedConvIds[0];
+      } else {
+        // Multiple direct conversations exist — pick the one with the most recent message.
+        const { data: latestRows } = await supabase
+          .from('chat_messages')
+          .select('conversation_id, created_at')
+          .in('conversation_id', sharedConvIds)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (latestRows && latestRows.length > 0) {
+          sharedConvId = latestRows[0].conversation_id;
+        } else {
+          const { data: convRows } = await supabase
+            .from('chat_conversations')
+            .select('id, last_message_at')
+            .in('id', sharedConvIds)
+            .order('last_message_at', { ascending: false, nullsFirst: false })
+            .limit(1);
+          sharedConvId = convRows && convRows[0] ? convRows[0].id : sharedConvIds[0];
+        }
+      }
+    }
 
     if (!sharedConvId && (otherParts || []).length > 0) {
       const convId = (otherParts || [])[0].conversation_id;
@@ -3432,35 +5543,145 @@ app.get('/api/chat/messages', async (req, res) => {
         body: m.body,
         mediaType: withMedia ? (m.media_type || null) : null,
         mediaUrl: withMedia ? (m.media_url || null) : null,
+        listingId: m.listing_id != null ? String(m.listing_id) : null,
+        listingShare:
+          m.is_listing_share === true
+            ? true
+            : m.is_listing_share === false
+              ? false
+              : undefined,
         createdAt: m.created_at,
         isMe,
       };
     };
 
-    let { data: messages, error: msgErr } = await supabase
-      .from('chat_messages')
-      .select('id, sender_id, body, created_at, media_type, media_url')
-      .eq('conversation_id', sharedConvId)
-      .order('created_at', { ascending: true });
-
+    const msgSelectVariants = [
+      'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share',
+      'id, sender_id, body, created_at, media_type, media_url, listing_id',
+      'id, sender_id, body, created_at, media_type, media_url',
+      'id, sender_id, body, created_at, listing_id',
+      'id, sender_id, body, created_at',
+    ];
     let list;
-    if (msgErr) {
-      const fb = await supabase
+    let loaded = false;
+    for (let vi = 0; vi < msgSelectVariants.length; vi++) {
+      const sel = msgSelectVariants[vi];
+      const r = await supabase
         .from('chat_messages')
-        .select('id, sender_id, body, created_at')
+        .select(sel)
         .eq('conversation_id', sharedConvId)
         .order('created_at', { ascending: true });
-      if (fb.error) {
-        console.error('GET /api/chat/messages (fallback):', fb.error.message);
-        return res.status(500).json({ success: false, error: fb.error.message });
+      if (!r.error) {
+        const withMedia = sel.includes('media_type');
+        list = (r.data == null ? [] : r.data).map((m) => mapRow(m, withMedia));
+        loaded = true;
+        break;
       }
-      list = (fb.data || []).map(m => mapRow(m, false));
-    } else {
-      list = (messages == null ? [] : messages).map(m => mapRow(m, true));
+      if (!isMissingColumnError(r.error)) {
+        console.error('GET /api/chat/messages:', r.error.message);
+        return res.status(500).json({ success: false, error: r.error.message });
+      }
     }
-    res.json({ success: true, messages: list, conversation_id: sharedConvId });
+    if (!loaded) {
+      return res.status(500).json({ success: false, error: 'Unable to load chat messages' });
+    }
+
+    let exclusiveOfferOut = null;
+    const eoRes = await supabase.from('chat_exclusive_offers').select('*').eq('conversation_id', sharedConvId).maybeSingle();
+    if (!eoRes.error && eoRes.data) {
+      exclusiveOfferOut = {
+        conversationId: sharedConvId,
+        status: eoRes.data.status,
+        brokerEmail: normEmail(eoRes.data.broker_email),
+        ownerEmail: normEmail(eoRes.data.owner_email),
+        monthsCommitted:
+          eoRes.data.months_committed != null ? Number(eoRes.data.months_committed) : null,
+        listingId: eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
+      };
+    } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
+      console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
+    }
+
+    res.json({
+      success: true,
+      messages: list,
+      conversation_id: sharedConvId,
+      exclusiveOffer: exclusiveOfferOut,
+    });
   } catch (err) {
     console.error('GET /api/chat/messages:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/chat/exclusive-offer/respond — owner accepts or rejects (body: user_email, conversation_id, accept)
+app.post('/api/chat/exclusive-offer/respond', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.body.user_email);
+    const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
+    const accept =
+      req.body.accept === true ||
+      req.body.accept === 'true' ||
+      req.body.accept === 1 ||
+      req.body.accept === '1';
+
+    if (!userEmail || !convId) {
+      return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
+    }
+
+    const { data: row, error: selErr } = await supabase
+      .from('chat_exclusive_offers')
+      .select('*')
+      .eq('conversation_id', convId)
+      .maybeSingle();
+    if (selErr && !isMissingExclusiveOfferTableError(selErr)) {
+      return res.status(500).json({ success: false, error: selErr.message });
+    }
+    if (!row) {
+      return res.status(404).json({ success: false, error: 'לא נמצאה הצעת בלעדיות' });
+    }
+    if (normEmail(row.owner_email) !== userEmail) {
+      return res.status(403).json({ success: false, error: 'רק בעל הנכס יכול לאשר או לדחות' });
+    }
+
+    const st = String(row.status || '').trim().toLowerCase();
+    let nextStatus;
+
+    if (accept) {
+      if (st === 'accepted') {
+        return res.json({ success: true, status: 'accepted' });
+      }
+      if (st !== 'pending' && st !== 'rejected') {
+        return res.status(400).json({ success: false, error: 'לא ניתן לאשר במצב הנוכחי' });
+      }
+      nextStatus = 'accepted';
+    } else {
+      if (st === 'rejected') {
+        return res.json({ success: true, status: 'rejected' });
+      }
+      if (st !== 'pending' && st !== 'accepted') {
+        return res.status(400).json({ success: false, error: 'לא ניתן לדחות במצב הנוכחי' });
+      }
+      nextStatus = 'rejected';
+    }
+
+    const { error: upErr } = await supabase
+      .from('chat_exclusive_offers')
+      .update({ status: nextStatus, updated_at: new Date().toISOString() })
+      .eq('conversation_id', convId);
+    if (upErr) {
+      if (isMissingExclusiveOfferTableError(upErr)) {
+        return res.status(500).json({
+          success: false,
+          error: 'טבלת הצעות בלעדיות חסרה — הרץ migration-chat-exclusive-offer.sql',
+        });
+      }
+      return res.status(500).json({ success: false, error: upErr.message });
+    }
+
+    res.json({ success: true, status: nextStatus });
+  } catch (err) {
+    console.error('POST /api/chat/exclusive-offer/respond:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -3483,6 +5704,11 @@ app.post('/api/chat/messages', async (req, res) => {
     const listingIdRaw = req.body.listing_id != null ? String(req.body.listing_id).trim() : '';
     const listingIdForMessage =
       listingIdRaw && CHAT_LISTING_ID_UUID_RE.test(listingIdRaw) ? listingIdRaw : null;
+    const listingShareToStore =
+      req.body.listing_share === true ||
+      req.body.listing_share === 'true' ||
+      req.body.listing_share === 1 ||
+      req.body.listing_share === '1';
 
     if (!senderEmail || !receiverEmail) {
       return res.status(400).json({ success: false, error: 'sender_email and receiver_email required' });
@@ -3502,12 +5728,34 @@ app.post('/api/chat/messages', async (req, res) => {
     const senderConvIds = (senderConvs || []).map(p => p.conversation_id);
     if (senderConvIds.length > 0) {
       const { data: otherIn } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', receiverEmail).in('conversation_id', senderConvIds);
+      const candidateConvIds = [];
       for (const r of otherIn || []) {
         const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', r.conversation_id);
         const emails = (parts || []).map(p => normEmail(p.user_id));
         if (emails.length === 2 && emails.includes(senderEmail) && emails.includes(receiverEmail)) {
-          convId = r.conversation_id;
-          break;
+          candidateConvIds.push(r.conversation_id);
+        }
+      }
+      if (candidateConvIds.length === 1) {
+        convId = candidateConvIds[0];
+      } else if (candidateConvIds.length > 1) {
+        // Prefer the conversation with the most recent activity to avoid splitting threads.
+        const { data: latestRows } = await supabase
+          .from('chat_messages')
+          .select('conversation_id, created_at')
+          .in('conversation_id', candidateConvIds)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (latestRows && latestRows.length > 0) {
+          convId = latestRows[0].conversation_id;
+        } else {
+          const { data: convRows } = await supabase
+            .from('chat_conversations')
+            .select('id, last_message_at')
+            .in('id', candidateConvIds)
+            .order('last_message_at', { ascending: false, nullsFirst: false })
+            .limit(1);
+          convId = convRows && convRows[0] ? convRows[0].id : candidateConvIds[0];
         }
       }
     }
@@ -3547,67 +5795,290 @@ app.post('/api/chat/messages', async (req, res) => {
       }
     }
 
-    const insertPayload = {
-      conversation_id: convId,
-      sender_id: senderEmail,
-      receiver_id: receiverEmail,
-      body: body || '',
-    };
-    if (mediaType && mediaUrl) {
-      insertPayload.media_type = mediaType;
-      insertPayload.media_url = mediaUrl;
-    }
+    /**
+     * Listing id on insert: for explicit feed shares (`listing_share`), trust client UUID so chat can render
+     * the post card. For normal messages, only attach when the row exists in ads (badge / FK safety).
+     */
+    let listingToStore = null;
     if (listingIdForMessage) {
-      insertPayload.listing_id = listingIdForMessage;
-    }
-    const { data: msg, error } = await supabase
-      .from('chat_messages')
-      .insert(insertPayload)
-      .select('id, sender_id, body, created_at, media_type, media_url')
-      .single();
-    if (error) {
-      if (mediaType && mediaUrl) {
-        return res.status(500).json({ success: false, error: error.message });
+      if (listingShareToStore) {
+        listingToStore = listingIdForMessage;
+      } else {
+        const { data: adRow } = await supabase
+          .from('ads')
+          .select('id')
+          .eq('id', listingIdForMessage)
+          .maybeSingle();
+        if (adRow?.id) listingToStore = listingIdForMessage;
       }
-      const fallbackRow = { conversation_id: convId, sender_id: senderEmail, body: body || '' };
-      if (listingIdForMessage) fallbackRow.listing_id = listingIdForMessage;
-      const fallback = await supabase
-        .from('chat_messages')
-        .insert(fallbackRow)
-        .select('id, sender_id, body, created_at')
-        .single();
-      if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
-      await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
-      const fd = fallback.data;
+    }
+
+    /** DBs without migration-chat-media.sql lack media_*; without migration-chat-listing-share-flag.sql lack is_listing_share. */
+    const directInsertSelectVariants = [
+      'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share',
+      'id, sender_id, body, created_at, listing_id, is_listing_share',
+      'id, sender_id, body, created_at, media_type, media_url, listing_id',
+      'id, sender_id, body, created_at, listing_id',
+      'id, sender_id, body, created_at, media_type, media_url',
+      'id, sender_id, body, created_at',
+    ];
+    const mkInsertPayload = (withMedia, withListing) => {
+      const p = {
+        conversation_id: convId,
+        sender_id: senderEmail,
+        receiver_id: receiverEmail,
+        body: body || '',
+      };
+      if (withMedia && mediaType && mediaUrl) {
+        p.media_type = mediaType;
+        p.media_url = mediaUrl;
+      }
+      if (withListing && listingToStore) p.listing_id = listingToStore;
+      if (listingShareToStore) p.is_listing_share = true;
+      return p;
+    };
+
+    const mapDirectMessageResponse = (row, insertPayload) => ({
+      id: row.id,
+      senderId: row.sender_id,
+      body: row.body,
+      mediaType: row.media_type != null ? row.media_type : insertPayload.media_type || null,
+      mediaUrl: row.media_url != null ? row.media_url : insertPayload.media_url || null,
+      listingId:
+        row.listing_id != null
+          ? String(row.listing_id)
+          : insertPayload.listing_id != null
+            ? String(insertPayload.listing_id)
+            : null,
+      listingShare:
+        row.is_listing_share === true ||
+        insertPayload.is_listing_share === true,
+      createdAt: row.created_at,
+      isMe: true,
+    });
+
+    const insertAttempts = [
+      [true, true],
+      [true, false],
+      [false, true],
+      [false, false],
+    ];
+    let msg = null;
+    let winningPayload = null;
+    let insertErr = null;
+    const triedKeys = new Set();
+    outer: for (const [wm, wl] of insertAttempts) {
+      const insertPayload = mkInsertPayload(wm, wl);
+      const dedupeKey = JSON.stringify(insertPayload);
+      if (triedKeys.has(dedupeKey)) continue;
+      triedKeys.add(dedupeKey);
+      const payloadHasMedia = !!(insertPayload.media_type && insertPayload.media_url);
+      for (const sel of directInsertSelectVariants) {
+        const attempt = await supabase
+          .from('chat_messages')
+          .insert(insertPayload)
+          .select(sel)
+          .single();
+        if (!attempt.error) {
+          msg = attempt.data;
+          winningPayload = insertPayload;
+          break outer;
+        }
+        insertErr = attempt.error;
+        const em = String(attempt.error.message || '').toLowerCase();
+        if (
+          payloadHasMedia &&
+          (em.includes('media_type') || em.includes('media_url'))
+        ) {
+          console.warn('[POST /api/chat/messages] insert attempt failed (no media columns?)', {
+            withMedia: wm,
+            withListing: wl,
+            message: attempt.error.message,
+          });
+          continue outer;
+        }
+        if (!isMissingColumnError(attempt.error)) {
+          console.warn('[POST /api/chat/messages] insert attempt failed', {
+            withMedia: wm,
+            withListing: wl,
+            message: attempt.error.message,
+          });
+          continue outer;
+        }
+      }
+    }
+
+    if (!msg) {
+      /** Last resort: try listing+share with media, then same without media columns (older DBs). */
+      const rowBase = {
+        conversation_id: convId,
+        sender_id: senderEmail,
+        receiver_id: receiverEmail,
+        body: body || '',
+      };
+      const rowListingShare = { ...rowBase };
+      if (listingShareToStore) rowListingShare.is_listing_share = true;
+      if (listingToStore) rowListingShare.listing_id = listingToStore;
+
+      const fallbackAttempts = [];
+      if (mediaType && mediaUrl) {
+        fallbackAttempts.push({
+          ...rowListingShare,
+          media_type: mediaType,
+          media_url: mediaUrl,
+        });
+      }
+      fallbackAttempts.push(rowListingShare);
+
+      let fd = null;
+      let fallbackPayload = null;
+      const triedFb = new Set();
+      inner: for (const fallbackRow of fallbackAttempts) {
+        const dedupe = JSON.stringify(fallbackRow);
+        if (triedFb.has(dedupe)) continue;
+        triedFb.add(dedupe);
+        for (const sel of directInsertSelectVariants) {
+          const fallback = await supabase
+            .from('chat_messages')
+            .insert(fallbackRow)
+            .select(sel)
+            .single();
+          if (!fallback.error) {
+            fd = fallback.data;
+            fallbackPayload = fallbackRow;
+            break inner;
+          }
+          insertErr = fallback.error;
+          const em = String(fallback.error.message || '').toLowerCase();
+          if (
+            (fallbackRow.media_type || fallbackRow.media_url) &&
+            (em.includes('media_type') || em.includes('media_url'))
+          ) {
+            continue inner;
+          }
+          if (!isMissingColumnError(fallback.error)) {
+            continue inner;
+          }
+        }
+      }
+      if (!fd || !fallbackPayload) {
+        console.error('[POST /api/chat/messages] insert exhausted', insertErr?.message);
+        return res.status(500).json({
+          success: false,
+          error: insertErr?.message || 'Failed to save message',
+        });
+      }
+      await supabase.from('chat_conversations').update({ last_message_at: fd.created_at }).eq('id', convId);
+      await upsertExclusiveOfferPending(supabase, {
+        convId,
+        body,
+        listingId: listingToStore,
+        brokerEmail: senderEmail,
+        ownerEmail: receiverEmail,
+      });
       return res.json({
         success: true,
-        message: {
-          id: fd.id,
-          senderId: fd.sender_id,
-          body: fd.body,
-          mediaType: null,
-          mediaUrl: null,
-          createdAt: fd.created_at,
-          isMe: true,
-        },
+        message: mapDirectMessageResponse(fd, fallbackPayload),
       });
     }
     await supabase.from('chat_conversations').update({ last_message_at: msg.created_at }).eq('id', convId);
+    await upsertExclusiveOfferPending(supabase, {
+      convId,
+      body,
+      listingId: listingToStore,
+      brokerEmail: senderEmail,
+      ownerEmail: receiverEmail,
+    });
     res.json({
       success: true,
-      message: {
-        id: msg.id,
-        senderId: msg.sender_id,
-        body: msg.body,
-        mediaType: msg.media_type || null,
-        mediaUrl: msg.media_url || null,
-        createdAt: msg.created_at,
-        isMe: true,
-      },
+      message: mapDirectMessageResponse(msg, winningPayload),
     });
   } catch (err) {
     console.error('POST /api/chat/messages:', err);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/listings/:id/preview - lightweight listing preview for chat shared-post cards
+app.get('/api/listings/:id/preview', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id || !CHAT_LISTING_ID_UUID_RE.test(String(id).trim())) {
+      return res.status(400).json({ success: false, error: 'Invalid id' });
+    }
+    let row = null;
+    const primary = await supabase
+      .from('ads')
+      .select(
+        'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose',
+      )
+      .eq('id', id)
+      .maybeSingle();
+    if (primary.error && isMissingColumnError(primary.error)) {
+      const fb = await supabase
+        .from('ads')
+        .select('id, description, main_image_url, additional_image_urls, video_url, price, address, purpose')
+        .eq('id', id)
+        .maybeSingle();
+      row = fb.error ? null : fb.data;
+    } else if (!primary.error) {
+      row = primary.data;
+    } else {
+      console.error('listing preview ad select err:', primary.error.message);
+    }
+    if (!row) {
+      return res.json({
+        success: true,
+        listing: {
+          id,
+          description: '',
+          mediaUrl: null,
+          feedPost: false,
+          propertyType: null,
+          price: null,
+          address: null,
+          purpose: null,
+          purposeLabel: 'למכירה',
+        },
+      });
+    }
+    const additional = Array.isArray(row.additional_image_urls) ? row.additional_image_urls : [];
+    const mediaUrl =
+      (row.main_image_url && String(row.main_image_url).trim()) ||
+      (additional.find(u => u && String(u).trim()) || null);
+    const purposeRaw = row.purpose != null ? String(row.purpose).trim().toLowerCase() : '';
+    const purposeLabel = purposeRaw === 'rent' ? 'להשכרה' : 'למכירה';
+    const priceNum = row.price != null ? Number(row.price) : null;
+    return res.json({
+      success: true,
+      listing: {
+        id: row.id,
+        description: row.description || '',
+        mediaUrl: mediaUrl || null,
+        feedPost: row.feed_post === true || row.feed_post === 'true' || row.feed_post === 't',
+        propertyType: row.property_type || null,
+        price: Number.isFinite(priceNum) ? priceNum : null,
+        address: row.address != null && String(row.address).trim() ? String(row.address).trim() : null,
+        purpose: purposeRaw || null,
+        purposeLabel,
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/listings/:id/preview:', err);
+    return res.json({
+      success: true,
+      listing: {
+        id: req.params.id || null,
+        description: '',
+        mediaUrl: null,
+        feedPost: false,
+        propertyType: null,
+        price: null,
+        address: null,
+        purpose: null,
+        purposeLabel: 'למכירה',
+      },
+    });
   }
 });
 
@@ -3630,6 +6101,35 @@ app.post('/api/listings/:id/view', async (req, res) => {
     return res.json({ success: true });
   } catch (e) {
     console.error('Error recording view:', e);
+    return res.status(200).json({ success: true });
+  }
+});
+
+// POST /api/listings/:id/share - increment share_count once per share action
+app.post('/api/listings/:id/share', async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).json({ success: false, error: 'Missing listing id' });
+    const countBy = Math.max(1, Number.isFinite(Number(req.body?.count)) ? Number(req.body.count) : 1);
+    const { data: row, error: selectError } = await supabase
+      .from('ads')
+      .select('share_count')
+      .eq('id', id)
+      .maybeSingle();
+    if (selectError) {
+      console.warn('Share count select failed (column may be missing):', selectError.message);
+      return res.status(200).json({ success: true });
+    }
+    const current = row?.share_count != null ? Number(row.share_count) : 0;
+    const next = current + countBy;
+    const { error } = await supabase.from('ads').update({ share_count: next }).eq('id', id);
+    if (error) {
+      console.warn('Share count update failed:', error.message);
+      return res.status(200).json({ success: true, share_count: current });
+    }
+    return res.json({ success: true, share_count: next });
+  } catch (e) {
+    console.error('Error recording share:', e);
     return res.status(200).json({ success: true });
   }
 });
@@ -3960,7 +6460,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
     }
     const { data: rows, error } = await supabase
       .from('post_comments')
-      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, likes_count, dislikes_count, created_at')
+      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, comment_image_url, likes_count, dislikes_count, created_at')
       .eq('ad_id', id)
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ success: false, error: error.message });
@@ -3988,6 +6488,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
         comment_text: r.comment_text || '',
         commenter_name: r.commenter_name || 'משתמש',
         commenter_image_url: r.commenter_image_url || null,
+        comment_image_url: r.comment_image_url || null,
         likes_count: r.likes_count != null ? Number(r.likes_count) : 0,
         dislikes_count: r.dislikes_count != null ? Number(r.dislikes_count) : 0,
         my_reaction: reactionByCommentId[r.id] || null,
@@ -4008,11 +6509,13 @@ app.post('/api/posts/:id/comments', async (req, res) => {
       req.body && req.body.user_id != null ? String(req.body.user_id).trim() : null;
     const text =
       req.body && req.body.text != null ? String(req.body.text).trim() : '';
+    const imageUrlRaw =
+      req.body && req.body.image_url != null ? String(req.body.image_url).trim() : '';
     if (!id || !user_id) {
       return res.status(400).json({ success: false, error: 'Missing post id or user_id' });
     }
-    if (!text) {
-      return res.status(400).json({ success: false, error: 'Comment text is required' });
+    if (!text && !imageUrlRaw) {
+      return res.status(400).json({ success: false, error: 'Comment text or image is required' });
     }
     const { row: postRow, error: postErr } = await fetchAdRowWithFallback(
       id,
@@ -4068,8 +6571,9 @@ app.post('/api/posts/:id/comments', async (req, res) => {
         comment_text: text,
         commenter_name: commenterName,
         commenter_image_url: commenterImageUrl,
+        comment_image_url: imageUrlRaw || null,
       })
-      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, likes_count, dislikes_count, created_at')
+      .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, comment_image_url, likes_count, dislikes_count, created_at')
       .single();
     if (insErr) return res.status(500).json({ success: false, error: insErr.message });
 
@@ -4085,6 +6589,7 @@ app.post('/api/posts/:id/comments', async (req, res) => {
         comment_text: inserted.comment_text || '',
         commenter_name: inserted.commenter_name || commenterName,
         commenter_image_url: inserted.commenter_image_url || commenterImageUrl,
+        comment_image_url: inserted.comment_image_url || null,
         likes_count: inserted.likes_count != null ? Number(inserted.likes_count) : 0,
         dislikes_count: inserted.dislikes_count != null ? Number(inserted.dislikes_count) : 0,
         my_reaction: null,
@@ -4231,197 +6736,7 @@ app.delete('/api/posts/:id/comments/:commentId/reaction', async (req, res) => {
 // Media URLs reference files in storage bucket: user-photo-video
 app.post('/api/listings', async (req, res) => {
   try {
-    const body = req.body || {};
-    const {
-      category,
-      status = 'draft',
-      subscriptionId,
-      subscriptionType,
-      propertyType,
-      area,
-      rooms,
-      floor,
-      purpose,
-      price,
-      projectName,
-      address,
-      phone,
-      description,
-      displayOption,
-      feed_display_priority: feedDisplayPriority,
-      mainImageUrl,
-      additionalImageUrls = [],
-      videoUrl,
-      hasVideo,
-      amenities,
-      condition,
-      searchPurpose,
-      preferredApartmentType,
-      preferredGender,
-      preferredAgeMin,
-      preferredAgeMax,
-      preferences,
-      budget,
-      pricePerNight,
-      hospitalityNature,
-      serviceFacility,
-      accommodationOffers,
-      cancellationPolicy,
-      contactDetails,
-      proposedLand,
-      planApproval,
-      landInMortgage,
-      permit,
-      agriculturalLand,
-      landOwnership,
-      landAddress,
-      landParcel,
-      landBlock,
-      constructionStatus,
-      saleAtPresale,
-      generalDetails,
-      bnbHostType,
-      bnbBusinessLogoUrl,
-      hotDeal,
-      projectOffers,
-      companyOffersLandSizes,
-      salesImageUrl,
-      profileImageUrl,
-      overlay_x: overlayX,
-      overlay_y: overlayY,
-      exposure_level: exposureLevel
-    } = body;
-
-    const additionalUrls = Array.isArray(additionalImageUrls) ? additionalImageUrls : [];
-    const additionalImageUrlsJson = additionalUrls.filter(Boolean);
-
-    // subscription_id must be a valid UUID; client may send "user-123" style ids
-    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-    const validSubscriptionId =
-      subscriptionId && typeof subscriptionId === 'string' && uuidRegex.test(subscriptionId.trim())
-        ? subscriptionId.trim()
-        : null;
-
-    // Save uploader (creator) name and email from subscription so listing always shows who uploaded it
-    let creatorName = null;
-    let creatorEmail = null;
-    if (validSubscriptionId) {
-      try {
-        const { data: sub } = await supabase
-          .from('subscriptions')
-          .select('id, email, name, contact_person_name, subscription_type, business_name, broker_office_name')
-          .eq('id', validSubscriptionId)
-          .maybeSingle();
-        if (sub) {
-          creatorEmail = sub.email || null;
-          const type = (sub.subscription_type || '').toLowerCase();
-          if (type === 'company') {
-            creatorName = sub.business_name || sub.name || sub.contact_person_name || null;
-          } else if (type === 'broker') {
-            creatorName = sub.broker_office_name || sub.name || sub.contact_person_name || null;
-          } else {
-            creatorName = sub.name || sub.business_name || sub.contact_person_name || null;
-          }
-        }
-      } catch (_) { /* ignore */ }
-    }
-
-    const adRecord = {
-      subscription_id: validSubscriptionId,
-      owner_id: subscriptionId && typeof subscriptionId === 'string' && subscriptionId.trim() ? subscriptionId.trim() : null,
-      creator_name: creatorName,
-      creator_email: creatorEmail,
-      subscription_type: subscriptionType || null,
-      category: category != null ? parseInt(category, 10) : 1,
-      status: status === 'published' ? 'published' : 'draft',
-      main_image_url: mainImageUrl || null,
-      additional_image_urls: additionalImageUrlsJson.length ? additionalImageUrlsJson : [],
-      video_url: videoUrl || null,
-      sales_image_url: salesImageUrl || null,
-      profile_image_url: profileImageUrl || null,
-      bnb_business_logo_url:
-        typeof bnbBusinessLogoUrl === 'string' && bnbBusinessLogoUrl.trim() !== ''
-          ? bnbBusinessLogoUrl.trim()
-          : null,
-      display_option: displayOption || null,
-      feed_display_priority: feedDisplayPriority === 'mainImage' ? 'mainImage' : (feedDisplayPriority === 'video' ? 'video' : null),
-      property_type: propertyType || null,
-      area: area != null ? parseInt(area, 10) : null,
-      rooms: rooms != null ? parseInt(rooms, 10) : null,
-      floor: floor != null ? parseInt(floor, 10) : null,
-      purpose: purpose || 'sale',
-      price: price != null ? parseFloat(price) : null,
-      budget: budget != null ? parseFloat(budget) : null,
-      price_per_night: pricePerNight != null ? parseFloat(pricePerNight) : null,
-      amenities: amenities && typeof amenities === 'object' ? amenities : null,
-      condition: condition || null,
-      project_name: projectName != null && String(projectName).trim() !== '' ? String(projectName).trim() : null,
-      address: address || null,
-      phone: phone || null,
-      description: description || null,
-      overlay_x: overlayX != null ? parseInt(overlayX, 10) : null,
-      overlay_y: overlayY != null ? parseInt(overlayY, 10) : null,
-      search_purpose: searchPurpose || null,
-      preferred_apartment_type: preferredApartmentType || null,
-      preferred_gender: preferredGender || null,
-      preferred_age_min: preferredAgeMin != null ? parseInt(preferredAgeMin, 10) : null,
-      preferred_age_max: preferredAgeMax != null ? parseInt(preferredAgeMax, 10) : null,
-      preferences: preferences && typeof preferences === 'object' ? preferences : null,
-      hospitality_nature: hospitalityNature || null,
-      service_facility: serviceFacility && typeof serviceFacility === 'object' ? serviceFacility : null,
-      accommodation_offers: accommodationOffers && typeof accommodationOffers === 'object' ? accommodationOffers : null,
-      cancellation_policy: cancellationPolicy || null,
-      hot_deal: !!(
-        hotDeal === true ||
-        hotDeal === 'true' ||
-        hotDeal === 1 ||
-        hotDeal === '1'
-      ),
-      contact_details: contactDetails && typeof contactDetails === 'object' ? contactDetails : null,
-      proposed_land: proposedLand && typeof proposedLand === 'object' ? proposedLand : null,
-      plan_approval: planApproval || null,
-      land_in_mortgage: landInMortgage || null,
-      permit: permit || null,
-      agricultural_land: agriculturalLand || null,
-      land_ownership: landOwnership || null,
-      // חלקה/גוש: merged into land_address so inserts work without land_parcel/land_block columns.
-      // Run migration-ads-land-parcel-block.sql if you want dedicated columns in Supabase.
-      land_address: (() => {
-        const line =
-          landAddress != null && String(landAddress).trim() !== ''
-            ? String(landAddress).trim()
-            : null;
-        const parcelStr =
-          landParcel != null && String(landParcel).trim() !== ''
-            ? String(landParcel).trim()
-            : null;
-        const blockStr =
-          landBlock != null && String(landBlock).trim() !== ''
-            ? String(landBlock).trim()
-            : null;
-        const parts = [
-          line,
-          parcelStr ? `חלקה ${parcelStr}` : null,
-          blockStr ? `גוש ${blockStr}` : null,
-        ].filter(Boolean);
-        return parts.length ? parts.join(' | ') : null;
-      })(),
-      construction_status: constructionStatus || null,
-      sale_at_presale: saleAtPresale !== undefined && saleAtPresale !== null ? (saleAtPresale === true || saleAtPresale === 'true') : null,
-      general_details: (() => {
-        const base =
-          generalDetails && typeof generalDetails === 'object' ? {...generalDetails} : {};
-        const bnb =
-          bnbHostType === 'private' || bnbHostType === 'business'
-            ? String(bnbHostType)
-            : null;
-        if (bnb) base.bnb_host_type = bnb;
-        return Object.keys(base).length ? base : null;
-      })(),
-      project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,
-      company_offers_land_sizes: companyOffersLandSizes && typeof companyOffersLandSizes === 'object' ? companyOffersLandSizes : null,
-      exposure_level: ['low', 'medium', 'high'].includes(String(exposureLevel || '').toLowerCase()) ? String(exposureLevel).toLowerCase() : 'medium'
-    };
+    const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
 
     const { data: ad, error: insertError } = await supabase
       .from('ads')
@@ -4448,6 +6763,50 @@ app.post('/api/listings', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+const LISTING_AD_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// PUT /api/listings/:id — full update (same body shape as POST)
+app.put('/api/listings/:id', async (req, res) => {
+  try {
+    const id = req.params.id != null ? String(req.params.id).trim() : '';
+    if (!LISTING_AD_UUID_RE.test(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid listing id' });
+    }
+    const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
+    const { data: ad, error: updateError } = await supabase
+      .from('ads')
+      .update(adRecord)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Error updating ad:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update listing',
+        details: updateError.message,
+      });
+    }
+    if (!ad) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+
+    res.status(200).json({
+      success: true,
+      id: ad.id,
+      listing: ad,
+    });
+  } catch (error) {
+    console.error('Error in PUT /api/listings/:id:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
     });
   }
 });
@@ -4508,6 +6867,300 @@ app.patch('/api/listings/:id', async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+// ==================== USER SEARCH HISTORY ENDPOINTS ====================
+// Recent user searches shown in the TikTok feed "אחרונים" list.
+
+/** Limit for how many recent searches to return per user. */
+const USER_SEARCH_RECENT_LIMIT = 25;
+
+// GET /api/search/users/recent?user_email=...
+// Returns the current user's recent searches, newest first, joined with the target's display info.
+app.get('/api/search/users/recent', async (req, res) => {
+  try {
+    const userSubId = await resolveSubscriptionIdByEmail(req.query.user_email);
+    if (!userSubId) {
+      return res.status(400).json({ success: false, error: 'user_email invalid or not a subscription' });
+    }
+    const { data: rows, error } = await supabase
+      .from('user_search_history')
+      .select('id, target_subscription_id, updated_at')
+      .eq('user_subscription_id', userSubId)
+      .order('updated_at', { ascending: false })
+      .limit(USER_SEARCH_RECENT_LIMIT);
+    if (error) {
+      if (error.code === '42P01' || (error.message || '').toLowerCase().includes('user_search_history')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-user-search-history.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    const list = Array.isArray(rows) ? rows : [];
+    const targetIds = [...new Set(list.map(r => r.target_subscription_id).filter(Boolean))];
+    let subs = [];
+    if (targetIds.length > 0) {
+      const { data: subRows } = await supabase
+        .from('subscriptions')
+        .select(
+          'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
+        )
+        .in('id', targetIds);
+      subs = subRows || [];
+    }
+    const subsById = Object.fromEntries(subs.map(s => [String(s.id), s]));
+    const recent = list
+      .map(row => {
+        const sub = subsById[String(row.target_subscription_id)];
+        if (!sub) return null;
+        const type = (sub.subscription_type || '').toLowerCase();
+        let name = null;
+        if (type === 'company') name = sub.business_name || sub.name || sub.contact_person_name || null;
+        else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
+        else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
+        else name = sub.name || sub.contact_person_name || sub.business_name || null;
+        const pic = asPublicImageUrl(
+          sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null,
+        );
+        return {
+          id: row.id,
+          target_subscription_id: row.target_subscription_id,
+          updated_at: row.updated_at,
+          name: name || 'משתמש',
+          email: sub.email || null,
+          subscription_type: sub.subscription_type || null,
+          profileImageUrl: pic || null,
+        };
+      })
+      .filter(Boolean);
+    res.json({ success: true, recent });
+  } catch (err) {
+    console.error('GET /api/search/users/recent error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/search/users/recent - body: { user_email, target_subscription_id }
+// Upserts a row so the same target bubbles to the top on re-search.
+app.post('/api/search/users/recent', async (req, res) => {
+  try {
+    const userSubId = await resolveSubscriptionIdByEmail(req.body?.user_email);
+    if (!userSubId) {
+      return res.status(400).json({ success: false, error: 'user_email invalid or not a subscription' });
+    }
+    const targetId =
+      req.body?.target_subscription_id != null
+        ? String(req.body.target_subscription_id).trim()
+        : '';
+    if (!targetId || !CHAT_UUID_RE.test(targetId)) {
+      return res.status(400).json({ success: false, error: 'target_subscription_id (UUID) required' });
+    }
+    if (targetId === userSubId) {
+      return res.json({ success: true, skipped: true });
+    }
+    const now = new Date().toISOString();
+    const { error: upsertErr } = await supabase
+      .from('user_search_history')
+      .upsert(
+        {
+          user_subscription_id: userSubId,
+          target_subscription_id: targetId,
+          updated_at: now,
+        },
+        { onConflict: 'user_subscription_id,target_subscription_id' },
+      );
+    if (upsertErr) {
+      if (upsertErr.code === '42P01' || (upsertErr.message || '').toLowerCase().includes('user_search_history')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-user-search-history.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: upsertErr.message });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/search/users/recent error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/search/users/recent?user_email=...  → clears all recent searches for that user.
+app.delete('/api/search/users/recent', async (req, res) => {
+  try {
+    const userSubId = await resolveSubscriptionIdByEmail(
+      req.query.user_email || req.body?.user_email,
+    );
+    if (!userSubId) {
+      return res.status(400).json({ success: false, error: 'user_email invalid or not a subscription' });
+    }
+    const { error } = await supabase
+      .from('user_search_history')
+      .delete()
+      .eq('user_subscription_id', userSubId);
+    if (error) {
+      if (error.code === '42P01' || (error.message || '').toLowerCase().includes('user_search_history')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-user-search-history.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/search/users/recent error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==================== LISTING BOOST ENDPOINTS ====================
+
+/** Monthly boost quota per subscription. */
+const BOOST_MONTHLY_QUOTA = 2;
+/** Boost duration in hours. */
+const BOOST_DURATION_HOURS = 24;
+
+/** Start of the current calendar month in UTC as ISO string. */
+function currentMonthStartIso() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+}
+
+async function resolveSubscriptionIdByEmail(emailRaw) {
+  const email = normEmail(emailRaw);
+  if (!email) return null;
+  const { data } = await supabase
+    .from('subscriptions')
+    .select('id')
+    .ilike('email', email)
+    .maybeSingle();
+  return data?.id || null;
+}
+
+// GET /api/listings/boost-quota?user_email=...
+// Returns current month's boost usage/remaining for the caller.
+app.get('/api/listings/boost-quota', async (req, res) => {
+  try {
+    const subscriptionId = await resolveSubscriptionIdByEmail(req.query.user_email);
+    if (!subscriptionId) {
+      return res.status(400).json({ success: false, error: 'user_email invalid or not a subscription' });
+    }
+    const monthStart = currentMonthStartIso();
+    const { count, error } = await supabase
+      .from('listing_boosts')
+      .select('id', { count: 'exact', head: true })
+      .eq('subscription_id', subscriptionId)
+      .gte('created_at', monthStart);
+    if (error) {
+      if (error.code === '42P01' || (error.message || '').toLowerCase().includes('listing_boosts')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-listing-boosts.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    const used = count || 0;
+    res.json({
+      success: true,
+      quota: BOOST_MONTHLY_QUOTA,
+      used,
+      remaining: Math.max(0, BOOST_MONTHLY_QUOTA - used),
+      duration_hours: BOOST_DURATION_HOURS,
+    });
+  } catch (err) {
+    console.error('GET /api/listings/boost-quota error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/listings/:id/boost - mark the listing as boosted for BOOST_DURATION_HOURS.
+// Body: { user_email }. Enforces BOOST_MONTHLY_QUOTA per subscription per calendar month.
+app.post('/api/listings/:id/boost', async (req, res) => {
+  try {
+    const adId = req.params.id;
+    if (!adId) return res.status(400).json({ success: false, error: 'Listing id required' });
+    const subscriptionId = await resolveSubscriptionIdByEmail(req.body?.user_email);
+    if (!subscriptionId) {
+      return res.status(400).json({ success: false, error: 'user_email invalid or not a subscription' });
+    }
+
+    const monthStart = currentMonthStartIso();
+    const { count, error: countErr } = await supabase
+      .from('listing_boosts')
+      .select('id', { count: 'exact', head: true })
+      .eq('subscription_id', subscriptionId)
+      .gte('created_at', monthStart);
+    if (countErr) {
+      if (countErr.code === '42P01' || (countErr.message || '').toLowerCase().includes('listing_boosts')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-listing-boosts.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: countErr.message });
+    }
+    const used = count || 0;
+    if (used >= BOOST_MONTHLY_QUOTA) {
+      return res.status(429).json({
+        success: false,
+        error: `הגעת למכסת ההקפצות החודשית (${BOOST_MONTHLY_QUOTA}).`,
+        code: 'QUOTA_EXCEEDED',
+        quota: BOOST_MONTHLY_QUOTA,
+        used,
+        remaining: 0,
+      });
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + BOOST_DURATION_HOURS * 60 * 60 * 1000);
+
+    const { error: boostErr } = await supabase.from('listing_boosts').insert({
+      subscription_id: subscriptionId,
+      ad_id: adId,
+      expires_at: expiresAt.toISOString(),
+    });
+    if (boostErr) {
+      return res.status(500).json({ success: false, error: boostErr.message });
+    }
+
+    const { data: ad, error: updateErr } = await supabase
+      .from('ads')
+      .update({ boost_expires_at: expiresAt.toISOString() })
+      .eq('id', adId)
+      .select('id, boost_expires_at')
+      .single();
+    if (updateErr) {
+      if (updateErr.code === 'PGRST204' && (updateErr.message || '').includes('boost_expires_at')) {
+        return res.status(503).json({
+          success: false,
+          error: 'Run migration-listing-boosts.sql in Supabase SQL Editor.',
+          code: 'SCHEMA_MIGRATION_NEEDED',
+        });
+      }
+      return res.status(500).json({ success: false, error: updateErr.message });
+    }
+
+    res.json({
+      success: true,
+      listing: ad,
+      boost_expires_at: expiresAt.toISOString(),
+      quota: BOOST_MONTHLY_QUOTA,
+      used: used + 1,
+      remaining: Math.max(0, BOOST_MONTHLY_QUOTA - (used + 1)),
+    });
+  } catch (err) {
+    console.error('POST /api/listings/:id/boost error:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
