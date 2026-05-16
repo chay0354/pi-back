@@ -1,10 +1,69 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
+
+const B2B_SUBSCRIPTION_TYPES = new Set(['broker', 'company', 'professional']);
+const MIN_PASSWORD_LENGTH = 8;
+
+function isB2BSubscriptionType(type) {
+  return B2B_SUBSCRIPTION_TYPES.has(String(type || '').trim().toLowerCase());
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedHash) {
+  if (!storedHash || typeof storedHash !== 'string') return false;
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, expected] = parts;
+  const actual = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(actual, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+async function persistSubscriptionPasswordHash(subscriptionId, passwordRaw) {
+  const pwd = String(passwordRaw || '');
+  if (pwd.length < MIN_PASSWORD_LENGTH) {
+    const err = new Error(
+      `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+  const { error } = await supabase
+    .from('subscriptions')
+    .update({ password_hash: hashPassword(pwd) })
+    .eq('id', subscriptionId);
+  if (error) {
+    console.error('[persistSubscriptionPasswordHash]', subscriptionId, error.message);
+    const err = new Error(error.message || 'Failed to save password');
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+/** Never expose password_hash or verification_code to clients. */
+function sanitizeSubscriptionForClient(subscription) {
+  if (!subscription || typeof subscription !== 'object') return subscription;
+  const {
+    password_hash: _ph,
+    verification_code: _vc,
+    ...safe
+  } = subscription;
+  return safe;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -249,6 +308,25 @@ function allowSkipEmailVerificationTest() {
 
 /** Assign subscriber number and mark subscription verified (shared by /verify and test skip). */
 async function finalizeSubscriptionVerification(subscription) {
+  const { data: fresh, error: freshErr } = await supabase
+    .from('subscriptions')
+    .select('id, subscription_type, password_hash')
+    .eq('id', subscription.id)
+    .single();
+  if (freshErr || !fresh) {
+    const err = new Error('Subscription not found');
+    err.statusCode = 404;
+    throw err;
+  }
+  if (
+    isB2BSubscriptionType(fresh.subscription_type) &&
+    !fresh.password_hash
+  ) {
+    const err = new Error('יש להגדיר סיסמה לפני אימות המייל');
+    err.statusCode = 400;
+    throw err;
+  }
+
   let subscriberNumber;
   let isUnique = false;
   let attempts = 0;
@@ -330,7 +408,8 @@ app.post('/api/subscription/submit', upload.fields([
       activityRegions, // Array of selected regions (for broker)
       agreedToTerms,
       profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
-      company_logo_url // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
+      company_logo_url, // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
+      deferVerificationEmail, // When true, email is sent only from POST /api/subscription/resend-code
     } = req.body;
 
     // Validate required fields based on subscription type
@@ -532,14 +611,37 @@ app.post('/api/subscription/submit', upload.fields([
       });
     }
 
-    // Send verification email with code
-    await sendVerificationEmail(email, verificationCode, subscriptionType);
+    const submitPassword = req.body?.password != null ? String(req.body.password) : '';
+    if (isB2BSubscriptionType(subscriptionType) && submitPassword.length >= MIN_PASSWORD_LENGTH) {
+      try {
+        await persistSubscriptionPasswordHash(subscription.id, submitPassword);
+      } catch (pwdErr) {
+        console.error('[subscription/submit] password save failed:', pwdErr.message);
+        return res.status(pwdErr.statusCode || 500).json({
+          success: false,
+          error: pwdErr.message || 'Failed to save password',
+        });
+      }
+    }
+
+    const shouldDeferEmail =
+      deferVerificationEmail === true ||
+      deferVerificationEmail === 'true' ||
+      deferVerificationEmail === 1 ||
+      deferVerificationEmail === '1';
+
+    if (!shouldDeferEmail) {
+      await sendVerificationEmail(email, verificationCode, subscriptionType);
+    }
 
     res.json({
       success: true,
       subscriptionId: subscription.id,
       verificationCode: verificationCode, // Remove in production
-      message: 'Subscription submitted successfully. Please check your email for verification code.'
+      verificationEmailDeferred: shouldDeferEmail,
+      message: shouldDeferEmail
+        ? 'Subscription saved. Set a password and tap send verification code to receive the email.'
+        : 'Subscription submitted. Verification code sent by email.',
     });
 
   } catch (error) {
@@ -554,7 +656,8 @@ app.post('/api/subscription/submit', upload.fields([
 // Verify email with code
 app.post('/api/subscription/verify', async (req, res) => {
   try {
-    const { email, verificationCode, subscriptionId } = req.body;
+    const { email, verificationCode, subscriptionId, password: passwordRaw } =
+      req.body;
 
     if (!verificationCode) {
       return res.status(400).json({ 
@@ -592,6 +695,28 @@ app.post('/api/subscription/verify', async (req, res) => {
         success: false, 
         error: 'Invalid verification code' 
       });
+    }
+
+    if (
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      !subscription.password_hash
+    ) {
+      const pwd = String(passwordRaw || '');
+      if (pwd.length < MIN_PASSWORD_LENGTH) {
+        return res.status(400).json({
+          success: false,
+          error: 'יש להגדיר סיסמה לפני אימות המייל',
+        });
+      }
+      try {
+        await persistSubscriptionPasswordHash(subscription.id, pwd);
+        subscription.password_hash = 'set';
+      } catch (pwdErr) {
+        return res.status(pwdErr.statusCode || 500).json({
+          success: false,
+          error: pwdErr.message || 'Failed to save password',
+        });
+      }
     }
 
     // Check if code is expired
@@ -672,7 +797,7 @@ app.post('/api/subscription/verify', async (req, res) => {
 
     res.json({
       success: true,
-      subscription: updatedSubscription,
+      subscription: sanitizeSubscriptionForClient(updatedSubscription),
       subscriberNumber: subscriberNumber,
       message: 'Email verified successfully',
     });
@@ -682,6 +807,161 @@ app.post('/api/subscription/verify', async (req, res) => {
       success: false,
       error: error.message,
     });
+  }
+});
+
+// Stage 2: set password before email verification (B2B only)
+app.post('/api/subscription/set-password', async (req, res) => {
+  try {
+    const { subscriptionId, password } = req.body || {};
+    if (!subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscriptionId is required',
+      });
+    }
+    const pwd = String(password || '');
+    if (pwd.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+      });
+    }
+
+    const { data: subscription, error } = await supabase
+      .from('subscriptions')
+      .select('id, email, status, subscription_type, password_hash')
+      .eq('id', subscriptionId)
+      .single();
+
+    if (error || !subscription) {
+      return res.status(404).json({
+        success: false,
+        error: 'Subscription not found',
+      });
+    }
+    const canSetPassword =
+      subscription.status === 'pending_verification' ||
+      ((subscription.status === 'verified' ||
+        subscription.status === 'active') &&
+        !subscription.password_hash);
+    if (!canSetPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot set password for this subscription state',
+      });
+    }
+    if (!isB2BSubscriptionType(subscription.subscription_type)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password registration applies to business subscriptions only',
+      });
+    }
+
+    try {
+      await persistSubscriptionPasswordHash(subscriptionId, pwd);
+    } catch (pwdErr) {
+      return res.status(pwdErr.statusCode || 500).json({
+        success: false,
+        error: pwdErr.message || 'Failed to save password',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('subscriptions')
+      .select('id, email, status, subscription_type')
+      .eq('id', subscriptionId)
+      .single();
+
+    if (updateError) {
+      return res.status(500).json({
+        success: false,
+        error: updateError.message || 'Failed to load subscription',
+      });
+    }
+
+    res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(updated),
+      message: 'Password saved',
+    });
+  } catch (err) {
+    console.error('Error in set-password:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// B2B sign-in: email + password
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const emailRaw = req.body?.email != null ? String(req.body.email).trim() : '';
+    const emailNorm = emailRaw.toLowerCase();
+    const password = String(req.body?.password || '');
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({
+        success: false,
+        error: 'כתובת מייל לא תקינה',
+      });
+    }
+    if (!password) {
+      return res.status(400).json({
+        success: false,
+        error: 'נא להזין סיסמה',
+      });
+    }
+
+    const { data: subscription, error } = await supabase
+      .from('subscriptions')
+      .select('*')
+      .ilike('email', emailNorm)
+      .in('status', ['verified', 'active'])
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Login failed',
+      });
+    }
+
+    if (!subscription) {
+      return res.status(401).json({
+        success: false,
+        error: 'מייל או סיסמה שגויים',
+      });
+    }
+
+    if (
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      !subscription.password_hash
+    ) {
+      return res.status(401).json({
+        success: false,
+        code: 'NO_PASSWORD_SET',
+        error:
+          'לא הוגדרה סיסמה לחשבון. השלימו הרשמה (שלחו קוד אימות עם סיסמה) או הגדירו סיסמה מחדש.',
+      });
+    }
+
+    if (
+      !subscription.password_hash ||
+      !verifyPassword(password, subscription.password_hash)
+    ) {
+      return res.status(401).json({
+        success: false,
+        error: 'מייל או סיסמה שגויים',
+      });
+    }
+
+    res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(subscription),
+    });
+  } catch (err) {
+    console.error('Error in auth/login:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -696,7 +976,7 @@ app.post('/api/subscription/verify-skip-test', async (req, res) => {
           'דילוג אימות (בדיקה) כבוי בשרת זה. להפעלה: הגדר ALLOW_SKIP_EMAIL_VERIFICATION=1 ב-.env של pi-back, או הרץ מקומית עם NODE_ENV שלא production.',
       });
     }
-    const { subscriptionId, email } = req.body || {};
+    const { subscriptionId, email, password: passwordRaw } = req.body || {};
     if (!subscriptionId) {
       return res.status(400).json({
         success: false,
@@ -716,6 +996,28 @@ app.post('/api/subscription/verify-skip-test', async (req, res) => {
         success: false,
         error: 'Subscription not found or already verified',
       });
+    }
+
+    if (
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      !subscription.password_hash
+    ) {
+      const pwd = String(passwordRaw || '');
+      if (pwd.length < MIN_PASSWORD_LENGTH) {
+        return res.status(400).json({
+          success: false,
+          error: 'יש להגדיר סיסמה לפני אימות',
+        });
+      }
+      try {
+        await persistSubscriptionPasswordHash(subscription.id, pwd);
+        subscription.password_hash = 'set';
+      } catch (pwdErr) {
+        return res.status(pwdErr.statusCode || 500).json({
+          success: false,
+          error: pwdErr.message || 'Failed to save password',
+        });
+      }
     }
 
     if (email && String(email).trim() && subscription.email !== String(email).trim()) {
@@ -742,7 +1044,7 @@ app.post('/api/subscription/verify-skip-test', async (req, res) => {
 
     res.json({
       success: true,
-      subscription: updatedSubscription,
+      subscription: sanitizeSubscriptionForClient(updatedSubscription),
       subscriberNumber,
       message: 'Verification skipped (test mode)',
     });
@@ -755,7 +1057,7 @@ app.post('/api/subscription/verify-skip-test', async (req, res) => {
 // Resend verification code
 app.post('/api/subscription/resend-code', async (req, res) => {
   try {
-    const { email, subscriptionId } = req.body;
+    const { email, subscriptionId, password: passwordRaw } = req.body;
 
     if (!email && !subscriptionId) {
       return res.status(400).json({ 
@@ -788,6 +1090,30 @@ app.post('/api/subscription/resend-code', async (req, res) => {
       });
     }
 
+    let subscriptionRow = subscription;
+    if (
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      passwordRaw
+    ) {
+      try {
+        await persistSubscriptionPasswordHash(subscription.id, passwordRaw);
+        subscriptionRow = { ...subscription, password_hash: 'set' };
+      } catch (pwdErr) {
+        return res.status(pwdErr.statusCode || 500).json({
+          success: false,
+          error: pwdErr.message || 'Failed to save password before sending code',
+        });
+      }
+    } else if (
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      !subscription.password_hash
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'יש להגדיר סיסמה לפני שליחת מייל האימות',
+      });
+    }
+
     // Generate new verification code
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -798,7 +1124,7 @@ app.post('/api/subscription/resend-code', async (req, res) => {
         verification_code: verificationCode,
         verification_code_expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString()
       })
-      .eq('id', subscription.id);
+      .eq('id', subscriptionRow.id);
 
     if (updateError) {
       return res.status(500).json({ 
@@ -807,13 +1133,26 @@ app.post('/api/subscription/resend-code', async (req, res) => {
       });
     }
 
-    // Send verification email
-    await sendVerificationEmail(email, verificationCode, subscription.subscription_type);
+    const sendTo =
+      subscriptionRow.email ||
+      (email && String(email).trim() ? String(email).trim() : '');
+    if (!sendTo) {
+      return res.status(400).json({
+        success: false,
+        error: 'No email on file for this subscription',
+      });
+    }
+
+    await sendVerificationEmail(
+      sendTo,
+      verificationCode,
+      subscriptionRow.subscription_type,
+    );
 
     res.json({
       success: true,
       verificationCode: verificationCode, // Remove in production
-      message: 'Verification code resent successfully'
+      message: 'Verification code sent successfully',
     });
 
   } catch (error) {
@@ -897,6 +1236,7 @@ app.post('/api/users/register-regular', async (req, res) => {
       body.profile_picture_url != null && String(body.profile_picture_url).trim()
         ? String(body.profile_picture_url).trim()
         : null;
+    const password = body.password != null ? String(body.password) : '';
 
     // Check if a subscription already exists for this email.
     const { data: existing, error: existingErr } = await supabase
@@ -921,6 +1261,14 @@ app.post('/api/users/register-regular', async (req, res) => {
       if (profilePictureUrl && !existing.profile_picture_url) {
         updates.profile_picture_url = profilePictureUrl;
       }
+      if (password.length >= MIN_PASSWORD_LENGTH) {
+        updates.password_hash = hashPassword(password);
+      } else if (!existing.password_hash) {
+        return res.status(400).json({
+          success: false,
+          error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+        });
+      }
       if (Object.keys(updates).length > 0) {
         const { data: updated, error: updErr } = await supabase
           .from('subscriptions')
@@ -935,12 +1283,33 @@ app.post('/api/users/register-regular', async (req, res) => {
           id: existing.id,
           updatedKeys: Object.keys(updates),
         });
-        return res.json({ success: true, subscription: updated || existing, created: false });
+        return res.json({
+          success: true,
+          subscription: sanitizeSubscriptionForClient(updated || existing),
+          created: false,
+        });
+      }
+      if (!existing.password_hash) {
+        return res.status(400).json({
+          success: false,
+          error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+        });
       }
       console.log('[users/register-regular] existing user returned (no changes)', {
         id: existing.id,
       });
-      return res.json({ success: true, subscription: existing, created: false });
+      return res.json({
+        success: true,
+        subscription: sanitizeSubscriptionForClient(existing),
+        created: false,
+      });
+    }
+
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+      });
     }
 
     const insertRow = {
@@ -949,6 +1318,7 @@ app.post('/api/users/register-regular', async (req, res) => {
       name,
       phone,
       profile_picture_url: profilePictureUrl,
+      password_hash: hashPassword(password),
       status: 'verified',
       verified_at: new Date().toISOString(),
     };
@@ -969,7 +1339,11 @@ app.post('/api/users/register-regular', async (req, res) => {
       subscription_type: inserted?.subscription_type || null,
       status: inserted?.status || null,
     });
-    return res.json({ success: true, subscription: inserted, created: true });
+    return res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(inserted),
+      created: true,
+    });
   } catch (err) {
     console.error('[users/register-regular] unexpected:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Unexpected error' });
@@ -3432,7 +3806,7 @@ app.get('/api/user/current', async (req, res) => {
 
     res.json({
       success: true,
-      subscription
+      subscription: sanitizeSubscriptionForClient(subscription),
     });
 
   } catch (error) {
@@ -7359,14 +7733,27 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
+module.exports = app;
+
 // Start server (0.0.0.0 = accept connections from any network interface, so you can access from other devices)
-const HOST = process.env.HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
-  console.log(`Server is running on http://${HOST}:${PORT}`);
-  console.log(`Supabase URL: ${process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}`);
-  if (allowSkipEmailVerificationTest()) {
-    console.warn(
-      '⚠️  ALLOW_SKIP_EMAIL_VERIFICATION is on — POST /api/subscription/verify-skip-test enabled (test only).',
-    );
-  }
-});
+if (require.main === module) {
+  const HOST = process.env.HOST || '0.0.0.0';
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`Server is running on http://${HOST}:${PORT}`);
+    console.log(`Supabase URL: ${process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL}`);
+    if (allowSkipEmailVerificationTest()) {
+      console.warn(
+        '⚠️  ALLOW_SKIP_EMAIL_VERIFICATION is on — POST /api/subscription/verify-skip-test enabled (test only).',
+      );
+    }
+  });
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(
+        `Port ${PORT} is already in use. Stop the other process (e.g. taskkill /F /PID <pid>) or set PORT in .env.`,
+      );
+      process.exit(1);
+    }
+    throw err;
+  });
+}

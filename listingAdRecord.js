@@ -182,6 +182,14 @@ async function buildAdRecordFromListingBody(body, supabase) {
     permit: permit || null,
     agricultural_land: agriculturalLand || null,
     land_ownership: landOwnership || null,
+    land_parcel:
+      landParcel != null && String(landParcel).trim() !== ''
+        ? String(landParcel).trim()
+        : null,
+    land_block:
+      landBlock != null && String(landBlock).trim() !== ''
+        ? String(landBlock).trim()
+        : null,
     land_address: (() => {
       const line =
         landAddress != null && String(landAddress).trim() !== '' ? String(landAddress).trim() : null;
