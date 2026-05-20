@@ -1,5 +1,14 @@
 {
   "version": 2,
   "builds": [{"src": "server.js", "use": "@vercel/node"}],
-  "routes": [{"src": "/(.*)", "dest": "server.js"}]
+  "routes": [{"src": "/(.*)", "dest": "server.js"}],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {"key": "Vary", "value": "Origin"},
+        {"key": "Cache-Control", "value": "no-store"}
+      ]
+    }
+  ]
 }

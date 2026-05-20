@@ -1,7 +1,6 @@
 require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
-const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const { Pool } = require('pg');
@@ -68,8 +67,36 @@ function sanitizeSubscriptionForClient(subscription) {
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware — reflect Origin so browser CORS matches the requesting page (esp. web + localhost dev servers)
-app.use(cors({ origin: true }));
+/**
+ * Reflect the request Origin on every response (localhost:8081, 8084, production, etc.).
+ * Vary: Origin avoids CDN/proxy serving one port's ACAO header to another (common on Vercel).
+ */
+function applyReflectCors(req, res, next) {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+  );
+  const requestedHeaders = req.headers['access-control-request-headers'];
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    requestedHeaders ||
+      'Content-Type, Authorization, Accept, X-Requested-With',
+  );
+  res.setHeader('Access-Control-Max-Age', '86400');
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+}
+
+app.use(applyReflectCors);
 app.use(express.json({
   limit: '50mb',
   verify: (req, _res, buf) => {
