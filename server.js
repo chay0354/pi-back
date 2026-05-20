@@ -8,6 +8,123 @@ const { Resend } = require('resend');
 
 const B2B_SUBSCRIPTION_TYPES = new Set(['broker', 'company', 'professional']);
 const MIN_PASSWORD_LENGTH = 8;
+const DEFAULT_MONTHLY_LISTING_QUOTA = 65;
+
+function normalizePromoCode(raw) {
+  return String(raw || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, '');
+}
+
+function monthlyQuotaFromPromoBonus(bonusListings) {
+  const bonus = Math.max(0, Number(bonusListings) || 0);
+  return DEFAULT_MONTHLY_LISTING_QUOTA + bonus;
+}
+
+function promoCodeIsCurrentlyValid(promo, now = new Date()) {
+  if (!promo || !promo.is_active) return false;
+  if (promo.valid_from) {
+    const from = new Date(promo.valid_from);
+    if (!Number.isNaN(from.getTime()) && from > now) return false;
+  }
+  if (promo.valid_until) {
+    const until = new Date(promo.valid_until);
+    if (!Number.isNaN(until.getTime()) && until < now) return false;
+  }
+  if (
+    promo.max_redemptions != null &&
+    Number(promo.redemption_count) >= Number(promo.max_redemptions)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function findPromoCodeRow(codeNorm) {
+  const { data: rows, error } = await supabase
+    .from('promo_codes')
+    .select('*')
+    .eq('is_active', true);
+  if (error) throw error;
+  return (rows || []).find((r) => normalizePromoCode(r.code) === codeNorm) || null;
+}
+
+async function applyPromoCodeToSubscription(subscriptionId, codeRaw) {
+  const codeNorm = normalizePromoCode(codeRaw);
+  if (!codeNorm) {
+    const err = new Error('יש להזין קוד קופון');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const { data: subscription, error: subErr } = await supabase
+    .from('subscriptions')
+    .select('id, promo_code, max_published_listings, status')
+    .eq('id', subscriptionId)
+    .maybeSingle();
+
+  if (subErr || !subscription) {
+    const err = new Error('מנוי לא נמצא');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (subscription.promo_code) {
+    const err = new Error('כבר הופעל קופון לחשבון זה');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const promo = await findPromoCodeRow(codeNorm);
+  if (!promo) {
+    const err = new Error('קוד הקופון אינו תקף');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  if (!promoCodeIsCurrentlyValid(promo)) {
+    const err = new Error('קוד הקופון אינו פעיל או שפג תוקפו');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const newQuota = monthlyQuotaFromPromoBonus(promo.bonus_listings);
+
+  const { data: updated, error: updErr } = await supabase
+    .from('subscriptions')
+    .update({
+      max_published_listings: newQuota,
+      promo_code: normalizePromoCode(promo.code),
+    })
+    .eq('id', subscriptionId)
+    .select('*')
+    .single();
+
+  if (updErr) {
+    console.error('[applyPromoCodeToSubscription]', updErr.message);
+    const err = new Error(updErr.message || 'Failed to apply promo code');
+    err.statusCode = 500;
+    throw err;
+  }
+
+  const nextCount = (Number(promo.redemption_count) || 0) + 1;
+  const { error: promoUpdErr } = await supabase
+    .from('promo_codes')
+    .update({ redemption_count: nextCount })
+    .eq('id', promo.id);
+
+  if (promoUpdErr) {
+    console.warn('[applyPromoCodeToSubscription] redemption_count:', promoUpdErr.message);
+  }
+
+  return {
+    subscription: updated,
+    promoCode: normalizePromoCode(promo.code),
+    bonusListings: Number(promo.bonus_listings) || 0,
+    maxPublishedListings: newQuota,
+  };
+}
 
 function isB2BSubscriptionType(type) {
   return B2B_SUBSCRIPTION_TYPES.has(String(type || '').trim().toLowerCase());
@@ -17,6 +134,20 @@ function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
   const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
   return `${salt}:${hash}`;
+}
+
+function generateTemporaryPassword(length = 12) {
+  const chars =
+    'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$';
+  const bytes = crypto.randomBytes(length);
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += chars[bytes[i] % chars.length];
+  }
+  if (out.length < MIN_PASSWORD_LENGTH) {
+    return generateTemporaryPassword(MIN_PASSWORD_LENGTH);
+  }
+  return out;
 }
 
 function verifyPassword(password, storedHash) {
@@ -90,11 +221,18 @@ function applyReflectCors(req, res, next) {
       'Content-Type, Authorization, Accept, X-Requested-With',
   );
   res.setHeader('Access-Control-Max-Age', '86400');
+  res.setHeader(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, private',
+  );
+  res.setHeader('Pragma', 'no-cache');
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
   next();
 }
+
+app.set('etag', false);
 
 app.use(applyReflectCors);
 app.use(express.json({
@@ -110,7 +248,11 @@ app.use((err, req, res, next) => {
       message: err.message,
       rawBodyPreview: String(req.rawBody || '').slice(0, 300),
     });
-    return res.status(400).json({ success: false, error: 'Invalid JSON body' });
+    return res.status(400).json({
+      success: false,
+      error:
+        'Invalid JSON body. Send Content-Type: application/json with JSON.stringify payload (quoted keys and string values).',
+    });
   }
   return next(err);
 });
@@ -216,19 +358,23 @@ const sendVerificationEmail = async (email, verificationCode, subscriptionType) 
   return false;
 };
 
-/** Send subscriber number (מספר מנוי) to verified account email – secret code recovery */
-const sendSubscriberRecoveryEmail = async (email, subscriberNumber, subscriptionType) => {
+/** Send login password after forgot-password (stored as hash only — email contains new password). */
+const sendPasswordRecoveryEmail = async (email, passwordPlain, subscriptionType) => {
   const typeNames = { broker: 'מתווכים', company: 'חברות', professional: 'בעלי מקצוע' };
   const typeName = typeNames[subscriptionType] || 'מנוי';
+  const safePassword = String(passwordPlain || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
   const html = `
     <div dir="rtl" style="font-family: Arial, sans-serif; text-align: right;">
       <h2>שלום,</h2>
-      <p>ביקשת לקבל את מספר המנוי שלך (${typeName}).</p>
-      <p><strong>מספר המנוי שלך:</strong></p>
-      <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 28px; font-weight: bold; margin: 20px 0; border-radius: 8px;">
-        ${subscriberNumber}
+      <p>ביקשת לקבל את הסיסמה לחשבון ${typeName} שלך ב-PI.</p>
+      <p><strong>הסיסמה שלך לכניסה למערכת:</strong></p>
+      <div style="background-color: #f0f0f0; padding: 20px; text-align: center; font-size: 22px; font-weight: bold; margin: 20px 0; border-radius: 8px; letter-spacing: 1px;">
+        ${safePassword}
       </div>
-      <p>אם לא ביקשת מייל זה, אנא התעלם.</p>
+      <p>מומלץ להחליף סיסמה לאחר ההתחברות. אם לא ביקשת מייל זה, אנא התעלם ופנה לתמיכה.</p>
       <p>בברכה,<br>צוות PI</p>
     </div>
   `;
@@ -237,16 +383,18 @@ const sendSubscriberRecoveryEmail = async (email, subscriberNumber, subscription
       await resend.emails.send({
         from: process.env.EMAIL_FROM || 'onboarding@resend.dev',
         to: email,
-        subject: 'מספר המנוי שלך – שחזור קוד',
+        subject: 'הסיסמה שלך – PI',
         html,
       });
-      console.log(`✅ Subscriber recovery email sent to ${email}`);
+      console.log(`✅ Password recovery email sent to ${email}`);
       return true;
     } catch (error) {
-      console.error('❌ Error sending subscriber recovery email:', error);
+      console.error('❌ Error sending password recovery email:', error);
     }
   }
-  console.log(`\n📧 === SUBSCRIBER RECOVERY EMAIL ===\nTo: ${email}\nמספר מנוי: ${subscriberNumber}\n==========================\n`);
+  console.log(
+    `\n📧 === PASSWORD RECOVERY EMAIL ===\nTo: ${email}\nPassword: ${passwordPlain}\n==========================\n`,
+  );
   return false;
 };
 
@@ -405,13 +553,35 @@ async function finalizeSubscriptionVerification(subscription) {
 
 // ==================== SUBSCRIPTION ENDPOINTS ====================
 
-// Submit subscription form (all types: broker, company, professional)
-app.post('/api/subscription/submit', upload.fields([
+const subscriptionSubmitUpload = upload.fields([
   { name: 'profilePicture', maxCount: 1 },
   { name: 'additionalImages', maxCount: 10 },
   { name: 'companyLogo', maxCount: 1 },
-  { name: 'video', maxCount: 1 }
-]), async (req, res) => {
+  { name: 'video', maxCount: 1 },
+]);
+
+/** JSON submits skip multer (Android app sends application/json when there are no file parts). */
+function subscriptionSubmitParser(req, res, next) {
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  if (ct.includes('application/json')) {
+    return next();
+  }
+  if (ct.includes('multipart/form-data')) {
+    return subscriptionSubmitUpload(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({
+          success: false,
+          error: err.message || 'Invalid multipart upload',
+        });
+      }
+      return next();
+    });
+  }
+  return next();
+}
+
+// Submit subscription form (all types: broker, company, professional)
+app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) => {
   try {
     const {
       subscriptionType, // 'broker', 'company', 'professional'
@@ -620,6 +790,7 @@ app.post('/api/subscription/submit', upload.fields([
       verification_code_expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(), // 15 minutes from now (UTC)
       agreed_to_terms: agreedToTerms || false,
       status: 'pending_verification',
+      max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
       created_at: new Date().toISOString()
     };
 
@@ -833,6 +1004,39 @@ app.post('/api/subscription/verify', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message,
+    });
+  }
+});
+
+// Apply promo code during registration (raises monthly listing quota above default 65).
+app.post('/api/subscription/apply-promo-code', async (req, res) => {
+  try {
+    const { subscriptionId, code } = req.body || {};
+    if (!subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscriptionId is required',
+      });
+    }
+
+    const result = await applyPromoCodeToSubscription(subscriptionId, code);
+    res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(result.subscription),
+      promoCode: result.promoCode,
+      bonusListings: result.bonusListings,
+      maxPublishedListings: result.maxPublishedListings,
+      defaultQuota: DEFAULT_MONTHLY_LISTING_QUOTA,
+      message: 'קוד הקופון הופעל בהצלחה',
+    });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status >= 500) {
+      console.error('POST /api/subscription/apply-promo-code:', err);
+    }
+    res.status(status).json({
+      success: false,
+      error: err.message || 'Failed to apply promo code',
     });
   }
 });
@@ -1191,8 +1395,8 @@ app.post('/api/subscription/resend-code', async (req, res) => {
   }
 });
 
-// Recover subscriber number by email (שחזור קוד סודי) – only verified subscriptions; always same response to avoid email enumeration
-app.post('/api/subscription/recover-subscriber-code', async (req, res) => {
+/** Forgot password: reset B2B password and email the new one (hash-only storage). */
+async function handleForgotPasswordByEmail(req, res) {
   try {
     const emailRaw = req.body && req.body.email != null ? String(req.body.email).trim() : '';
     const emailNorm = emailRaw.toLowerCase();
@@ -1206,36 +1410,50 @@ app.post('/api/subscription/recover-subscriber-code', async (req, res) => {
 
     const { data: rows, error } = await supabase
       .from('subscriptions')
-      .select('subscriber_number, email, subscription_type')
-      .eq('status', 'verified')
+      .select('id, email, subscription_type, password_hash, status')
+      .in('status', ['verified', 'active'])
       .ilike('email', emailNorm)
       .limit(1);
 
     if (error) {
-      console.error('recover-subscriber-code lookup:', error);
+      console.error('forgot-password lookup:', error);
     }
 
     const subscription = rows && rows[0];
-    if (subscription && subscription.subscriber_number != null && String(subscription.subscriber_number).trim() !== '') {
+    if (
+      subscription &&
+      isB2BSubscriptionType(subscription.subscription_type) &&
+      subscription.password_hash
+    ) {
       const toEmail = subscription.email || emailRaw;
-      await sendSubscriberRecoveryEmail(
-        toEmail,
-        String(subscription.subscriber_number).trim(),
-        subscription.subscription_type,
-      );
+      const newPassword = generateTemporaryPassword(12);
+      try {
+        await persistSubscriptionPasswordHash(subscription.id, newPassword);
+        await sendPasswordRecoveryEmail(
+          toEmail,
+          newPassword,
+          subscription.subscription_type,
+        );
+      } catch (pwdErr) {
+        console.error('forgot-password reset failed:', pwdErr.message);
+      }
     } else {
-      console.log(`recover-subscriber-code: no verified subscription for email (masked)`);
+      console.log('forgot-password: no B2B account with password for email (masked)');
     }
 
     res.json({
       success: true,
-      message: 'אם קיים חשבון למייל זה, נשלח אליו את מספר המנוי.',
+      message: 'אם קיים חשבון למייל זה, נשלח אליו מייל עם הסיסמה.',
     });
   } catch (error) {
-    console.error('recover-subscriber-code:', error);
+    console.error('forgot-password:', error);
     res.status(500).json({ success: false, error: error.message });
   }
-});
+}
+
+app.post('/api/auth/forgot-password', handleForgotPasswordByEmail);
+// Legacy route — same forgot-password behavior
+app.post('/api/subscription/recover-subscriber-code', handleForgotPasswordByEmail);
 
 // POST /api/users/register-regular – upsert a regular (subscription_type='user') verified subscription by email
 // Returns the existing or newly created subscription so the client always gets a real UUID `id`.
