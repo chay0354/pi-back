@@ -1595,6 +1595,144 @@ app.post('/api/users/register-regular', async (req, res) => {
   }
 });
 
+function getGoogleClientIds() {
+  return String(process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+async function verifyGoogleIdToken(idToken) {
+  const token = String(idToken || '').trim();
+  if (!token) {
+    throw new Error('Missing Google ID token');
+  }
+  const res = await fetch(
+    `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(token)}`,
+  );
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload?.error_description || payload?.error || 'Invalid Google token');
+  }
+  const allowed = getGoogleClientIds();
+  if (allowed.length > 0 && !allowed.includes(String(payload.aud || ''))) {
+    throw new Error('Google token audience mismatch');
+  }
+  const email = payload.email ? String(payload.email).trim().toLowerCase() : '';
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('Google account has no valid email');
+  }
+  const verified =
+    payload.email_verified === true ||
+    payload.email_verified === 'true' ||
+    payload.email_verified === 1 ||
+    payload.email_verified === '1';
+  if (!verified) {
+    throw new Error('Google email is not verified');
+  }
+  return {
+    email,
+    name: payload.name ? String(payload.name).trim() : null,
+    picture: payload.picture ? String(payload.picture).trim() : null,
+    sub: payload.sub ? String(payload.sub) : null,
+  };
+}
+
+// POST /api/auth/google – verify Google ID token, upsert regular user subscription
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const idToken = req.body?.id_token || req.body?.idToken;
+    let googleUser;
+    try {
+      googleUser = await verifyGoogleIdToken(idToken);
+    } catch (verifyErr) {
+      console.warn('[auth/google] token verify failed:', verifyErr.message);
+      return res.status(401).json({success: false, error: verifyErr.message});
+    }
+
+    const emailNorm = googleUser.email;
+    const name = googleUser.name || null;
+    const profilePictureUrl = googleUser.picture || null;
+
+    const {data: existing, error: existingErr} = await supabase
+      .from('subscriptions')
+      .select('*')
+      .ilike('email', emailNorm)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingErr) {
+      console.error('[auth/google] lookup error:', existingErr);
+      return res.status(500).json({success: false, error: existingErr.message});
+    }
+
+    if (existing) {
+      const updates = {};
+      if (existing.status !== 'verified' && existing.status !== 'active') {
+        updates.status = 'verified';
+      }
+      if (!existing.subscription_type) updates.subscription_type = 'user';
+      if (name && !existing.name) updates.name = name;
+      if (profilePictureUrl && !existing.profile_picture_url) {
+        updates.profile_picture_url = profilePictureUrl;
+      }
+      if (!existing.verified_at) updates.verified_at = new Date().toISOString();
+
+      if (Object.keys(updates).length > 0) {
+        const {data: updated, error: updErr} = await supabase
+          .from('subscriptions')
+          .update(updates)
+          .eq('id', existing.id)
+          .select('*')
+          .maybeSingle();
+        if (updErr) {
+          console.warn('[auth/google] update warn:', updErr.message);
+        }
+        return res.json({
+          success: true,
+          subscription: sanitizeSubscriptionForClient(updated || existing),
+          created: false,
+        });
+      }
+
+      return res.json({
+        success: true,
+        subscription: sanitizeSubscriptionForClient(existing),
+        created: false,
+      });
+    }
+
+    const insertRow = {
+      subscription_type: 'user',
+      email: emailNorm,
+      name,
+      profile_picture_url: profilePictureUrl,
+      status: 'verified',
+      verified_at: new Date().toISOString(),
+    };
+
+    const {data: inserted, error: insertErr} = await supabase
+      .from('subscriptions')
+      .insert(insertRow)
+      .select('*')
+      .single();
+
+    if (insertErr) {
+      console.error('[auth/google] insert error:', insertErr);
+      return res.status(500).json({success: false, error: insertErr.message});
+    }
+
+    return res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(inserted),
+      created: true,
+    });
+  } catch (err) {
+    console.error('[auth/google] unexpected:', err);
+    return res.status(500).json({success: false, error: err?.message || 'Unexpected error'});
+  }
+});
+
 // Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
 const SUBSCRIPTION_SELECT =
   'id, email, name, subscription_type, status, subscriber_number, ' +
