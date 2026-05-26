@@ -465,8 +465,7 @@ Give practical, factual info relevant to someone considering a property there. N
 });
 
 /**
- * Test-only skip verify. Explicit ALLOW_SKIP_EMAIL_VERIFICATION=0 forces off.
- * =1 / true turns on even in production (avoid). If unset: on when NODE_ENV is not production (typical localhost).
+ * Test-only skip verify. Enabled by default; set ALLOW_SKIP_EMAIL_VERIFICATION=0 to disable.
  */
 function allowSkipEmailVerificationTest() {
   const v = String(process.env.ALLOW_SKIP_EMAIL_VERIFICATION || '')
@@ -475,10 +474,7 @@ function allowSkipEmailVerificationTest() {
   if (v === 'false' || v === '0' || v === 'no' || v === 'off') {
     return false;
   }
-  if (v === 'true' || v === '1' || v === 'yes' || v === 'on') {
-    return true;
-  }
-  return process.env.NODE_ENV !== 'production';
+  return true;
 }
 
 /** Assign subscriber number and mark subscription verified (shared by /verify and test skip). */
@@ -606,6 +602,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       agreedToTerms,
       profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
       company_logo_url, // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
+      video_url, // Optional: pre-uploaded intro video URL (Android JSON submit)
       deferVerificationEmail, // When true, email is sent only from POST /api/subscription/resend-code
     } = req.body;
 
@@ -642,6 +639,9 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
     }
     if (company_logo_url && typeof company_logo_url === 'string' && company_logo_url.trim()) {
       fileUrls.companyLogo = company_logo_url.trim();
+    }
+    if (video_url && typeof video_url === 'string' && video_url.trim()) {
+      fileUrls.video = video_url.trim();
     }
     if (req.files) {
       // Upload profile picture only if not already provided (e.g. uploaded when moving stage 1 → 2)
@@ -1204,7 +1204,7 @@ app.post('/api/subscription/verify-skip-test', async (req, res) => {
         success: false,
         code: 'SKIP_VERIFY_DISABLED',
         error:
-          'דילוג אימות (בדיקה) כבוי בשרת זה. להפעלה: הגדר ALLOW_SKIP_EMAIL_VERIFICATION=1 ב-.env של pi-back, או הרץ מקומית עם NODE_ENV שלא production.',
+          'דילוג אימות (בדיקה) כבוי בשרת זה.',
       });
     }
     const { subscriptionId, email, password: passwordRaw } = req.body || {};
@@ -3410,6 +3410,62 @@ app.get('/api/follows/status', async (req, res) => {
   }
 });
 
+// POST /api/follows/status-batch — { viewer_id, target_ids: string[] }
+// Returns per-target is_following / has_pending_request for the viewer.
+app.post('/api/follows/status-batch', async (req, res) => {
+  try {
+    const viewerId = normalizeFollowSubId(req.body?.viewer_id);
+    const rawIds = req.body?.target_ids;
+    const list = Array.isArray(rawIds) ? rawIds : [];
+    if (!viewerId) {
+      return res.status(400).json({success: false, error: 'viewer_id is required'});
+    }
+    const targetIds = [
+      ...new Set(
+        list
+          .map(x => (x != null ? String(x).trim() : ''))
+          .filter(s => s !== '' && s !== viewerId)
+          .slice(0, 200),
+      ),
+    ];
+    if (targetIds.length === 0) {
+      return res.json({success: true, status: {}});
+    }
+
+    const [{data: followRows}, {data: pendingRows}] = await Promise.all([
+      supabase
+        .from('user_follows')
+        .select('following_subscription_id')
+        .eq('follower_subscription_id', viewerId)
+        .in('following_subscription_id', targetIds),
+      supabase
+        .from('user_follow_requests')
+        .select('target_subscription_id')
+        .eq('requester_subscription_id', viewerId)
+        .eq('status', 'pending')
+        .in('target_subscription_id', targetIds),
+    ]);
+
+    const status = {};
+    for (const id of targetIds) {
+      status[id] = {is_following: false, has_pending_request: false};
+    }
+    for (const row of followRows || []) {
+      const tid = String(row?.following_subscription_id || '').trim();
+      if (status[tid]) status[tid].is_following = true;
+    }
+    for (const row of pendingRows || []) {
+      const tid = String(row?.target_subscription_id || '').trim();
+      if (status[tid]) status[tid].has_pending_request = true;
+    }
+
+    return res.json({success: true, status});
+  } catch (err) {
+    console.error('POST /api/follows/status-batch:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
 // POST /api/follows/mutual-batch — { viewer_id, target_ids: string[] }
 // For each target: true iff both follow each other in user_follows and no pending request from viewer.
 app.post('/api/follows/mutual-batch', async (req, res) => {
@@ -3864,7 +3920,10 @@ function getSubscriptionDisplayNameAndImage(sub) {
   else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
   else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
   else name = sub.name || sub.contact_person_name || sub.business_name || sub.broker_office_name || null;
-  const imageUrl = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+  const imageUrl =
+    sub.profile_picture_url ||
+    ((type === 'company' || type === 'broker') ? sub.company_logo_url : null) ||
+    null;
   return {
     name: name && String(name).trim() ? String(name).trim() : null,
     imageUrl: imageUrl && String(imageUrl).trim() ? String(imageUrl).trim() : null,
