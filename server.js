@@ -5093,10 +5093,18 @@ function storyHasVideoUrl(u) {
   return u != null && String(u).trim().length > 0;
 }
 
+function storyMediaTypeFromUrl(url) {
+  const s = String(url || '').trim().toLowerCase();
+  if (!s) return 'image';
+  if (/\.(mp4|webm|mov|m4v|mkv)(\?|#|$)/i.test(s)) return 'video';
+  if (/\/videos?\//i.test(s)) return 'video';
+  return 'image';
+}
+
 const SUBSCRIPTION_SELECT_STORY =
   'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, status, updated_at';
 
-// GET /api/stories/feed — strip: profile intro video first, then video feed-posts; omit users with neither
+// GET /api/stories/feed — strip: profile intro video, story slides (stories table), video feed-posts
 app.get('/api/stories/feed', async (req, res) => {
   try {
     const limit = Math.min(
@@ -5163,7 +5171,30 @@ app.get('/api/stories/feed', async (req, res) => {
       );
     }
 
+    const storyCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const storiesBySubId = new Map();
+    try {
+      const { data: storyRows, error: storyErr } = await supabase
+        .from('stories')
+        .select('id, subscription_id, media_url, created_at')
+        .gte('created_at', storyCutoff)
+        .order('created_at', { ascending: false })
+        .limit(2000);
+      if (!storyErr && storyRows) {
+        for (const row of storyRows) {
+          const sid = row.subscription_id;
+          const url = row.media_url && String(row.media_url).trim();
+          if (!sid || !url) continue;
+          if (!storiesBySubId.has(sid)) storiesBySubId.set(sid, []);
+          storiesBySubId.get(sid).push(row);
+        }
+      }
+    } catch (_) {
+      /* stories table may not exist yet */
+    }
+
     const idsFromVideoPosts = [...postsBySubId.keys()];
+    const idsFromStorySlides = [...storiesBySubId.keys()];
 
     const { data: subsProfileVideo, error: profErr } = await supabase
       .from('subscriptions')
@@ -5200,8 +5231,35 @@ app.get('/api/stories/feed', async (req, res) => {
       }
     }
 
+    const storyOnlySubIds = idsFromStorySlides.filter((id) => !subById.has(id));
+    for (let i = 0; i < storyOnlySubIds.length; i += chunkSize) {
+      const chunk = storyOnlySubIds.slice(i, i + chunkSize);
+      const { data: chunkSubs, error: chErr } = await supabase
+        .from('subscriptions')
+        .select(SUBSCRIPTION_SELECT_STORY)
+        .in('id', chunk)
+        .in('status', ['verified', 'active']);
+      if (chErr) {
+        console.warn('GET /api/stories/feed chunk story subs:', chErr.message);
+        continue;
+      }
+      for (const s of chunkSubs || []) {
+        if (s?.id && !subById.has(s.id)) subById.set(s.id, s);
+      }
+    }
+
+    const ringSubIds = [
+      ...new Set([
+        ...subById.keys(),
+        ...postsBySubId.keys(),
+        ...storiesBySubId.keys(),
+      ]),
+    ];
+
     const rings = [];
-    for (const s of subById.values()) {
+    for (const sid of ringSubIds) {
+      const s = subById.get(sid);
+      if (!s) continue;
       const slides = [];
       if (storyHasVideoUrl(s.video_url)) {
         slides.push({
@@ -5209,6 +5267,17 @@ app.get('/api/stories/feed', async (req, res) => {
           media_url: String(s.video_url).trim(),
           media_type: 'video',
           kind: 'profile',
+        });
+      }
+      const tableStories = storiesBySubId.get(s.id) || [];
+      for (const st of tableStories) {
+        const url = String(st.media_url || '').trim();
+        if (!url) continue;
+        slides.push({
+          id: `${s.id}-story-${st.id}`,
+          media_url: url,
+          media_type: storyMediaTypeFromUrl(url),
+          kind: 'story',
         });
       }
       const posts = postsBySubId.get(s.id) || [];
@@ -5228,12 +5297,19 @@ app.get('/api/stories/feed', async (req, res) => {
         (st === 'company' ? s.company_logo_url : null) ||
         null;
 
+      let ringUpdatedAt = s.updated_at;
+      if (tableStories[0]?.created_at) {
+        ringUpdatedAt = tableStories[0].created_at;
+      } else if (posts[0]?.created_at) {
+        ringUpdatedAt = posts[0].created_at;
+      }
+
       rings.push({
         subscription_id: s.id,
         display_name: subscriptionDisplayNameForStory(s),
         profile_image_url: pic,
         slides,
-        updated_at: s.updated_at,
+        updated_at: ringUpdatedAt,
       });
     }
 
