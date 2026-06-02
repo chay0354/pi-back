@@ -8117,6 +8117,58 @@ app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req,
   }
 });
 
+// Signed upload URL — client PUTs the file directly to Supabase (avoids Vercel body-size limits for videos).
+app.post('/api/upload/signed-url', async (req, res) => {
+  try {
+    if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
+      return res.status(503).json({
+        success: false,
+        error:
+          'Server upload not configured. Set SUPABASE_SERVICE_ROLE_KEY in the backend .env.',
+      });
+    }
+
+    const folder = (req.body && req.body.folder)
+      ? String(req.body.folder).replace(/[^a-zA-Z0-9/_-]/g, '')
+      : 'general';
+    const safeName = (req.body?.fileName || 'file.mp4')
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/^_+|_+$/g, '') || 'file.mp4';
+    const objectPath = `${folder}/${Date.now()}-${safeName}`;
+
+    const { data, error } = await supabase.storage
+      .from('user-pohto-video')
+      .createSignedUploadUrl(objectPath);
+
+    if (error) {
+      console.error('Signed upload URL error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to prepare upload',
+        details: error.message,
+      });
+    }
+
+    const { data: urlData } = supabase.storage
+      .from('user-pohto-video')
+      .getPublicUrl(objectPath);
+
+    res.json({
+      success: true,
+      signedUrl: data.signedUrl,
+      path: data.path,
+      token: data.token,
+      publicUrl: urlData.publicUrl,
+    });
+  } catch (error) {
+    console.error('Error in POST /api/upload/signed-url:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to prepare upload',
+    });
+  }
+});
+
 // Upload file to Supabase Storage
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
