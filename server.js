@@ -3368,7 +3368,9 @@ app.post('/api/company-reports', async (req, res) => {
         ? 'broker'
         : subjectTypeRaw === 'professional'
           ? 'professional'
-          : 'company';
+          : subjectTypeRaw === 'bnb'
+            ? 'bnb'
+            : 'company';
 
     const allowedCompany = new Set([
       'construction_quality',
@@ -3398,12 +3400,23 @@ app.post('/api/company-reports', async (req, res) => {
       'business_listing_as_private',
       'other',
     ]);
+    /** Figma 5:413570 — BnB profile report drawer */
+    const allowedBnb = new Set([
+      'fictitious_listing',
+      'listing_error',
+      'wrong_phone_in_listing',
+      'offensive_content',
+      'fraud',
+      'other',
+    ]);
     const allowed =
       subject_type === 'broker'
         ? allowedBroker
         : subject_type === 'professional'
           ? allowedProfessional
-          : allowedCompany;
+          : subject_type === 'bnb'
+            ? allowedBnb
+            : allowedCompany;
 
     const reason_keys = [
       ...new Set(
