@@ -9,6 +9,9 @@ const { Resend } = require('resend');
 const B2B_SUBSCRIPTION_TYPES = new Set(['broker', 'company', 'professional']);
 const MIN_PASSWORD_LENGTH = 8;
 const DEFAULT_MONTHLY_LISTING_QUOTA = 65;
+// Every account starts with 3 months of usage; coupons extend by 3/6/12 months.
+const BASE_ACCESS_MONTHS = 3;
+const ALLOWED_PROMO_BONUS_MONTHS = [3, 6, 12];
 
 function normalizePromoCode(raw) {
   return String(raw || '')
@@ -17,9 +20,17 @@ function normalizePromoCode(raw) {
     .replace(/\s+/g, '');
 }
 
-function monthlyQuotaFromPromoBonus(bonusListings) {
-  const bonus = Math.max(0, Number(bonusListings) || 0);
-  return DEFAULT_MONTHLY_LISTING_QUOTA + bonus;
+function addMonths(date, months) {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + months);
+  return d;
+}
+
+/** Coupon time bonus, clamped to the supported tiers (3 / 6 / 12 months). */
+function promoBonusMonths(promo) {
+  const raw = Number(promo?.bonus_months);
+  if (ALLOWED_PROMO_BONUS_MONTHS.includes(raw)) return raw;
+  return ALLOWED_PROMO_BONUS_MONTHS[0];
 }
 
 function promoCodeIsCurrentlyValid(promo, now = new Date()) {
@@ -60,7 +71,7 @@ async function applyPromoCodeToSubscription(subscriptionId, codeRaw) {
 
   const { data: subscription, error: subErr } = await supabase
     .from('subscriptions')
-    .select('id, promo_code, max_published_listings, status')
+    .select('id, promo_code, max_published_listings, status, access_expires_at')
     .eq('id', subscriptionId)
     .maybeSingle();
 
@@ -89,14 +100,25 @@ async function applyPromoCodeToSubscription(subscriptionId, codeRaw) {
     throw err;
   }
 
-  const newQuota = monthlyQuotaFromPromoBonus(promo.bonus_listings);
+  // Coupons extend the subscription period (base 3 months) by 3/6/12 months.
+  // The 65-listing monthly quota stays untouched.
+  const bonusMonths = promoBonusMonths(promo);
+  const updates = {
+    promo_code: normalizePromoCode(promo.code),
+    promo_bonus_months: bonusMonths,
+  };
+  // Verified accounts already have an expiry — extend it now. Pending
+  // registrations get the bonus folded in at verification time.
+  if (subscription.access_expires_at) {
+    updates.access_expires_at = addMonths(
+      subscription.access_expires_at,
+      bonusMonths,
+    ).toISOString();
+  }
 
   const { data: updated, error: updErr } = await supabase
     .from('subscriptions')
-    .update({
-      max_published_listings: newQuota,
-      promo_code: normalizePromoCode(promo.code),
-    })
+    .update(updates)
     .eq('id', subscriptionId)
     .select('*')
     .single();
@@ -121,8 +143,11 @@ async function applyPromoCodeToSubscription(subscriptionId, codeRaw) {
   return {
     subscription: updated,
     promoCode: normalizePromoCode(promo.code),
-    bonusListings: Number(promo.bonus_listings) || 0,
-    maxPublishedListings: newQuota,
+    bonusMonths,
+    totalMonths: BASE_ACCESS_MONTHS + bonusMonths,
+    accessExpiresAt: updated.access_expires_at || null,
+    maxPublishedListings:
+      Number(updated.max_published_listings) || DEFAULT_MONTHLY_LISTING_QUOTA,
   };
 }
 
@@ -464,6 +489,135 @@ Give practical, factual info relevant to someone considering a property there. N
   }
 });
 
+// ==================== PI AI SEARCH (Gemini) ====================
+// POST /api/ai/pi-search - body: { query, listings: [{ id, ...compact fields }] }
+// Gemini ranks the candidate listings against the free-text (Hebrew) query and
+// returns { success, ids } — listing ids ordered best-match first. The client
+// keeps its keyword ranking as a fallback when this endpoint is unavailable.
+app.post('/api/ai/pi-search', async (req, res) => {
+  try {
+    const { query, listings } = req.body || {};
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ success: false, error: 'AI not configured' });
+    }
+    const q = (query && String(query).trim()) || '';
+    if (!q) {
+      return res.status(400).json({ success: false, error: 'missing query' });
+    }
+    const clip = (v, n) => (v == null ? '' : String(v).slice(0, n));
+    // Whitelist + clip fields server-side so the prompt stays small and safe.
+    const pool = (Array.isArray(listings) ? listings : [])
+      .filter(l => l && l.id != null)
+      .slice(0, 150)
+      .map(l => {
+        const item = { id: clip(l.id, 48) };
+        const put = (key, max) => {
+          const s = clip(l[key], max).trim();
+          if (s) item[key] = s;
+        };
+        put('purpose', 30);
+        put('category', 10);
+        put('property_type', 40);
+        put('apartment_type', 40);
+        put('address', 120);
+        put('project_name', 80);
+        put('price', 20);
+        put('budget', 20);
+        put('rooms', 10);
+        put('area', 12);
+        put('floor', 10);
+        put('description', 240);
+        return item;
+      });
+    if (!pool.length) {
+      return res.json({ success: true, ids: [] });
+    }
+
+    const prompt = `You are Pi AI, the search engine of an Israeli real-estate listings app. User queries are usually in Hebrew.
+
+USER QUERY: "${q.slice(0, 300)}"
+
+CANDIDATE LISTINGS (JSON array, each object has an "id" plus property fields; prices in ILS):
+${JSON.stringify(pool)}
+
+Task: pick the listings that genuinely match the query and order them best-match first.
+Rules:
+- Understand Hebrew synonyms and morphology (דירה/דירות, להשכרה/שכירות/לשכור, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע, שותף/שותפים, פנטהאוז, דירת גן...).
+- purpose "rent" = להשכרה, "sale" = למכירה. If the query clearly implies one, exclude the other.
+- Location: if the query names a city/neighborhood/street, prefer matching addresses and exclude clearly different cities. Recognize spelling variants (תל אביב/ת"א).
+- Numeric constraints: price/budget within roughly ±20% of what the query asks, rooms/area/floor respected when specified ("עד 2 מיליון" means a maximum).
+- Prefer strong matches; include weaker partial matches only when fewer than 3 strong ones exist. Never include clearly irrelevant listings.
+- Return at most 20 ids. If nothing reasonably matches, return an empty array.
+
+Output strict JSON only, exactly in this format: {"ids": ["id1", "id2"]}`;
+
+    const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+    let lastError = null;
+    let response = null;
+    for (const model of modelsToTry) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: 2048,
+            temperature: 0.1,
+            responseMimeType: 'application/json'
+          }
+        })
+      });
+      if (response.ok) break;
+      lastError = await response.text();
+      if (response.status === 429) break; // quota - don't hammer other models
+      if (response.status === 404) continue; // try next model
+      break;
+    }
+    if (!response.ok) {
+      console.error('Gemini pi-search error:', response.status, lastError);
+      const status = response.status === 429 ? 429 : 502;
+      return res.status(status).json({
+        success: false,
+        error: response.status === 429 ? 'quota_exceeded' : 'AI request failed'
+      });
+    }
+    const data = await response.json();
+    const textPart = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    let ids = [];
+    try {
+      const cleaned = String(textPart || '')
+        .replace(/^```(?:json)?/i, '')
+        .replace(/```$/, '')
+        .trim();
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed?.ids)) {
+        ids = parsed.ids;
+      } else if (Array.isArray(parsed)) {
+        ids = parsed;
+      }
+    } catch (parseErr) {
+      console.error('Gemini pi-search: unparseable response:', textPart);
+      return res.status(502).json({ success: false, error: 'AI returned invalid response' });
+    }
+    const validIds = new Set(pool.map(l => String(l.id)));
+    const seen = new Set();
+    const ranked = [];
+    for (const id of ids) {
+      const key = String(id);
+      if (!validIds.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      ranked.push(key);
+      if (ranked.length >= 20) break;
+    }
+    return res.json({ success: true, ids: ranked });
+  } catch (err) {
+    console.error('POST /api/ai/pi-search:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /**
  * Test-only skip verify. Enabled by default; set ALLOW_SKIP_EMAIL_VERIFICATION=0 to disable.
  */
@@ -481,7 +635,7 @@ function allowSkipEmailVerificationTest() {
 async function finalizeSubscriptionVerification(subscription) {
   const { data: fresh, error: freshErr } = await supabase
     .from('subscriptions')
-    .select('id, subscription_type, password_hash')
+    .select('id, subscription_type, password_hash, promo_bonus_months, access_expires_at')
     .eq('id', subscription.id)
     .single();
   if (freshErr || !fresh) {
@@ -527,12 +681,21 @@ async function finalizeSubscriptionVerification(subscription) {
 
   console.log('Generated subscriber number:', subscriberNumber);
 
+  // Access window: base 3 months from verification + any coupon bonus
+  // (3/6/12 months) redeemed during registration.
+  const verifiedAt = new Date();
+  const totalAccessMonths =
+    BASE_ACCESS_MONTHS + (Number(fresh.promo_bonus_months) || 0);
+
   const { data: updatedSubscription, error: updateError } = await supabase
     .from('subscriptions')
     .update({
       status: 'verified',
       subscriber_number: subscriberNumber,
-      verified_at: new Date().toISOString(),
+      verified_at: verifiedAt.toISOString(),
+      access_expires_at:
+        fresh.access_expires_at ||
+        addMonths(verifiedAt, totalAccessMonths).toISOString(),
     })
     .eq('id', subscription.id)
     .select()
@@ -1008,7 +1171,7 @@ app.post('/api/subscription/verify', async (req, res) => {
   }
 });
 
-// Apply promo code during registration (raises monthly listing quota above default 65).
+// Apply promo code during registration (extends the base 3-month access period by 3/6/12 months).
 app.post('/api/subscription/apply-promo-code', async (req, res) => {
   try {
     const { subscriptionId, code } = req.body || {};
@@ -1024,7 +1187,10 @@ app.post('/api/subscription/apply-promo-code', async (req, res) => {
       success: true,
       subscription: sanitizeSubscriptionForClient(result.subscription),
       promoCode: result.promoCode,
-      bonusListings: result.bonusListings,
+      bonusMonths: result.bonusMonths,
+      totalMonths: result.totalMonths,
+      baseMonths: BASE_ACCESS_MONTHS,
+      accessExpiresAt: result.accessExpiresAt,
       maxPublishedListings: result.maxPublishedListings,
       defaultQuota: DEFAULT_MONTHLY_LISTING_QUOTA,
       message: 'קוד הקופון הופעל בהצלחה',
@@ -1183,6 +1349,18 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({
         success: false,
         error: 'מייל או סיסמה שגויים',
+      });
+    }
+
+    // Time-limited usage: base 3 months, extendable with coupons (3/6/12 months).
+    if (
+      subscription.access_expires_at &&
+      new Date(subscription.access_expires_at) < new Date()
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: 'SUBSCRIPTION_EXPIRED',
+        error: 'תוקף המנוי הסתיים. לחידוש המנוי צרו קשר עם שירות הלקוחות.',
       });
     }
 
@@ -3352,6 +3530,21 @@ app.post('/api/follows/request', async (req, res) => {
       return res.status(400).json({ success: false, error: 'cannot follow yourself' });
     }
 
+    const { data: targetSub, error: targetSubErr } = await supabase
+      .from('subscriptions')
+      .select('subscription_type')
+      .eq('id', targetId)
+      .maybeSingle();
+    if (targetSubErr) {
+      return res.status(500).json({ success: false, error: targetSubErr.message });
+    }
+    if (!targetSub || !isB2BSubscriptionType(targetSub.subscription_type)) {
+      return res.status(400).json({
+        success: false,
+        error: 'cannot follow this account type',
+      });
+    }
+
     const { data: alreadyFollow } = await supabase
       .from('user_follows')
       .select('follower_subscription_id')
@@ -3971,6 +4164,10 @@ app.get('/api/follows/hub', async (req, res) => {
           is_mutual_follow: isMutualFollow,
           name: name || 'משתמש',
           subtitle,
+          subscription_type:
+            sub?.subscription_type != null
+              ? String(sub.subscription_type).trim().toLowerCase()
+              : null,
           viewer_rating_avg:
             viewerRatingAvgByTargetId[id] != null
               ? Number(viewerRatingAvgByTargetId[id])
@@ -7915,7 +8112,7 @@ app.delete('/api/search/users/recent', async (req, res) => {
 // ==================== LISTING BOOST ENDPOINTS ====================
 
 /** Monthly boost quota per subscription. */
-const BOOST_MONTHLY_QUOTA = 2;
+const BOOST_MONTHLY_QUOTA = 1;
 /** Boost duration in hours. */
 const BOOST_DURATION_HOURS = 24;
 
