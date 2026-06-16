@@ -51,6 +51,7 @@ async function buildAdRecordFromListingBody(body, supabase) {
     landBlock,
     constructionStatus,
     saleAtPresale,
+    sharedSpacesCompany,
     generalDetails,
     bnbHostType,
     bnbBusinessLogoUrl,
@@ -215,6 +216,9 @@ async function buildAdRecordFromListingBody(body, supabase) {
       const bnb =
         bnbHostType === 'private' || bnbHostType === 'business' ? String(bnbHostType) : null;
       if (bnb) base.bnb_host_type = bnb;
+      if (sharedSpacesCompany === true || sharedSpacesCompany === 'true') {
+        base.shared_spaces_company = true;
+      }
       return Object.keys(base).length ? base : null;
     })(),
     project_offers: projectOffers && typeof projectOffers === 'object' ? projectOffers : null,

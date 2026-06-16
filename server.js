@@ -429,6 +429,26 @@ app.get('/health', (req, res) => {
 });
 
 // ==================== AI SMART INFO (Gemini) ====================
+function buildSmartInfoPrompt(topic, topicLabel, address) {
+  const addr = (address && String(address).trim()) || '';
+  const area = addr || 'ישראל';
+  const label = (topicLabel && String(topicLabel).trim()) || (topic && String(topic)) || 'נושא';
+  const topicKey = String(topic || '').trim().toLowerCase();
+
+  if (topicKey === 'pests' || topicKey === 'nuisances') {
+    return `You are a helpful real-estate assistant for Israel. Answer in Hebrew only, in 2-4 short sentences.
+The user asks about "מטרדים" (environmental nuisances and disturbances) near: ${area}.
+Describe realistic nuisances someone might experience when living there — for example: nearby construction or renovation, road/street works, heavy traffic noise, train or light-rail lines and stations, bus terminals, airports or flight paths, industrial/commercial noise, nightlife venues, garbage collection, or other urban disturbances.
+Do NOT write about insects, pests, rodents, or bug infestations unless explicitly relevant to sanitation (prefer to skip entirely).
+If you are unsure about a specific nuisance at this exact address, speak generally about what is typical for that city/neighborhood type and note uncertainty briefly.
+No preamble.`;
+  }
+
+  return `You are a helpful real-estate assistant. Answer in Hebrew only, in 2-4 short sentences.
+Question: What can you tell me about "${label}" (${topic || label}) for the address/area: ${area}?
+Give practical, factual info relevant to someone considering a property there. No preamble.`;
+}
+
 // POST /api/ai/smart-info - body: { topic, topicLabel, address }
 // Returns short Hebrew answer about the topic for the given address.
 app.post('/api/ai/smart-info', async (req, res) => {
@@ -438,11 +458,7 @@ app.post('/api/ai/smart-info', async (req, res) => {
     if (!apiKey) {
       return res.status(503).json({ success: false, error: 'AI not configured', text: 'שירות המידע החכם לא מוגדר.' });
     }
-    const addr = (address && String(address).trim()) || '';
-    const label = (topicLabel && String(topicLabel).trim()) || (topic && String(topic)) || 'נושא';
-    const prompt = `You are a helpful real-estate assistant. Answer in Hebrew only, in 2-4 short sentences.
-Question: What can you tell me about "${label}" (${topic || label}) for the address/area: ${addr || 'Israel'}?
-Give practical, factual info relevant to someone considering a property there. No preamble.`;
+    const prompt = buildSmartInfoPrompt(topic, topicLabel, address);
     // Use 2.5-flash-lite for better free-tier quota (15 RPM, 1000 RPD); fallback to 2.5-flash
     const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
     let lastError = null;
@@ -4832,6 +4848,10 @@ app.get('/api/listings', async (req, res) => {
         : '';
     const permitParam =
       typeof req.query.permit === 'string' ? req.query.permit.trim() : '';
+    const planApprovalParam =
+      typeof req.query.plan_approval === 'string'
+        ? req.query.plan_approval.trim()
+        : '';
     const applyLandSidebar = (q) => {
       let out = q;
       if (landInMortgageParam) {
@@ -4847,6 +4867,16 @@ app.get('/api/listings', async (req, res) => {
           out = out.or('permit.eq.there_is,permit.eq.יש');
         } else {
           out = out.eq('permit', permitParam);
+        }
+      }
+      if (planApprovalParam) {
+        // תב״ע: "there_is" means a plan exists — match there_is/approved (happy) + legacy Hebrew.
+        if (planApprovalParam === 'there_is') {
+          out = out.or(
+            'plan_approval.eq.there_is,plan_approval.eq.happy,plan_approval.eq.יש,plan_approval.eq.מאושרת',
+          );
+        } else {
+          out = out.eq('plan_approval', planApprovalParam);
         }
       }
       return out;
