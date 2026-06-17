@@ -3938,10 +3938,10 @@ app.get('/api/follows/stats', async (req, res) => {
     try {
       const { data: likesRows } = await supabase
         .from('ads')
-        .select('like_count')
+        .select('post_like_count')
         .eq('subscription_id', userId);
       likes = (likesRows || []).reduce(
-        (sum, row) => sum + (Number(row?.like_count) || 0),
+        (sum, row) => sum + (Number(row?.post_like_count) || 0),
         0,
       );
     } catch (_) {}
@@ -4013,7 +4013,7 @@ app.get('/api/follows/hub', async (req, res) => {
 
     let relationRows = [];
     if (tab === 'likes') {
-      // Everyone who liked any of this profile's ads or posts (deduped by liker).
+      // Everyone who liked any of this profile's POSTS (post likes only, not ad favorites).
       const { data: ownAds, error: adsErr } = await supabase
         .from('ads')
         .select('id')
@@ -4023,18 +4023,12 @@ app.get('/api/follows/hub', async (req, res) => {
       if (ownAdIds.length === 0) {
         return res.json({ success: true, tab, rows: [] });
       }
-      const [{ data: adLikeRows }, { data: postLikeRows }] = await Promise.all([
-        supabase
-          .from('ad_likes')
-          .select('user_id, created_at')
-          .in('ad_id', ownAdIds),
-        supabase
-          .from('post_likes')
-          .select('user_id, created_at')
-          .in('ad_id', ownAdIds),
-      ]);
+      const { data: postLikeRows } = await supabase
+        .from('post_likes')
+        .select('user_id, created_at')
+        .in('ad_id', ownAdIds);
       const byLiker = new Map();
-      [...(adLikeRows || []), ...(postLikeRows || [])].forEach(r => {
+      (postLikeRows || []).forEach(r => {
         const likerId = r?.user_id != null ? String(r.user_id) : '';
         if (!likerId) return;
         const existing = byLiker.get(likerId);
