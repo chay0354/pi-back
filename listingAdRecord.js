@@ -55,6 +55,7 @@ async function buildAdRecordFromListingBody(body, supabase) {
     generalDetails,
     bnbHostType,
     bnbBusinessLogoUrl,
+    hashtags,
     hotDeal,
     projectOffers,
     companyOffersLandSizes,
@@ -69,6 +70,14 @@ async function buildAdRecordFromListingBody(body, supabase) {
 
   const additionalUrls = Array.isArray(additionalImageUrls) ? additionalImageUrls : [];
   const additionalImageUrlsJson = additionalUrls.filter(Boolean);
+
+  // Normalize hashtags: strip leading '#'/spaces, drop empties, dedupe, cap.
+  const normalizedHashtags = (Array.isArray(hashtags) ? hashtags : [])
+    .map(t => String(t == null ? '' : t).trim().replace(/^#+/, '').trim())
+    .filter(Boolean)
+    .filter((t, i, arr) => arr.indexOf(t) === i)
+    .slice(0, 30)
+    .map(t => t.slice(0, 50));
 
   const descTrim = String(description || '').trim();
   const descriptionMarksFeedPost =
@@ -218,6 +227,9 @@ async function buildAdRecordFromListingBody(body, supabase) {
       if (bnb) base.bnb_host_type = bnb;
       if (sharedSpacesCompany === true || sharedSpacesCompany === 'true') {
         base.shared_spaces_company = true;
+      }
+      if (normalizedHashtags.length) {
+        base.hashtags = normalizedHashtags;
       }
       return Object.keys(base).length ? base : null;
     })(),
