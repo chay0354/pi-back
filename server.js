@@ -4004,15 +4004,49 @@ app.get('/api/follows/hub', async (req, res) => {
       .trim()
       .toLowerCase();
     if (!userId) return res.status(400).json({ success: false, error: 'user_id is required' });
-    if (!['requests', 'followers', 'following'].includes(tab)) {
-      return res.status(400).json({ success: false, error: 'tab must be requests|followers|following' });
+    if (!['requests', 'followers', 'following', 'likes'].includes(tab)) {
+      return res.status(400).json({ success: false, error: 'tab must be requests|followers|following|likes' });
     }
     if (tab === 'requests' && viewerId !== userId) {
       return res.status(403).json({ success: false, error: 'requests are private to account owner' });
     }
 
     let relationRows = [];
-    if (tab === 'followers') {
+    if (tab === 'likes') {
+      // Everyone who liked any of this profile's ads or posts (deduped by liker).
+      const { data: ownAds, error: adsErr } = await supabase
+        .from('ads')
+        .select('id')
+        .eq('subscription_id', userId);
+      if (adsErr) return res.status(500).json({ success: false, error: adsErr.message });
+      const ownAdIds = (ownAds || []).map(r => r.id).filter(Boolean);
+      if (ownAdIds.length === 0) {
+        return res.json({ success: true, tab, rows: [] });
+      }
+      const [{ data: adLikeRows }, { data: postLikeRows }] = await Promise.all([
+        supabase
+          .from('ad_likes')
+          .select('user_id, created_at')
+          .in('ad_id', ownAdIds),
+        supabase
+          .from('post_likes')
+          .select('user_id, created_at')
+          .in('ad_id', ownAdIds),
+      ]);
+      const byLiker = new Map();
+      [...(adLikeRows || []), ...(postLikeRows || [])].forEach(r => {
+        const likerId = r?.user_id != null ? String(r.user_id) : '';
+        if (!likerId) return;
+        const existing = byLiker.get(likerId);
+        // Keep the most recent like timestamp per liker.
+        if (!existing || new Date(r.created_at) > new Date(existing.created_at)) {
+          byLiker.set(likerId, { user_id: r.user_id, created_at: r.created_at });
+        }
+      });
+      relationRows = [...byLiker.values()].sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at),
+      );
+    } else if (tab === 'followers') {
       const { data, error } = await supabase
         .from('user_follows')
         .select('follower_subscription_id, created_at')
@@ -4087,7 +4121,9 @@ app.get('/api/follows/hub', async (req, res) => {
         ? 'follower_subscription_id'
         : tab === 'following'
           ? 'following_subscription_id'
-          : 'requester_subscription_id';
+          : tab === 'likes'
+            ? 'user_id'
+            : 'requester_subscription_id';
     const idsInOrder = relationRows.map(r => String(r[idField]));
     const uniqueIds = [...new Set(idsInOrder)];
     if (uniqueIds.length === 0) {
