@@ -6494,6 +6494,102 @@ app.get('/api/chat/conversations', async (req, res) => {
   }
 });
 
+// DELETE /api/chat/conversations - body: user_email, other_user_email.
+// Deletes a 1-on-1 (direct) conversation between the two users, including its
+// messages, participants, and any exclusive offer. Group conversations are
+// rejected (use group management to leave/remove instead).
+app.delete('/api/chat/conversations', async (req, res) => {
+  try {
+    const userEmail = normEmail(req.body.user_email || req.query.user_email);
+    const otherEmail = normEmail(
+      req.body.other_user_email || req.query.other_user_email,
+    );
+    if (!userEmail || !otherEmail) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'user_email and other_user_email required' });
+    }
+
+    // Find conversations the requesting user participates in.
+    const { data: myParts } = await supabase
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', userEmail);
+    const myConvIds = [...new Set((myParts || []).map(p => p.conversation_id))];
+    if (myConvIds.length === 0) {
+      return res.status(404).json({ success: false, error: 'Conversation not found' });
+    }
+
+    // Of those, the ones the other user is also in.
+    const { data: otherIn } = await supabase
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', otherEmail)
+      .in('conversation_id', myConvIds);
+    const sharedConvIds = [...new Set((otherIn || []).map(p => p.conversation_id))];
+    if (sharedConvIds.length === 0) {
+      return res.status(404).json({ success: false, error: 'Conversation not found' });
+    }
+
+    // Keep only true direct (non-group) conversations with exactly these 2 members.
+    const { data: convRows } = await supabase
+      .from('chat_conversations')
+      .select('id, type')
+      .in('id', sharedConvIds);
+    const typeById = {};
+    (convRows || []).forEach(c => {
+      typeById[c.id] = String(c.type || '').trim().toLowerCase();
+    });
+
+    const directConvIds = [];
+    for (const convId of sharedConvIds) {
+      if (typeById[convId] === 'group') continue;
+      const { data: parts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('conversation_id', convId);
+      const emails = (parts || []).map(p => normEmail(p.user_id));
+      if (
+        emails.length === 2 &&
+        emails.includes(userEmail) &&
+        emails.includes(otherEmail)
+      ) {
+        directConvIds.push(convId);
+      }
+    }
+
+    if (directConvIds.length === 0) {
+      return res
+        .status(403)
+        .json({ success: false, error: 'Only direct chats can be deleted this way' });
+    }
+
+    // Delete dependent rows first, then the conversations themselves.
+    await supabase.from('chat_messages').delete().in('conversation_id', directConvIds);
+    const eoDel = await supabase
+      .from('chat_exclusive_offers')
+      .delete()
+      .in('conversation_id', directConvIds);
+    if (eoDel.error && !isMissingExclusiveOfferTableError(eoDel.error)) {
+      console.warn('DELETE /api/chat/conversations exclusive offers:', eoDel.error.message);
+    }
+    await supabase.from('chat_participants').delete().in('conversation_id', directConvIds);
+    const { error: convDelErr } = await supabase
+      .from('chat_conversations')
+      .delete()
+      .in('id', directConvIds);
+    if (convDelErr) {
+      console.error('DELETE /api/chat/conversations conv:', convDelErr.message);
+      return res.status(500).json({ success: false, error: convDelErr.message });
+    }
+
+    res.json({ success: true, deleted: directConvIds.length });
+  } catch (err) {
+    console.error('DELETE /api/chat/conversations:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Resolve avatar URL (public/signed) to help web clients load mixed storage paths reliably.
 app.get('/api/chat/avatar-url', async (req, res) => {
   try {
@@ -6844,6 +6940,51 @@ app.post('/api/chat/exclusive-offer/respond', async (req, res) => {
     res.json({ success: true, status: nextStatus });
   } catch (err) {
     console.error('POST /api/chat/exclusive-offer/respond:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/chat/messages/:id - body/query: user_email. Only the sender may
+// delete their own message (direct or group; both live in chat_messages).
+app.delete('/api/chat/messages/:id', async (req, res) => {
+  try {
+    const messageId = req.params.id != null ? String(req.params.id).trim() : '';
+    const userEmail = normEmail(req.body.user_email || req.query.user_email);
+    if (!messageId) {
+      return res.status(400).json({ success: false, error: 'message id required' });
+    }
+    if (!userEmail) {
+      return res.status(400).json({ success: false, error: 'user_email required' });
+    }
+
+    const { data: row, error: findErr } = await supabase
+      .from('chat_messages')
+      .select('id, sender_id')
+      .eq('id', messageId)
+      .maybeSingle();
+    if (findErr) {
+      console.error('DELETE /api/chat/messages find:', findErr.message);
+      return res.status(500).json({ success: false, error: findErr.message });
+    }
+    if (!row) {
+      return res.status(404).json({ success: false, error: 'Message not found' });
+    }
+    if (normEmail(row.sender_id) !== userEmail) {
+      return res.status(403).json({ success: false, error: 'You can only delete your own messages' });
+    }
+
+    const { error: delErr } = await supabase
+      .from('chat_messages')
+      .delete()
+      .eq('id', messageId);
+    if (delErr) {
+      console.error('DELETE /api/chat/messages delete:', delErr.message);
+      return res.status(500).json({ success: false, error: delErr.message });
+    }
+
+    res.json({ success: true, id: messageId });
+  } catch (err) {
+    console.error('DELETE /api/chat/messages:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
