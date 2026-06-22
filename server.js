@@ -634,6 +634,312 @@ Output strict JSON only, exactly in this format: {"ids": ["id1", "id2"]}`;
   }
 });
 
+// ==================== DISTANCE (Gemini) ====================
+async function callGeminiJsonPrompt(prompt, maxOutputTokens = 512) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return { ok: false, status: 503, error: 'AI not configured' };
+  }
+  const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+  let lastError = null;
+  let response = null;
+  for (const model of modelsToTry) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          maxOutputTokens,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        },
+      }),
+    });
+    if (response.ok) break;
+    lastError = await response.text();
+    if (response.status === 429) break;
+    if (response.status === 404) continue;
+    break;
+  }
+  if (!response?.ok) {
+    return {
+      ok: false,
+      status: response?.status === 429 ? 429 : 502,
+      error: response?.status === 429 ? 'quota_exceeded' : 'AI request failed',
+      detail: lastError,
+    };
+  }
+  const data = await response.json();
+  const textPart = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  return { ok: true, textPart: String(textPart || '').trim() };
+}
+
+function parseGeminiJsonText(textPart) {
+  const cleaned = String(textPart || '')
+    .replace(/^```(?:json)?/i, '')
+    .replace(/```$/, '')
+    .trim();
+  return JSON.parse(cleaned);
+}
+
+function normalizeDistanceKm(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n * 10) / 10;
+}
+
+async function geocodeAddressForDistance(address) {
+  const raw = String(address || '').trim();
+  if (!raw) return null;
+  const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+  let url;
+  if (parts.length >= 2) {
+    const city = parts[parts.length - 1];
+    const streetPart = parts
+      .slice(0, -1)
+      .join(', ')
+      .replace(/^רחוב\s+/u, '')
+      .replace(/^שדרות\s+/u, '')
+      .trim();
+    const houseMatch = streetPart.match(/(\d+)/u);
+    const houseNum = houseMatch ? houseMatch[1] : null;
+    const streetName = streetPart.replace(/\d+/gu, '').trim();
+    if (streetName && city && houseNum) {
+      const params = new URLSearchParams({
+        format: 'json',
+        limit: '1',
+        street: `${houseNum} ${streetName}`,
+        city,
+        country: 'Israel',
+      });
+      url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+    }
+  }
+  if (!url) {
+    const q = /israel/i.test(raw) || raw.includes('ישראל') ? raw : `${raw}, Israel`;
+    url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+  }
+  const res = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'Pi2701App/1.0 (real-estate; contact@pi2701.com)',
+      'Accept-Language': 'he,en',
+    },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const first = Array.isArray(data) ? data[0] : null;
+  const latitude = Number(first?.lat);
+  const longitude = Number(first?.lon);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  return { latitude, longitude };
+}
+
+function haversineDistanceKmServer(a, b) {
+  const lat1 = Number(a?.latitude);
+  const lon1 = Number(a?.longitude);
+  const lat2 = Number(b?.latitude);
+  const lon2 = Number(b?.longitude);
+  if (![lat1, lon1, lat2, lon2].every(Number.isFinite)) return null;
+  const toRad = d => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const s1 = Math.sin(dLat / 2);
+  const s2 = Math.sin(dLon / 2);
+  const h =
+    s1 * s1 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * s2 * s2;
+  return normalizeDistanceKm(6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h)));
+}
+
+async function measureDistanceWithGeminiCoords(origin, destinationCoords, destinationAddress) {
+  const lat = Number(origin?.latitude);
+  const lon = Number(origin?.longitude);
+  const destLat = Number(destinationCoords?.latitude);
+  const destLon = Number(destinationCoords?.longitude);
+  const dest = String(destinationAddress || '').trim();
+
+  const prompt = `You are a precise geographic calculator.
+Point A (user phone GPS in Israel): latitude ${lat}, longitude ${lon}
+Point B (property "${dest.slice(0, 120)}"): latitude ${destLat}, longitude ${destLon}
+
+Calculate ONLY the straight-line great-circle distance in kilometers between A and B (NOT driving distance).
+Round to one decimal place.
+
+Output strict JSON only: {"distanceKm": number}`;
+
+  const gemini = await callGeminiJsonPrompt(prompt, 128);
+  if (!gemini.ok) {
+    return {
+      ok: false,
+      status: gemini.status || 502,
+      error: gemini.error || 'AI request failed',
+    };
+  }
+  try {
+    const parsed = parseGeminiJsonText(gemini.textPart);
+    const distanceKm = normalizeDistanceKm(parsed?.distanceKm);
+    if (distanceKm == null) {
+      return { ok: false, status: 502, error: 'AI returned invalid distance' };
+    }
+    return { ok: true, distanceKm, destinationCoords };
+  } catch (parseErr) {
+    console.error('Gemini distance: unparseable response:', gemini.textPart);
+    return { ok: false, status: 502, error: 'AI returned invalid response' };
+  }
+}
+
+// POST /api/ai/distance - body: { origin: { latitude, longitude }, destinationAddress }
+app.post('/api/ai/distance', async (req, res) => {
+  try {
+    const { origin, destinationAddress } = req.body || {};
+    const lat = Number(origin?.latitude);
+    const lon = Number(origin?.longitude);
+    const dest = String(destinationAddress || '').trim();
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !dest) {
+      return res.status(400).json({
+        success: false,
+        error: 'missing origin or destinationAddress',
+      });
+    }
+
+    const destinationCoords = await geocodeAddressForDistance(dest);
+    if (!destinationCoords) {
+      return res.status(502).json({
+        success: false,
+        error: 'Could not geocode destination address',
+      });
+    }
+
+    const measured = await measureDistanceWithGeminiCoords(
+      { latitude: lat, longitude: lon },
+      destinationCoords,
+      dest,
+    );
+    if (!measured.ok) {
+      const fallbackKm = haversineDistanceKmServer(
+        { latitude: lat, longitude: lon },
+        destinationCoords,
+      );
+      if (fallbackKm != null) {
+        return res.json({
+          success: true,
+          distanceKm: fallbackKm,
+          origin: { latitude: lat, longitude: lon },
+          destinationAddress: dest,
+          destinationCoords,
+          source: 'haversine_fallback',
+        });
+      }
+      return res.status(measured.status || 502).json({
+        success: false,
+        error: measured.error || 'AI request failed',
+      });
+    }
+
+    return res.json({
+      success: true,
+      distanceKm: measured.distanceKm,
+      origin: { latitude: lat, longitude: lon },
+      destinationAddress: dest,
+      destinationCoords: measured.destinationCoords,
+      source: 'gemini',
+    });
+  } catch (err) {
+    console.error('POST /api/ai/distance:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/ai/distance-batch - body: { origin, destinations: [{ key, address }] }
+app.post('/api/ai/distance-batch', async (req, res) => {
+  try {
+    const { origin, destinations } = req.body || {};
+    const lat = Number(origin?.latitude);
+    const lon = Number(origin?.longitude);
+    const destList = (Array.isArray(destinations) ? destinations : [])
+      .map(d => ({
+        key: String(d?.key || '').trim(),
+        address: String(d?.address || '').trim(),
+      }))
+      .filter(d => d.key && d.address)
+      .slice(0, 40);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !destList.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'missing origin or destinations',
+      });
+    }
+
+    const resolved = [];
+    for (const item of destList) {
+      const coords = await geocodeAddressForDistance(item.address);
+      if (coords) {
+        resolved.push({ ...item, latitude: coords.latitude, longitude: coords.longitude });
+      }
+    }
+
+    if (!resolved.length) {
+      return res.status(502).json({ success: false, error: 'Could not geocode destinations' });
+    }
+
+    const prompt = `You are a precise geographic calculator.
+Origin phone GPS in Israel: latitude ${lat}, longitude ${lon}
+
+For each destination below, calculate ONLY the straight-line great-circle distance in kilometers from the origin to that destination (NOT driving distance). Round each to one decimal.
+
+DESTINATIONS (JSON with coordinates):
+${JSON.stringify(
+  resolved.map(r => ({
+    key: r.key,
+    address: r.address,
+    latitude: r.latitude,
+    longitude: r.longitude,
+  })),
+)}
+
+Output strict JSON only:
+{"distances":[{"key":"same key as input","distanceKm": number}]}`;
+
+    const gemini = await callGeminiJsonPrompt(prompt, 2048);
+    const out = {};
+    if (gemini.ok) {
+      try {
+        const parsed = parseGeminiJsonText(gemini.textPart);
+        for (const row of Array.isArray(parsed?.distances) ? parsed.distances : []) {
+          const key = String(row?.key || '').trim();
+          const km = normalizeDistanceKm(row?.distanceKm);
+          if (key && km != null) out[key] = km;
+        }
+      } catch (parseErr) {
+        console.error('Gemini distance-batch: unparseable response:', gemini.textPart);
+      }
+    }
+
+    for (const item of resolved) {
+      if (out[item.key] != null) continue;
+      const fallbackKm = haversineDistanceKmServer(
+        { latitude: lat, longitude: lon },
+        { latitude: item.latitude, longitude: item.longitude },
+      );
+      if (fallbackKm != null) out[item.key] = fallbackKm;
+    }
+
+    return res.json({
+      success: true,
+      distances: out,
+      origin: { latitude: lat, longitude: lon },
+      source: gemini.ok ? 'gemini' : 'haversine_fallback',
+    });
+  } catch (err) {
+    console.error('POST /api/ai/distance-batch:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 /**
  * Test-only skip verify. Enabled by default; set ALLOW_SKIP_EMAIL_VERIFICATION=0 to disable.
  */
@@ -787,10 +1093,10 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
 
     // Validate required fields based on subscription type
     if (subscriptionType === 'company') {
-      if (!businessName || !contactPersonName || !email || !officePhone || !companyWebsite) {
+      if (!businessName || !contactPersonName || !email || !officePhone) {
         return res.status(400).json({ 
           success: false, 
-          error: 'Missing required fields for company subscription (businessName, contactPersonName, email, officePhone, companyWebsite)' 
+          error: 'Missing required fields for company subscription (businessName, contactPersonName, email, officePhone)' 
         });
       }
     } else if (subscriptionType === 'broker') {
@@ -1671,6 +1977,12 @@ app.post('/api/users/register-regular', async (req, res) => {
 
     const name = body.name != null && String(body.name).trim() ? String(body.name).trim() : null;
     const phone = body.phone != null && String(body.phone).trim() ? String(body.phone).trim() : null;
+    const businessAddress =
+      body.business_address != null && String(body.business_address).trim()
+        ? String(body.business_address).trim()
+        : body.address != null && String(body.address).trim()
+          ? String(body.address).trim()
+          : null;
     const profilePictureUrl =
       body.profile_picture_url != null && String(body.profile_picture_url).trim()
         ? String(body.profile_picture_url).trim()
@@ -1697,6 +2009,9 @@ app.post('/api/users/register-regular', async (req, res) => {
       if (!existing.subscription_type) updates.subscription_type = 'user';
       if (name && !existing.name) updates.name = name;
       if (phone && !existing.phone) updates.phone = phone;
+      if (businessAddress && !existing.business_address) {
+        updates.business_address = businessAddress;
+      }
       if (profilePictureUrl && !existing.profile_picture_url) {
         updates.profile_picture_url = profilePictureUrl;
       }
@@ -1756,6 +2071,7 @@ app.post('/api/users/register-regular', async (req, res) => {
       email: emailNorm,
       name,
       phone,
+      business_address: businessAddress,
       profile_picture_url: profilePictureUrl,
       password_hash: hashPassword(password),
       status: 'verified',
@@ -1965,6 +2281,72 @@ app.get('/api/subscription/:id', async (req, res) => {
       success: false, 
       error: error.message 
     });
+  }
+});
+
+/** Profile fields a user may edit from the "edit profile" screen (all account types). */
+const EDITABLE_SUBSCRIPTION_FIELDS = [
+  'name',
+  'business_name',
+  'contact_person_name',
+  'broker_office_name',
+  'phone',
+  'mobile_phone',
+  'office_phone',
+  'company_website',
+  'business_address',
+  'company_id',
+  'brokerage_license_number',
+  'dealer_number',
+  'description',
+  'profile_picture_url',
+  'company_logo_url',
+];
+
+// PATCH /api/subscription/:id — update editable profile fields (all account types).
+app.patch('/api/subscription/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || !LISTING_AD_UUID_RE.test(String(id).trim())) {
+      return res.status(400).json({ success: false, error: 'Invalid subscription id' });
+    }
+
+    const body = req.body || {};
+    const updates = {};
+    for (const key of EDITABLE_SUBSCRIPTION_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
+      let value = body[key];
+      if (typeof value === 'string') {
+        value = value.trim();
+        if (value === '') value = null;
+      }
+      updates[key] = value;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'No editable fields provided' });
+    }
+    updates.updated_at = new Date().toISOString();
+
+    const { data: updated, error: updateError } = await supabase
+      .from('subscriptions')
+      .update(updates)
+      .eq('id', String(id).trim())
+      .select(SUBSCRIPTION_SELECT)
+      .single();
+
+    if (updateError || !updated) {
+      console.error('Error updating subscription profile:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: updateError?.message || 'Failed to update profile',
+      });
+    }
+
+    res.json({ success: true, subscription: sanitizeSubscriptionForClient(updated) });
+  } catch (error) {
+    console.error('Error in PATCH /api/subscription/:id:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
