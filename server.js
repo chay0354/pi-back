@@ -5678,6 +5678,11 @@ app.get('/api/listings', async (req, res) => {
         creator_email: row.creator_email ?? creator.creator_email ?? null,
         creator_profile_image_url: row.profile_image_url ?? creator.creator_profile_image_url ?? null,
         creator_subscription_type: creator.creator_subscription_type ?? null,
+        subscription_type:
+          creator.creator_subscription_type ??
+          row.subscription_type ??
+          row.created_by_subscription_type ??
+          null,
         creator_specialties: creator.creator_specialties || null,
         creator_activity_regions: creator.creator_activity_regions || null,
         creator_types: creator.creator_types || null,
@@ -5960,6 +5965,7 @@ app.get('/api/stories/feed', async (req, res) => {
         subscription_id: s.id,
         display_name: subscriptionDisplayNameForStory(s),
         profile_image_url: pic,
+        subscription_type: st || null,
         slides,
         updated_at: ringUpdatedAt,
       });
@@ -7096,7 +7102,13 @@ app.get('/api/chat/participant-display', async (req, res) => {
       const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
       const profileImageUrl = await resolveExistingImageUrl(asPublicImageUrl(profilePic), new Map());
       const phone = pickSubscriptionPhone(sub);
-      return res.json({ success: true, name: displayName || null, profileImageUrl: profileImageUrl || null, phone: phone || null });
+      return res.json({
+        success: true,
+        name: displayName || null,
+        profileImageUrl: profileImageUrl || null,
+        phone: phone || null,
+        subscription_type: type || null,
+      });
     }
 
     const participantRef = userRef.includes('@') ? userEmail : userRef;
@@ -8551,6 +8563,83 @@ app.patch('/api/listings/:id', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+// DELETE /api/listings/:id — remove an ad/post owned by the current user.
+// Query: user_email (required). Cleans related likes/comments/boosts then deletes the ad row.
+app.delete('/api/listings/:id', async (req, res) => {
+  try {
+    const id = req.params.id != null ? String(req.params.id).trim() : '';
+    if (!LISTING_AD_UUID_RE.test(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid listing id' });
+    }
+
+    const userEmail =
+      typeof req.query.user_email === 'string'
+        ? req.query.user_email.trim()
+        : typeof req.body?.user_email === 'string'
+          ? req.body.user_email.trim()
+          : '';
+    const subscriptionId = await resolveSubscriptionIdByEmail(userEmail);
+    if (!subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'user_email invalid or not a subscription',
+      });
+    }
+
+    const { data: ad, error: fetchErr } = await supabase
+      .from('ads')
+      .select('id, subscription_id, owner_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (fetchErr) {
+      return res.status(500).json({ success: false, error: fetchErr.message });
+    }
+    if (!ad) {
+      return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+
+    const subStr = String(subscriptionId);
+    const ownsAd =
+      (ad.subscription_id != null && String(ad.subscription_id) === subStr) ||
+      (ad.owner_id != null && String(ad.owner_id).trim() === subStr);
+    if (!ownsAd) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not allowed to delete this listing',
+      });
+    }
+
+    await supabase.from('listing_boosts').delete().eq('ad_id', id);
+    await supabase.from('post_comment_reactions').delete().eq('ad_id', id);
+    await supabase.from('post_comments').delete().eq('ad_id', id);
+    await supabase.from('post_likes').delete().eq('ad_id', id);
+    await supabase.from('ad_likes').delete().eq('ad_id', id);
+    try {
+      await supabase.from('profile_reviews').delete().eq('listing_id', id);
+    } catch (_) {
+      /* listing_id column may be absent */
+    }
+
+    const { error: delErr } = await supabase.from('ads').delete().eq('id', id);
+    if (delErr) {
+      console.error('Error deleting listing:', delErr);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to delete listing',
+        details: delErr.message,
+      });
+    }
+
+    res.json({ success: true, id });
+  } catch (error) {
+    console.error('Error in DELETE /api/listings/:id:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
     });
   }
 });
