@@ -3404,6 +3404,8 @@ app.get('/api/chat/group-messages', async (req, res) => {
       return res.status(500).json({ success: false, error: 'Unable to load group messages' });
     }
 
+    await markChatConversationRead(userEmail, convId);
+
     let group = { title: 'קבוצה', profileImageUrl: null, description: null };
     let convMeta = null;
     const rAll = await supabase
@@ -3943,16 +3945,16 @@ app.post('/api/follows/request', async (req, res) => {
 
     const { data: targetSub, error: targetSubErr } = await supabase
       .from('subscriptions')
-      .select('subscription_type')
+      .select('id')
       .eq('id', targetId)
       .maybeSingle();
     if (targetSubErr) {
       return res.status(500).json({ success: false, error: targetSubErr.message });
     }
-    if (!targetSub || !isB2BSubscriptionType(targetSub.subscription_type)) {
-      return res.status(400).json({
+    if (!targetSub) {
+      return res.status(404).json({
         success: false,
-        error: 'cannot follow this account type',
+        error: 'target account not found',
       });
     }
 
@@ -6427,6 +6429,38 @@ async function upsertExclusiveOfferPending(supabase, { convId, body, listingId, 
 }
 
 // GET /api/chat/unread-count?user_email=...&after=:iso_timestamp
+async function markChatConversationRead(userEmail, conversationId, selfRefs = null) {
+  if (!userEmail || !conversationId) return;
+  const now = new Date().toISOString();
+  const refs =
+    selfRefs && typeof selfRefs.size === 'number' && selfRefs.size > 0
+      ? [...selfRefs]
+      : [userEmail];
+  const upd = await supabase
+    .from('chat_participants')
+    .update({ last_read_at: now })
+    .eq('conversation_id', conversationId)
+    .in('user_id', refs);
+  if (upd.error && !isMissingColumnError(upd.error)) {
+    console.warn('[chat] markChatConversationRead:', upd.error.message);
+  }
+}
+
+function buildUnreadCountByConversation(convIds, lastMessages, isSelfRef, lastReadByConv = {}) {
+  const unreadByConvId = {};
+  (convIds || []).forEach((id) => {
+    unreadByConvId[id] = 0;
+  });
+  (lastMessages || []).forEach((m) => {
+    const cid = m.conversation_id;
+    if (!cid || isSelfRef(m.sender_id)) return;
+    const lastRead = lastReadByConv[cid];
+    if (lastRead && new Date(m.created_at) <= new Date(lastRead)) return;
+    unreadByConvId[cid] = (unreadByConvId[cid] || 0) + 1;
+  });
+  return unreadByConvId;
+}
+
 app.get('/api/chat/unread-count', async (req, res) => {
   try {
     const userEmail = normEmail(req.query.user_email);
@@ -6506,12 +6540,26 @@ app.get('/api/chat/conversations', async (req, res) => {
       return em ? selfRefs.has(em) : false;
     };
 
-    const { data: myParts } = await supabase
+    let myParts = [];
+    const myPartsRes = await supabase
       .from('chat_participants')
-      .select('conversation_id')
+      .select('conversation_id, last_read_at')
       .eq('user_id', userEmail);
+    if (myPartsRes.error && isMissingColumnError(myPartsRes.error)) {
+      const fb = await supabase
+        .from('chat_participants')
+        .select('conversation_id')
+        .eq('user_id', userEmail);
+      myParts = fb.data || [];
+    } else {
+      myParts = myPartsRes.data || [];
+    }
     const convIds = [...new Set((myParts || []).map(p => p.conversation_id))];
     if (convIds.length === 0) return res.json({ success: true, conversations: [] });
+    const lastReadByConv = {};
+    (myParts || []).forEach((p) => {
+      lastReadByConv[p.conversation_id] = p.last_read_at || null;
+    });
 
     const { data: allParticipants } = await supabase
       .from('chat_participants')
@@ -6581,6 +6629,12 @@ app.get('/api/chat/conversations', async (req, res) => {
         lastByConv[m.conversation_id] = m;
       }
     });
+    const unreadByConvId = buildUnreadCountByConversation(
+      convIds,
+      lastMessages,
+      isSelfRef,
+      lastReadByConv,
+    );
 
     /** Newest message in thread that carries listing_id (so badges survive when latest text msg omitted listing_id). */
     const latestListingIdByConv = {};
@@ -6820,6 +6874,7 @@ app.get('/api/chat/conversations', async (req, res) => {
           listingDisplayNumber,
           listingCategoryLabel,
           exclusiveOfferStatus: null,
+          unreadCount: unreadByConvId[c.id] || 0,
         };
       }
       const other =
@@ -6864,6 +6919,7 @@ app.get('/api/chat/conversations', async (req, res) => {
         listingDisplayNumber,
         listingCategoryLabel,
         exclusiveOfferStatus: offerStatusByConvId[c.id] || null,
+        unreadCount: unreadByConvId[c.id] || 0,
       };
     }));
 
@@ -7237,6 +7293,8 @@ app.get('/api/chat/messages', async (req, res) => {
     if (!loaded) {
       return res.status(500).json({ success: false, error: 'Unable to load chat messages' });
     }
+
+    await markChatConversationRead(myEmail, sharedConvId);
 
     let exclusiveOfferOut = null;
     const eoRes = await supabase.from('chat_exclusive_offers').select('*').eq('conversation_id', sharedConvId).maybeSingle();
