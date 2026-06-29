@@ -5768,7 +5768,7 @@ app.get('/api/stories/feed', async (req, res) => {
   try {
     const limit = Math.min(
       80,
-      Math.max(1, parseInt(String(req.query.limit || '40'), 10) || 40),
+      Math.max(1, parseInt(String(req.query.limit || '80'), 10) || 80),
     );
 
     const adsSelect =
@@ -5830,7 +5830,7 @@ app.get('/api/stories/feed', async (req, res) => {
       );
     }
 
-    const storyCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const storyCutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const storiesBySubId = new Map();
     try {
       const { data: storyRows, error: storyErr } = await supabase
@@ -5861,7 +5861,7 @@ app.get('/api/stories/feed', async (req, res) => {
       .in('status', ['verified', 'active'])
       .not('video_url', 'is', null)
       .order('updated_at', { ascending: false })
-      .limit(400);
+      .limit(2000);
 
     if (profErr) {
       console.error('GET /api/stories/feed (subscriptions profile video):', profErr);
