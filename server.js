@@ -8212,6 +8212,46 @@ app.delete('/api/posts/:id/like', async (req, res) => {
   }
 });
 
+const POST_PUBLISHER_UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function collectPostPublisherIds(supabase, postRow, adId) {
+  const publisherIds = new Set();
+  const addId = raw => {
+    if (raw == null) return;
+    const pid = String(raw).trim();
+    if (POST_PUBLISHER_UUID_REGEX.test(pid)) publisherIds.add(pid);
+  };
+  if (postRow) {
+    addId(postRow.subscription_id);
+    addId(postRow.owner_id);
+  }
+  if (publisherIds.size === 0 && adId) {
+    try {
+      const { data: row } = await supabase
+        .from('ads')
+        .select('subscription_id, owner_id')
+        .eq('id', adId)
+        .maybeSingle();
+      if (row) {
+        addId(row.subscription_id);
+        addId(row.owner_id);
+      }
+    } catch (_) {
+      /* optional fallback */
+    }
+  }
+  return publisherIds;
+}
+
+function commentIsFromPostPublisher(commentUserId, publisherIds) {
+  const uid = commentUserId == null ? '' : String(commentUserId).trim();
+  if (!uid) return false;
+  if (publisherIds.has(uid)) return true;
+  if (POST_PUBLISHER_UUID_REGEX.test(uid)) return publisherIds.has(uid);
+  return false;
+}
+
 // GET /api/posts/:id/comments - comments list for a post listing
 app.get('/api/posts/:id/comments', async (req, res) => {
   try {
@@ -8223,8 +8263,9 @@ app.get('/api/posts/:id/comments', async (req, res) => {
       id,
       `[GET /api/posts/${id}/comments]`,
       [
-        'id, property_type, feed_post, description',
-        'id, property_type, description',
+        'id, property_type, feed_post, description, subscription_id, owner_id',
+        'id, property_type, description, subscription_id, owner_id',
+        'id, property_type, subscription_id, owner_id',
         'id, property_type',
       ],
       { feed_post: null, description: null },
@@ -8234,6 +8275,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
     if (!isPostListingRow(postRow)) {
       return res.status(400).json({ success: false, error: 'Listing is not a post' });
     }
+    const publisherIds = await collectPostPublisherIds(supabase, postRow, id);
     const { data: rows, error } = await supabase
       .from('post_comments')
       .select('id, ad_id, user_id, comment_text, commenter_name, commenter_image_url, comment_image_url, likes_count, dislikes_count, created_at')
@@ -8268,6 +8310,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
         likes_count: r.likes_count != null ? Number(r.likes_count) : 0,
         dislikes_count: r.dislikes_count != null ? Number(r.dislikes_count) : 0,
         my_reaction: reactionByCommentId[r.id] || null,
+        is_publisher: commentIsFromPostPublisher(r.user_id, publisherIds),
         created_at: r.created_at,
       })),
     });
@@ -8297,7 +8340,8 @@ app.post('/api/posts/:id/comments', async (req, res) => {
       id,
       `[POST /api/posts/${id}/comments]`,
       [
-        'id, property_type, feed_post, description, comment_count',
+        'id, property_type, feed_post, description, comment_count, subscription_id, owner_id',
+        'id, property_type, description, comment_count, subscription_id, owner_id',
         'id, property_type, description, comment_count',
         'id, property_type, description',
         'id, property_type',
@@ -8356,6 +8400,8 @@ app.post('/api/posts/:id/comments', async (req, res) => {
     const currentCount = postRow.comment_count != null ? Number(postRow.comment_count) : 0;
     await supabase.from('ads').update({ comment_count: currentCount + 1 }).eq('id', id);
 
+    const publisherIds = await collectPostPublisherIds(supabase, postRow, id);
+
     return res.json({
       success: true,
       comment: {
@@ -8369,6 +8415,7 @@ app.post('/api/posts/:id/comments', async (req, res) => {
         likes_count: inserted.likes_count != null ? Number(inserted.likes_count) : 0,
         dislikes_count: inserted.dislikes_count != null ? Number(inserted.dislikes_count) : 0,
         my_reaction: null,
+        is_publisher: commentIsFromPostPublisher(inserted.user_id, publisherIds),
         created_at: inserted.created_at,
       },
     });
