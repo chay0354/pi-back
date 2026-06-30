@@ -321,6 +321,65 @@ function resolveSubscriptionSourceUrl(row) {
   return mp4 || null;
 }
 
+/** API shape for ads/listings/posts — keeps original MP4 in video_url, adds HLS playback fields. */
+function buildListingVideos(row) {
+  const rawVideoUrl = resolveAdSourceUrl(row);
+  if (!rawVideoUrl) return [];
+  return [{
+    video_url: rawVideoUrl,
+    video_hls_url: row.video_hls_url || null,
+    video_playback_url: resolveAdPlaybackUrl(row),
+    video_status: row.video_status || null,
+  }];
+}
+
+function shapeListingVideoFields(row) {
+  return {
+    listing_videos: buildListingVideos(row),
+    video_playback_url: resolveAdPlaybackUrl(row),
+  };
+}
+
+/** Story feed slide — original URL in media_url, best playback in media_playback_url. */
+function shapeStorySlideFields(row, kind) {
+  if (kind === 'profile') {
+    const source = resolveSubscriptionSourceUrl(row);
+    if (!source) return null;
+    return {
+      media_url: source,
+      media_playback_url: resolveSubscriptionPlaybackUrl(row),
+      media_hls_url: row.video_hls_url || null,
+      video_status: row.video_status || null,
+    };
+  }
+  if (kind === 'story') {
+    const source = resolveStorySourceUrl(row);
+    if (!source) return null;
+    return {
+      media_url: source,
+      media_playback_url: resolveStoryPlaybackUrl(row),
+      media_hls_url: row.media_hls_url || null,
+      video_status: row.video_status || null,
+    };
+  }
+  if (kind === 'post') {
+    const source = resolveAdSourceUrl(row);
+    if (!source) return null;
+    return {
+      media_url: source,
+      media_playback_url: resolveAdPlaybackUrl(row),
+      media_hls_url: row.video_hls_url || null,
+      video_status: row.video_status || null,
+    };
+  }
+  return null;
+}
+
+function scheduleVideoProcessing(supabase, kind, rowId, sourceUrl) {
+  if (!isVideoUrl(sourceUrl)) return;
+  scheduleProcessing(supabase, kind, rowId, sourceUrl);
+}
+
 module.exports = {
   isConfigured,
   isProcessingEnabled,
@@ -337,6 +396,10 @@ module.exports = {
   resolveStorySourceUrl,
   resolveSubscriptionPlaybackUrl,
   resolveSubscriptionSourceUrl,
+  buildListingVideos,
+  shapeListingVideoFields,
+  shapeStorySlideFields,
+  scheduleVideoProcessing,
   TABLE_BY_KIND,
   URL_FIELD_BY_KIND,
 };

@@ -1319,7 +1319,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
     }
 
     if (subscription.video_url && muxVideo.isVideoUrl(subscription.video_url)) {
-      muxVideo.scheduleProcessing(
+      muxVideo.scheduleVideoProcessing(
         supabase,
         'subscription',
         subscription.id,
@@ -5669,18 +5669,12 @@ app.get('/api/listings', async (req, res) => {
       additional.forEach((url) => {
         if (url) listing_images.push({ image_url: url, image_type: 'additional' });
       });
-      const rawVideoUrl = muxVideo.resolveAdSourceUrl(row);
-      const listing_videos = rawVideoUrl
-        ? [{
-            video_url: rawVideoUrl,
-            video_hls_url: row.video_hls_url || null,
-            video_playback_url: muxVideo.resolveAdPlaybackUrl(row),
-            video_status: row.video_status || null,
-          }]
-        : [];
+      const videoFields = muxVideo.shapeListingVideoFields(row);
+      const listing_videos = videoFields.listing_videos;
       const lidStr = row.id != null ? String(row.id) : '';
       return {
         ...row,
+        video_playback_url: videoFields.video_playback_url,
         review_count: lidStr ? (reviewCountByListingId[lidStr] ?? 0) : 0,
         view_count: row.view_count != null ? Number(row.view_count) : 0,
         like_count: row.like_count != null ? Number(row.like_count) : 0,
@@ -5939,41 +5933,34 @@ app.get('/api/stories/feed', async (req, res) => {
       if (!s) continue;
       const slides = [];
       if (storyHasVideoUrl(s.video_url)) {
-        const profileSource = muxVideo.resolveSubscriptionSourceUrl(s);
-        slides.push({
-          id: `${s.id}-profile-video`,
-          media_url: profileSource || String(s.video_url).trim(),
-          media_playback_url: muxVideo.resolveSubscriptionPlaybackUrl(s),
-          media_hls_url: s.video_hls_url || null,
-          video_status: s.video_status || null,
-          media_type: 'video',
-          kind: 'profile',
-        });
+        const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
+        if (profileMedia) {
+          slides.push({
+            id: `${s.id}-profile-video`,
+            ...profileMedia,
+            media_type: 'video',
+            kind: 'profile',
+          });
+        }
       }
       const tableStories = storiesBySubId.get(s.id) || [];
       for (const st of tableStories) {
-        const sourceUrl = muxVideo.resolveStorySourceUrl(st);
-        if (!sourceUrl) continue;
+        const storyMedia = muxVideo.shapeStorySlideFields(st, 'story');
+        if (!storyMedia) continue;
         slides.push({
           id: `${s.id}-story-${st.id}`,
-          media_url: sourceUrl,
-          media_playback_url: muxVideo.resolveStoryPlaybackUrl(st),
-          media_hls_url: st.media_hls_url || null,
-          video_status: st.video_status || null,
-          media_type: storyMediaTypeFromUrl(sourceUrl),
+          ...storyMedia,
+          media_type: storyMediaTypeFromUrl(storyMedia.media_url),
           kind: 'story',
         });
       }
       const posts = postsBySubId.get(s.id) || [];
       for (const p of posts) {
-        const postSource = muxVideo.resolveAdSourceUrl(p);
-        if (!postSource) continue;
+        const postMedia = muxVideo.shapeStorySlideFields(p, 'post');
+        if (!postMedia) continue;
         slides.push({
           id: `${s.id}-post-${p.id}`,
-          media_url: postSource,
-          media_playback_url: muxVideo.resolveAdPlaybackUrl(p),
-          media_hls_url: p.video_hls_url || null,
-          video_status: p.video_status || null,
+          ...postMedia,
           media_type: 'video',
           kind: 'post',
         });
@@ -6046,7 +6033,7 @@ app.post('/api/stories', async (req, res) => {
     }
 
     if (muxVideo.isVideoUrl(url)) {
-      muxVideo.scheduleProcessing(supabase, 'story', data.id, url);
+      muxVideo.scheduleVideoProcessing(supabase, 'story', data.id, url);
     }
 
     res.status(201).json({ success: true, story: data });
@@ -8543,13 +8530,16 @@ app.post('/api/listings', async (req, res) => {
     }
 
     if (ad.video_url && muxVideo.isVideoUrl(ad.video_url)) {
-      muxVideo.scheduleProcessing(supabase, 'ad', ad.id, ad.video_url);
+      muxVideo.scheduleVideoProcessing(supabase, 'ad', ad.id, ad.video_url);
     }
 
     res.status(201).json({
       success: true,
       id: ad.id,
-      listing: ad
+      listing: {
+        ...ad,
+        ...muxVideo.shapeListingVideoFields(ad),
+      },
     });
   } catch (error) {
     console.error('Error in POST /api/listings:', error);
@@ -8599,14 +8589,17 @@ app.put('/api/listings/:id', async (req, res) => {
       const prev = existingAd?.video_url && String(existingAd.video_url).trim();
       const next = String(ad.video_url).trim();
       if (next !== prev) {
-        muxVideo.scheduleProcessing(supabase, 'ad', ad.id, ad.video_url);
+        muxVideo.scheduleVideoProcessing(supabase, 'ad', ad.id, ad.video_url);
       }
     }
 
     res.status(200).json({
       success: true,
       id: ad.id,
-      listing: ad,
+      listing: {
+        ...ad,
+        ...muxVideo.shapeListingVideoFields(ad),
+      },
     });
   } catch (error) {
     console.error('Error in PUT /api/listings/:id:', error);
