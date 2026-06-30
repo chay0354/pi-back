@@ -282,8 +282,7 @@ function resolveAdPlaybackUrl(row) {
   if (!row) return null;
   const hls = row.video_hls_url && String(row.video_hls_url).trim();
   if (hls && row.video_status !== 'failed') return hls;
-  const mp4 = row.video_url && String(row.video_url).trim();
-  return mp4 || null;
+  return null;
 }
 
 /** Original Supabase/direct URL — never rewritten to HLS. */
@@ -297,8 +296,7 @@ function resolveStoryPlaybackUrl(row) {
   if (!row) return null;
   const hls = row.media_hls_url && String(row.media_hls_url).trim();
   if (hls && row.video_status !== 'failed') return hls;
-  const src = row.media_url && String(row.media_url).trim();
-  return src || null;
+  return null;
 }
 
 function resolveStorySourceUrl(row) {
@@ -311,8 +309,7 @@ function resolveSubscriptionPlaybackUrl(row) {
   if (!row) return null;
   const hls = row.video_hls_url && String(row.video_hls_url).trim();
   if (hls && row.video_status !== 'failed') return hls;
-  const mp4 = row.video_url && String(row.video_url).trim();
-  return mp4 || null;
+  return null;
 }
 
 function resolveSubscriptionSourceUrl(row) {
@@ -323,13 +320,15 @@ function resolveSubscriptionSourceUrl(row) {
 
 /** API shape for ads/listings/posts — keeps original MP4 in video_url, adds HLS playback fields. */
 function buildListingVideos(row) {
-  const rawVideoUrl = resolveAdSourceUrl(row);
-  if (!rawVideoUrl) return [];
+  const hls = resolveAdPlaybackUrl(row);
+  const source = resolveAdSourceUrl(row);
+  if (!hls) return [];
   return [{
-    video_url: rawVideoUrl,
-    video_hls_url: row.video_hls_url || null,
-    video_playback_url: resolveAdPlaybackUrl(row),
+    video_url: hls,
+    video_hls_url: row.video_hls_url || hls,
+    video_playback_url: hls,
     video_status: row.video_status || null,
+    source_video_url: source || null,
   }];
 }
 
