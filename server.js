@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
+const muxVideo = require('./muxVideo');
 
 const B2B_SUBSCRIPTION_TYPES = new Set(['broker', 'company', 'professional']);
 const MIN_PASSWORD_LENGTH = 8;
@@ -1315,6 +1316,15 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
 
     if (!shouldDeferEmail) {
       await sendVerificationEmail(email, verificationCode, subscriptionType);
+    }
+
+    if (subscription.video_url && muxVideo.isVideoUrl(subscription.video_url)) {
+      muxVideo.scheduleProcessing(
+        supabase,
+        'subscription',
+        subscription.id,
+        subscription.video_url,
+      );
     }
 
     res.json({
@@ -5659,7 +5669,15 @@ app.get('/api/listings', async (req, res) => {
       additional.forEach((url) => {
         if (url) listing_images.push({ image_url: url, image_type: 'additional' });
       });
-      const listing_videos = row.video_url ? [{ video_url: row.video_url }] : [];
+      const rawVideoUrl = muxVideo.resolveAdSourceUrl(row);
+      const listing_videos = rawVideoUrl
+        ? [{
+            video_url: rawVideoUrl,
+            video_hls_url: row.video_hls_url || null,
+            video_playback_url: muxVideo.resolveAdPlaybackUrl(row),
+            video_status: row.video_status || null,
+          }]
+        : [];
       const lidStr = row.id != null ? String(row.id) : '';
       return {
         ...row,
@@ -5761,7 +5779,7 @@ function storyMediaTypeFromUrl(url) {
 }
 
 const SUBSCRIPTION_SELECT_STORY =
-  'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, status, updated_at';
+  'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, video_hls_url, video_status, status, updated_at';
 
 // GET /api/stories/feed — strip: profile intro video, story slides (stories table), video feed-posts
 app.get('/api/stories/feed', async (req, res) => {
@@ -5772,7 +5790,7 @@ app.get('/api/stories/feed', async (req, res) => {
     );
 
     const adsSelect =
-      'id, subscription_id, video_url, created_at, feed_post, description, property_type, is_frozen';
+      'id, subscription_id, video_url, video_hls_url, video_status, created_at, feed_post, description, property_type, is_frozen';
 
     let adsQuery = supabase
       .from('ads')
@@ -5835,7 +5853,7 @@ app.get('/api/stories/feed', async (req, res) => {
     try {
       const { data: storyRows, error: storyErr } = await supabase
         .from('stories')
-        .select('id, subscription_id, media_url, created_at')
+        .select('id, subscription_id, media_url, media_hls_url, video_status, created_at')
         .gte('created_at', storyCutoff)
         .order('created_at', { ascending: false })
         .limit(2000);
@@ -5921,29 +5939,41 @@ app.get('/api/stories/feed', async (req, res) => {
       if (!s) continue;
       const slides = [];
       if (storyHasVideoUrl(s.video_url)) {
+        const profileSource = muxVideo.resolveSubscriptionSourceUrl(s);
         slides.push({
           id: `${s.id}-profile-video`,
-          media_url: String(s.video_url).trim(),
+          media_url: profileSource || String(s.video_url).trim(),
+          media_playback_url: muxVideo.resolveSubscriptionPlaybackUrl(s),
+          media_hls_url: s.video_hls_url || null,
+          video_status: s.video_status || null,
           media_type: 'video',
           kind: 'profile',
         });
       }
       const tableStories = storiesBySubId.get(s.id) || [];
       for (const st of tableStories) {
-        const url = String(st.media_url || '').trim();
-        if (!url) continue;
+        const sourceUrl = muxVideo.resolveStorySourceUrl(st);
+        if (!sourceUrl) continue;
         slides.push({
           id: `${s.id}-story-${st.id}`,
-          media_url: url,
-          media_type: storyMediaTypeFromUrl(url),
+          media_url: sourceUrl,
+          media_playback_url: muxVideo.resolveStoryPlaybackUrl(st),
+          media_hls_url: st.media_hls_url || null,
+          video_status: st.video_status || null,
+          media_type: storyMediaTypeFromUrl(sourceUrl),
           kind: 'story',
         });
       }
       const posts = postsBySubId.get(s.id) || [];
       for (const p of posts) {
+        const postSource = muxVideo.resolveAdSourceUrl(p);
+        if (!postSource) continue;
         slides.push({
           id: `${s.id}-post-${p.id}`,
-          media_url: String(p.video_url).trim(),
+          media_url: postSource,
+          media_playback_url: muxVideo.resolveAdPlaybackUrl(p),
+          media_hls_url: p.video_hls_url || null,
+          video_status: p.video_status || null,
           media_type: 'video',
           kind: 'post',
         });
@@ -6013,6 +6043,10 @@ app.post('/api/stories', async (req, res) => {
     if (error) {
       console.error('POST /api/stories:', error);
       return res.status(500).json({ success: false, error: error.message });
+    }
+
+    if (muxVideo.isVideoUrl(url)) {
+      muxVideo.scheduleProcessing(supabase, 'story', data.id, url);
     }
 
     res.status(201).json({ success: true, story: data });
@@ -8508,6 +8542,10 @@ app.post('/api/listings', async (req, res) => {
       });
     }
 
+    if (ad.video_url && muxVideo.isVideoUrl(ad.video_url)) {
+      muxVideo.scheduleProcessing(supabase, 'ad', ad.id, ad.video_url);
+    }
+
     res.status(201).json({
       success: true,
       id: ad.id,
@@ -8533,6 +8571,11 @@ app.put('/api/listings/:id', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid listing id' });
     }
     const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
+    const { data: existingAd } = await supabase
+      .from('ads')
+      .select('video_url')
+      .eq('id', id)
+      .maybeSingle();
     const { data: ad, error: updateError } = await supabase
       .from('ads')
       .update(adRecord)
@@ -8550,6 +8593,14 @@ app.put('/api/listings/:id', async (req, res) => {
     }
     if (!ad) {
       return res.status(404).json({ success: false, error: 'Listing not found' });
+    }
+
+    if (ad.video_url && muxVideo.isVideoUrl(ad.video_url)) {
+      const prev = existingAd?.video_url && String(existingAd.video_url).trim();
+      const next = String(ad.video_url).trim();
+      if (next !== prev) {
+        muxVideo.scheduleProcessing(supabase, 'ad', ad.id, ad.video_url);
+      }
     }
 
     res.status(200).json({
@@ -9240,6 +9291,76 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       success: false, 
       error: error.message 
     });
+  }
+});
+
+// Mux webhook — asset.ready / asset.errored updates HLS URLs on ads, stories, subscriptions
+app.post('/api/mux/webhook', async (req, res) => {
+  try {
+    const signature = req.headers['mux-signature'];
+    const rawBody = req.rawBody || JSON.stringify(req.body || {});
+    if (
+      process.env.MUX_WEBHOOK_SIGNING_SECRET &&
+      !muxVideo.verifyWebhookSignature(rawBody, signature)
+    ) {
+      return res.status(401).json({ success: false, error: 'Invalid Mux signature' });
+    }
+
+    const event = req.body || {};
+    const type = event.type || '';
+    const asset = event.data || event.object || null;
+
+    if (type.startsWith('video.asset.')) {
+      await muxVideo.applyWebhookAssetEvent(supabase, asset);
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('POST /api/mux/webhook:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * Manually (re)start Mux ingest for an existing row.
+ * Body: { kind: 'ad' | 'story' | 'subscription', id: '<uuid>' }
+ */
+app.post('/api/mux/reprocess', async (req, res) => {
+  try {
+    const kind = req.body?.kind != null ? String(req.body.kind).trim() : '';
+    const rowId = req.body?.id != null ? String(req.body.id).trim() : '';
+    const table = muxVideo.TABLE_BY_KIND[kind];
+    const urlField = muxVideo.URL_FIELD_BY_KIND[kind];
+    if (!table || !urlField || !rowId) {
+      return res.status(400).json({
+        success: false,
+        error: 'kind (ad|story|subscription) and id are required',
+      });
+    }
+
+    const { data: row, error } = await supabase
+      .from(table)
+      .select(`id, ${urlField}`)
+      .eq('id', rowId)
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    if (!row || !row[urlField]) {
+      return res.status(404).json({ success: false, error: 'Row or source video not found' });
+    }
+
+    const result = await muxVideo.startProcessing(
+      supabase,
+      kind,
+      rowId,
+      row[urlField],
+    );
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('POST /api/mux/reprocess:', err);
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
   }
 });
 
