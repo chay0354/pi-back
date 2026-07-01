@@ -5749,17 +5749,6 @@ function subscriptionDisplayNameForStory(sub) {
   return sub.name || sub.business_name || sub.contact_person_name || 'משתמש';
 }
 
-/** Aligns with TikTok feed “post” rows — only those rows qualify as video posts in stories (not full property ads). */
-function adRowIsFeedPostForStories(row) {
-  if (!row) return false;
-  if (row.feed_post === true || row.feed_post === 'true' || row.feed_post === 't') return true;
-  const d = String(row.description || '').trim().toLowerCase();
-  if (d === 'פוסט' || d === 'post') return true;
-  const pt = String(row.property_type || '').toLowerCase();
-  if (pt.includes('post')) return true;
-  return false;
-}
-
 function storyHasVideoUrl(u) {
   return u != null && String(u).trim().length > 0;
 }
@@ -5775,72 +5764,14 @@ function storyMediaTypeFromUrl(url) {
 const SUBSCRIPTION_SELECT_STORY =
   'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, video_hls_url, video_status, status, updated_at';
 
-// GET /api/stories/feed — strip: profile intro video, story slides (stories table), video feed-posts
+// GET /api/stories/feed — strip: profile intro video + explicit story slides only.
+// TikTok feed posts (ads.feed_post) are never mirrored here.
 app.get('/api/stories/feed', async (req, res) => {
   try {
     const limit = Math.min(
       80,
       Math.max(1, parseInt(String(req.query.limit || '80'), 10) || 80),
     );
-
-    const adsSelect =
-      'id, subscription_id, video_url, video_hls_url, video_status, created_at, feed_post, description, property_type, is_frozen';
-
-    let adsQuery = supabase
-      .from('ads')
-      .select(adsSelect)
-      .eq('status', 'published')
-      .not('video_url', 'is', null)
-      .or('is_frozen.is.null,is_frozen.eq.false')
-      .order('created_at', { ascending: false })
-      .limit(1200);
-
-    let { data: adsRows, error: adsError } = await adsQuery;
-
-    const frozenColMissing =
-      adsError &&
-      (adsError.code === '42703' ||
-        adsError.code === 'PGRST204' ||
-        (adsError.message && String(adsError.message).includes('is_frozen')));
-
-    if (frozenColMissing) {
-      const retry = await supabase
-        .from('ads')
-        .select(adsSelect.replace(', is_frozen', ''))
-        .eq('status', 'published')
-        .not('video_url', 'is', null)
-        .order('created_at', { ascending: false })
-        .limit(1200);
-      adsRows = retry.data;
-      adsError = retry.error;
-    }
-
-    if (adsError && !frozenColMissing) {
-      console.error('GET /api/stories/feed (ads):', adsError);
-      return res.status(500).json({ success: false, error: adsError.message });
-    }
-
-    const videoPosts = (adsRows || []).filter(
-      (r) =>
-        storyHasVideoUrl(r.video_url) &&
-        adRowIsFeedPostForStories(r) &&
-        r.subscription_id &&
-        (r.is_frozen !== true && String(r.is_frozen || '').toLowerCase() !== 'true'),
-    );
-
-    const postsBySubId = new Map();
-    for (const row of videoPosts) {
-      const sid = row.subscription_id;
-      if (!postsBySubId.has(sid)) postsBySubId.set(sid, []);
-      postsBySubId.get(sid).push(row);
-    }
-    for (const [, arr] of postsBySubId) {
-      arr.sort(
-        (a, b) =>
-          new Date(b.created_at || 0).getTime() -
-          new Date(a.created_at || 0).getTime(),
-      );
-    }
 
     const storyCutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const storiesBySubId = new Map();
@@ -5864,7 +5795,6 @@ app.get('/api/stories/feed', async (req, res) => {
       /* stories table may not exist yet */
     }
 
-    const idsFromVideoPosts = [...postsBySubId.keys()];
     const idsFromStorySlides = [...storiesBySubId.keys()];
 
     const { data: subsProfileVideo, error: profErr } = await supabase
@@ -5886,22 +5816,6 @@ app.get('/api/stories/feed', async (req, res) => {
     }
 
     const chunkSize = 80;
-    for (let i = 0; i < idsFromVideoPosts.length; i += chunkSize) {
-      const chunk = idsFromVideoPosts.slice(i, i + chunkSize);
-      const { data: chunkSubs, error: chErr } = await supabase
-        .from('subscriptions')
-        .select(SUBSCRIPTION_SELECT_STORY)
-        .in('id', chunk)
-        .in('status', ['verified', 'active']);
-      if (chErr) {
-        console.warn('GET /api/stories/feed chunk subs:', chErr.message);
-        continue;
-      }
-      for (const s of chunkSubs || []) {
-        if (s?.id && !subById.has(s.id)) subById.set(s.id, s);
-      }
-    }
-
     const storyOnlySubIds = idsFromStorySlides.filter((id) => !subById.has(id));
     for (let i = 0; i < storyOnlySubIds.length; i += chunkSize) {
       const chunk = storyOnlySubIds.slice(i, i + chunkSize);
@@ -5920,11 +5834,7 @@ app.get('/api/stories/feed', async (req, res) => {
     }
 
     const ringSubIds = [
-      ...new Set([
-        ...subById.keys(),
-        ...postsBySubId.keys(),
-        ...storiesBySubId.keys(),
-      ]),
+      ...new Set([...subById.keys(), ...storiesBySubId.keys()]),
     ];
 
     const rings = [];
@@ -5954,17 +5864,6 @@ app.get('/api/stories/feed', async (req, res) => {
           kind: 'story',
         });
       }
-      const posts = postsBySubId.get(s.id) || [];
-      for (const p of posts) {
-        const postMedia = muxVideo.shapeStorySlideFields(p, 'post');
-        if (!postMedia) continue;
-        slides.push({
-          id: `${s.id}-post-${p.id}`,
-          ...postMedia,
-          media_type: 'video',
-          kind: 'post',
-        });
-      }
       if (slides.length === 0) continue;
 
       const st = (s.subscription_type || '').toLowerCase();
@@ -5976,8 +5875,6 @@ app.get('/api/stories/feed', async (req, res) => {
       let ringUpdatedAt = s.updated_at;
       if (tableStories[0]?.created_at) {
         ringUpdatedAt = tableStories[0].created_at;
-      } else if (posts[0]?.created_at) {
-        ringUpdatedAt = posts[0].created_at;
       }
 
       rings.push({
