@@ -6033,7 +6033,22 @@ app.post('/api/stories', async (req, res) => {
     }
 
     if (muxVideo.isVideoUrl(url)) {
-      muxVideo.scheduleVideoProcessing(supabase, 'story', data.id, url);
+      try {
+        const result = await muxVideo.startProcessing(
+          supabase,
+          'story',
+          data.id,
+          url,
+        );
+        if (result && result.playbackId) {
+          data.mux_asset_id = result.assetId || data.mux_asset_id;
+          data.mux_playback_id = result.playbackId;
+          data.media_hls_url = muxVideo.hlsFromPlaybackId(result.playbackId);
+          data.video_status = result.status || 'processing';
+        }
+      } catch (muxErr) {
+        console.error('[mux] story create processing failed:', muxErr.message);
+      }
     }
 
     res.status(201).json({ success: true, story: data });
@@ -8226,7 +8241,7 @@ async function collectPostPublisherIds(supabase, postRow, adId) {
     addId(postRow.subscription_id);
     addId(postRow.owner_id);
   }
-  if (publisherIds.size === 0 && adId) {
+  if (adId) {
     try {
       const { data: row } = await supabase
         .from('ads')
@@ -8244,11 +8259,18 @@ async function collectPostPublisherIds(supabase, postRow, adId) {
   return publisherIds;
 }
 
-function commentIsFromPostPublisher(commentUserId, publisherIds) {
+function commentIsFromPostPublisher(commentUserId, publisherIds, postRow = null) {
   const uid = commentUserId == null ? '' : String(commentUserId).trim();
   if (!uid) return false;
   if (publisherIds.has(uid)) return true;
-  if (POST_PUBLISHER_UUID_REGEX.test(uid)) return publisherIds.has(uid);
+  if (POST_PUBLISHER_UUID_REGEX.test(uid) && publisherIds.has(uid)) return true;
+  if (postRow) {
+    const owner = postRow.owner_id == null ? '' : String(postRow.owner_id).trim();
+    const sub =
+      postRow.subscription_id == null ? '' : String(postRow.subscription_id).trim();
+    if (owner && owner === uid) return true;
+    if (sub && sub === uid) return true;
+  }
   return false;
 }
 
@@ -8310,7 +8332,7 @@ app.get('/api/posts/:id/comments', async (req, res) => {
         likes_count: r.likes_count != null ? Number(r.likes_count) : 0,
         dislikes_count: r.dislikes_count != null ? Number(r.dislikes_count) : 0,
         my_reaction: reactionByCommentId[r.id] || null,
-        is_publisher: commentIsFromPostPublisher(r.user_id, publisherIds),
+        is_publisher: commentIsFromPostPublisher(r.user_id, publisherIds, postRow),
         created_at: r.created_at,
       })),
     });
@@ -8415,7 +8437,11 @@ app.post('/api/posts/:id/comments', async (req, res) => {
         likes_count: inserted.likes_count != null ? Number(inserted.likes_count) : 0,
         dislikes_count: inserted.dislikes_count != null ? Number(inserted.dislikes_count) : 0,
         my_reaction: null,
-        is_publisher: commentIsFromPostPublisher(inserted.user_id, publisherIds),
+        is_publisher: commentIsFromPostPublisher(
+          inserted.user_id,
+          publisherIds,
+          postRow,
+        ),
         created_at: inserted.created_at,
       },
     });
@@ -8576,8 +8602,28 @@ app.post('/api/listings', async (req, res) => {
       });
     }
 
+    // Await Mux asset creation so the HLS URL is persisted before responding.
+    // On serverless (Vercel) a fire-and-forget setImmediate is frozen once the
+    // response is sent and never runs, which left video posts without a stream.
     if (ad.video_url && muxVideo.isVideoUrl(ad.video_url)) {
-      muxVideo.scheduleVideoProcessing(supabase, 'ad', ad.id, ad.video_url);
+      try {
+        const result = await muxVideo.startProcessing(
+          supabase,
+          'ad',
+          ad.id,
+          ad.video_url,
+        );
+        if (result && result.playbackId) {
+          ad.mux_asset_id = result.assetId || ad.mux_asset_id;
+          ad.mux_playback_id = result.playbackId;
+          ad.video_hls_url = muxVideo.hlsFromPlaybackId(result.playbackId);
+          ad.video_status = result.status || 'processing';
+        }
+      } catch (muxErr) {
+        // Mux over quota or unavailable — keep the raw video_url so the client
+        // can still play the MP4 directly.
+        console.error('[mux] ad create processing failed:', muxErr.message);
+      }
     }
 
     res.status(201).json({
@@ -8636,7 +8682,22 @@ app.put('/api/listings/:id', async (req, res) => {
       const prev = existingAd?.video_url && String(existingAd.video_url).trim();
       const next = String(ad.video_url).trim();
       if (next !== prev) {
-        muxVideo.scheduleVideoProcessing(supabase, 'ad', ad.id, ad.video_url);
+        try {
+          const result = await muxVideo.startProcessing(
+            supabase,
+            'ad',
+            ad.id,
+            ad.video_url,
+          );
+          if (result && result.playbackId) {
+            ad.mux_asset_id = result.assetId || ad.mux_asset_id;
+            ad.mux_playback_id = result.playbackId;
+            ad.video_hls_url = muxVideo.hlsFromPlaybackId(result.playbackId);
+            ad.video_status = result.status || 'processing';
+          }
+        } catch (muxErr) {
+          console.error('[mux] ad update processing failed:', muxErr.message);
+        }
       }
     }
 
