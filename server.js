@@ -6351,6 +6351,8 @@ const CHAT_MESSAGE_SELECT_FULL =
   'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share';
 const CHAT_MESSAGE_SELECT_FALLBACK =
   'id, sender_id, body, created_at, media_type, media_url, listing_id';
+/** Cap initial thread payload so opening a chat stays fast on long histories. */
+const CHAT_MESSAGES_INITIAL_LIMIT = 100;
 
 function mapChatMessageRow(m, myEmail, { withMedia = true, withListingShare = true } = {}) {
   const isMe = normEmail(m.sender_id) === myEmail;
@@ -6372,23 +6374,64 @@ function mapChatMessageRow(m, myEmail, { withMedia = true, withListingShare = tr
   };
 }
 
-async function loadChatMessagesForConversation(conversationId, myEmail) {
-  let r = await supabase
-    .from('chat_messages')
-    .select(CHAT_MESSAGE_SELECT_FULL)
-    .eq('conversation_id', conversationId)
-    .order('created_at', { ascending: true });
-  if (!r.error) {
-    return (r.data || []).map((m) => mapChatMessageRow(m, myEmail, { withMedia: true, withListingShare: true }));
-  }
+async function loadChatMessagesForConversation(
+  conversationId,
+  myEmail,
+  { limit = CHAT_MESSAGES_INITIAL_LIMIT } = {},
+) {
+  const cap = Number(limit);
+  const useCap = Number.isFinite(cap) && cap > 0;
+  const runSelect = async (selectCols, withListingShare) => {
+    let q = supabase
+      .from('chat_messages')
+      .select(selectCols)
+      .eq('conversation_id', conversationId);
+    if (useCap) {
+      q = q.order('created_at', { ascending: false }).limit(cap);
+    } else {
+      q = q.order('created_at', { ascending: true });
+    }
+    const r = await q;
+    if (r.error) return { error: r.error, rows: null };
+    let rows = r.data || [];
+    if (useCap) rows = rows.slice().reverse();
+    return {
+      error: null,
+      rows: rows.map((m) =>
+        mapChatMessageRow(m, myEmail, {
+          withMedia: selectCols.includes('media_type'),
+          withListingShare,
+        }),
+      ),
+    };
+  };
+
+  let r = await runSelect(CHAT_MESSAGE_SELECT_FULL, true);
+  if (!r.error) return r.rows;
   if (!isMissingColumnError(r.error)) throw r.error;
-  r = await supabase
-    .from('chat_messages')
-    .select(CHAT_MESSAGE_SELECT_FALLBACK)
-    .eq('conversation_id', conversationId)
-    .order('created_at', { ascending: true });
+  r = await runSelect(CHAT_MESSAGE_SELECT_FALLBACK, false);
   if (r.error) throw r.error;
-  return (r.data || []).map((m) => mapChatMessageRow(m, myEmail, { withMedia: true, withListingShare: false }));
+  return r.rows;
+}
+
+async function userCanAccessConversation(userEmail, conversationId) {
+  if (!userEmail || !conversationId) return false;
+  const selfRefs = new Set([userEmail]);
+  const { data: meSub } = await supabase
+    .from('subscriptions')
+    .select('id, email')
+    .ilike('email', userEmail)
+    .maybeSingle();
+  if (meSub?.id) selfRefs.add(String(meSub.id).trim().toLowerCase());
+  if (meSub?.email) selfRefs.add(normEmail(meSub.email));
+  const refs = [...selfRefs];
+  const { data: parts, error } = await supabase
+    .from('chat_participants')
+    .select('user_id')
+    .eq('conversation_id', conversationId)
+    .in('user_id', refs);
+  if (error) return false;
+  return (parts || []).length > 0;
 }
 
 function buildUnreadCountByConversation(convIds, lastMessages, isSelfRef, lastReadByConv = {}) {
@@ -6759,7 +6802,6 @@ app.get('/api/chat/conversations', async (req, res) => {
       });
     }
 
-    const imageUrlCache = new Map();
     const conversations = await Promise.all((convs || []).map(async (c) => {
       const participants = participantsByConv[c.id] || [];
       const isGroup = (c.type === 'group') || participants.length > 2;
@@ -6802,9 +6844,8 @@ app.get('/api/chat/conversations', async (req, res) => {
         }
         const participantGroupPic =
           [...participantPicFreq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
-        const groupProfileImageUrl = await resolveExistingImageUrl(
-          asPublicImageUrl(gPic || participantGroupPic),
-          imageUrlCache,
+        const groupProfileImageUrl = asPublicImageUrl(
+          gPic || participantGroupPic,
         );
         return {
           id: c.id,
@@ -6834,9 +6875,8 @@ app.get('/api/chat/conversations', async (req, res) => {
         (otherRefLower && displayByRef[otherRefLower]) ||
         {};
       const name = display?.name || (other && other.display_name) || 'משתמש';
-      const profileImageUrl = await resolveExistingImageUrl(
-        asPublicImageUrl(display?.profile_picture_url || (other && other.profile_picture_url) || null),
-        imageUrlCache,
+      const profileImageUrl = asPublicImageUrl(
+        display?.profile_picture_url || (other && other.profile_picture_url) || null,
       );
       const last = lastByConv[c.id];
       let preview = '';
@@ -7134,54 +7174,82 @@ app.get('/api/chat/participant-display', async (req, res) => {
   }
 });
 
-// GET /api/chat/messages?user_email=...&other_user_email=...
+// GET /api/chat/messages?user_email=...&other_user_email=... OR conversation_id=...
 app.get('/api/chat/messages', async (req, res) => {
   try {
     const myEmail = normEmail(req.query.user_email);
-    const otherEmail = normEmail(req.query.other_user_email);
-    if (!myEmail || !otherEmail) return res.status(400).json({ success: false, error: 'user_email and other_user_email required' });
-
-    const [{ data: myParts }, { data: otherParts }] = await Promise.all([
-      supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail),
-      supabase.from('chat_participants').select('conversation_id').eq('user_id', otherEmail),
-    ]);
-    const myConvIds = new Set((myParts || []).map(p => p.conversation_id));
-    /** All conversations shared by both users (there may be duplicates from earlier bugs). */
-    const sharedConvIds = (otherParts || [])
-      .map(p => p.conversation_id)
-      .filter(id => myConvIds.has(id));
-    let sharedConvId = null;
-    if (sharedConvIds.length > 0) {
-      if (sharedConvIds.length === 1) {
-        sharedConvId = sharedConvIds[0];
-      } else {
-        // Multiple direct conversations exist — pick the one with the most recent message.
-        const { data: latestRows } = await supabase
-          .from('chat_messages')
-          .select('conversation_id, created_at')
-          .in('conversation_id', sharedConvIds)
-          .order('created_at', { ascending: false })
-          .limit(1);
-        if (latestRows && latestRows.length > 0) {
-          sharedConvId = latestRows[0].conversation_id;
-        } else {
-          const { data: convRows } = await supabase
-            .from('chat_conversations')
-            .select('id, last_message_at')
-            .in('id', sharedConvIds)
-            .order('last_message_at', { ascending: false, nullsFirst: false })
-            .limit(1);
-          sharedConvId = convRows && convRows[0] ? convRows[0].id : sharedConvIds[0];
-        }
-      }
+    const convIdParam =
+      req.query.conversation_id != null
+        ? String(req.query.conversation_id).trim()
+        : '';
+    const otherRefRaw =
+      req.query.other_user_email != null
+        ? String(req.query.other_user_email).trim().toLowerCase()
+        : '';
+    if (!myEmail) {
+      return res.status(400).json({ success: false, error: 'user_email required' });
+    }
+    if (!convIdParam && !otherRefRaw) {
+      return res.status(400).json({
+        success: false,
+        error: 'other_user_email or conversation_id required',
+      });
     }
 
-    if (!sharedConvId && (otherParts || []).length > 0) {
-      const convId = (otherParts || [])[0].conversation_id;
-      const { data: parts } = await supabase.from('chat_participants').select('user_id').eq('conversation_id', convId);
-      if ((parts || []).length === 1) {
-        await supabase.from('chat_participants').insert({ conversation_id: convId, user_id: myEmail });
-        sharedConvId = convId;
+    let sharedConvId = convIdParam || null;
+
+    if (sharedConvId) {
+      const allowed = await userCanAccessConversation(myEmail, sharedConvId);
+      if (!allowed) {
+        return res.status(403).json({ success: false, error: 'Not a participant' });
+      }
+    } else {
+      const otherRef = otherRefRaw;
+      const [{ data: myParts }, { data: otherParts }] = await Promise.all([
+        supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail),
+        supabase.from('chat_participants').select('conversation_id').eq('user_id', otherRef),
+      ]);
+      const myConvIds = new Set((myParts || []).map((p) => p.conversation_id));
+      const sharedConvIds = (otherParts || [])
+        .map((p) => p.conversation_id)
+        .filter((id) => myConvIds.has(id));
+      if (sharedConvIds.length > 0) {
+        if (sharedConvIds.length === 1) {
+          sharedConvId = sharedConvIds[0];
+        } else {
+          const { data: latestRows } = await supabase
+            .from('chat_messages')
+            .select('conversation_id, created_at')
+            .in('conversation_id', sharedConvIds)
+            .order('created_at', { ascending: false })
+            .limit(1);
+          if (latestRows && latestRows.length > 0) {
+            sharedConvId = latestRows[0].conversation_id;
+          } else {
+            const { data: convRows } = await supabase
+              .from('chat_conversations')
+              .select('id, last_message_at')
+              .in('id', sharedConvIds)
+              .order('last_message_at', { ascending: false, nullsFirst: false })
+              .limit(1);
+            sharedConvId =
+              convRows && convRows[0] ? convRows[0].id : sharedConvIds[0];
+          }
+        }
+      }
+
+      if (!sharedConvId && (otherParts || []).length > 0) {
+        const convId = (otherParts || [])[0].conversation_id;
+        const { data: parts } = await supabase
+          .from('chat_participants')
+          .select('user_id')
+          .eq('conversation_id', convId);
+        if ((parts || []).length === 1) {
+          await supabase
+            .from('chat_participants')
+            .insert({ conversation_id: convId, user_id: myEmail });
+          sharedConvId = convId;
+        }
       }
     }
 
@@ -7194,7 +7262,11 @@ app.get('/api/chat/messages', async (req, res) => {
     try {
       const [messages, eoRes] = await Promise.all([
         loadChatMessagesForConversation(sharedConvId, myEmail),
-        supabase.from('chat_exclusive_offers').select('*').eq('conversation_id', sharedConvId).maybeSingle(),
+        supabase
+          .from('chat_exclusive_offers')
+          .select('*')
+          .eq('conversation_id', sharedConvId)
+          .maybeSingle(),
       ]);
       list = messages;
       if (!eoRes.error && eoRes.data) {
@@ -7204,15 +7276,21 @@ app.get('/api/chat/messages', async (req, res) => {
           brokerEmail: normEmail(eoRes.data.broker_email),
           ownerEmail: normEmail(eoRes.data.owner_email),
           monthsCommitted:
-            eoRes.data.months_committed != null ? Number(eoRes.data.months_committed) : null,
-          listingId: eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
+            eoRes.data.months_committed != null
+              ? Number(eoRes.data.months_committed)
+              : null,
+          listingId:
+            eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
         };
       } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
         console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
       }
     } catch (loadErr) {
       console.error('GET /api/chat/messages:', loadErr?.message || loadErr);
-      return res.status(500).json({ success: false, error: loadErr?.message || 'Unable to load chat messages' });
+      return res.status(500).json({
+        success: false,
+        error: loadErr?.message || 'Unable to load chat messages',
+      });
     }
 
     res.json({
