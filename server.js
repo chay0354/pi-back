@@ -7714,6 +7714,7 @@ app.post('/api/chat/messages', async (req, res) => {
       });
       return res.json({
         success: true,
+        conversation_id: convId,
         message: mapDirectMessageResponse(fd, fallbackPayload),
       });
     }
@@ -7727,6 +7728,7 @@ app.post('/api/chat/messages', async (req, res) => {
     });
     res.json({
       success: true,
+      conversation_id: convId,
       message: mapDirectMessageResponse(msg, winningPayload),
     });
   } catch (err) {
