@@ -3364,65 +3364,29 @@ app.get('/api/chat/group-messages', async (req, res) => {
     const members = (parts || []).map((p) => normEmail(p.user_id)).filter(Boolean);
     if (!members.includes(userEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
 
-    const mapRow = (m, withMedia) => {
-      const isMe = normEmail(m.sender_id) === userEmail;
-      return {
-        id: m.id,
-        senderId: m.sender_id,
-        body: m.body,
-        mediaType: withMedia ? (m.media_type || null) : null,
-        mediaUrl: withMedia ? (m.media_url || null) : null,
-        listingId: m.listing_id != null ? String(m.listing_id) : null,
-        listingShare:
-          m.is_listing_share === true
-            ? true
-            : m.is_listing_share === false
-              ? false
-              : undefined,
-        createdAt: m.created_at,
-        isMe,
-      };
-    };
+    markChatConversationRead(userEmail, convId);
 
-    const msgSelectVariants = [
-      'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share',
-      'id, sender_id, body, created_at, media_type, media_url, listing_id',
-      'id, sender_id, body, created_at, media_type, media_url',
-      'id, sender_id, body, created_at, listing_id',
-      'id, sender_id, body, created_at',
-    ];
     let list;
-    let loaded = false;
-    for (let vi = 0; vi < msgSelectVariants.length; vi++) {
-      const sel = msgSelectVariants[vi];
-      const r = await supabase
-        .from('chat_messages')
-        .select(sel)
-        .eq('conversation_id', convId)
-        .order('created_at', { ascending: true });
-      if (!r.error) {
-        const withMedia = sel.includes('media_type');
-        list = (r.data == null ? [] : r.data).map((m) => mapRow(m, withMedia));
-        loaded = true;
-        break;
-      }
-      if (!isMissingColumnError(r.error)) {
-        return res.status(500).json({ success: false, error: r.error.message });
-      }
+    try {
+      list = await loadChatMessagesForConversation(convId, userEmail);
+    } catch (loadErr) {
+      return res.status(500).json({ success: false, error: loadErr?.message || 'Unable to load group messages' });
     }
-    if (!loaded) {
-      return res.status(500).json({ success: false, error: 'Unable to load group messages' });
-    }
-
-    await markChatConversationRead(userEmail, convId);
 
     let group = { title: 'קבוצה', profileImageUrl: null, description: null };
     let convMeta = null;
-    const rAll = await supabase
-      .from('chat_conversations')
-      .select('title, group_image_url, group_description')
-      .eq('id', convId)
-      .maybeSingle();
+    const [rAll, rCreator] = await Promise.all([
+      supabase
+        .from('chat_conversations')
+        .select('title, group_image_url, group_description')
+        .eq('id', convId)
+        .maybeSingle(),
+      supabase
+        .from('chat_conversations')
+        .select('group_creator_email')
+        .eq('id', convId)
+        .maybeSingle(),
+    ]);
     if (!rAll.error && rAll.data) {
       convMeta = rAll.data;
     } else if (rAll.error && isMissingGroupDescriptionColumnError(rAll.error)) {
@@ -3441,11 +3405,6 @@ app.get('/api/chat/group-messages', async (req, res) => {
       }
     }
     let creatorEmailForRoles = '';
-    const rCreator = await supabase
-      .from('chat_conversations')
-      .select('group_creator_email')
-      .eq('id', convId)
-      .maybeSingle();
     if (!rCreator.error && rCreator.data?.group_creator_email) {
       creatorEmailForRoles = normEmail(rCreator.data.group_creator_email);
     }
@@ -3487,46 +3446,55 @@ app.get('/api/chat/group-messages', async (req, res) => {
         subscriptionType: null,
       });
     }
-    const groupImageCache = new Map();
-    await Promise.all(
-      memberList.map(async (m) => {
-        const ref = m.userRef && String(m.userRef).trim() ? String(m.userRef).trim() : m.email;
-        const refNorm = normEmail(ref);
-        let sub = null;
-        if (refNorm.includes('@')) {
-          const r = await supabase
-            .from('subscriptions')
-            .select(
-              'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
-            )
-            .ilike('email', refNorm)
-            .maybeSingle();
-          sub = r.data || null;
-        } else if (CHAT_UUID_RE.test(String(refNorm))) {
-          const r = await supabase
-            .from('subscriptions')
-            .select(
-              'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url',
-            )
-            .eq('id', refNorm)
-            .maybeSingle();
-          sub = r.data || null;
+    const memberEmails = [
+      ...new Set(memberList.map((m) => m.email).filter((em) => em.includes('@'))),
+    ];
+    const memberIds = [
+      ...new Set(
+        memberList
+          .map((m) => (m.userRef ? String(m.userRef).trim().toLowerCase() : ''))
+          .filter((id) => id && CHAT_UUID_RE.test(id)),
+      ),
+    ];
+    const subsByRef = new Map();
+    const subSelect =
+      'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url';
+    const subLookups = [];
+    if (memberEmails.length > 0) {
+      subLookups.push(
+        supabase.from('subscriptions').select(subSelect).in('email', memberEmails),
+      );
+    }
+    if (memberIds.length > 0) {
+      subLookups.push(
+        supabase.from('subscriptions').select(subSelect).in('id', memberIds),
+      );
+    }
+    if (subLookups.length > 0) {
+      const subResults = await Promise.all(subLookups);
+      for (const subsRes of subResults) {
+        for (const sub of subsRes.data || []) {
+          const emailKey = normEmail(sub.email);
+          if (emailKey) subsByRef.set(emailKey, sub);
+          if (sub.id != null) subsByRef.set(String(sub.id).trim().toLowerCase(), sub);
         }
-        if (sub) {
-          if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
-          m.subscriptionType =
-            sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
-          m.profileImageUrl = await resolveExistingImageUrl(subscriptionProfilePicFromRow(sub), groupImageCache);
-        }
-        if (!m.profileImageUrl && m.participantProfileImageUrl) {
-          m.profileImageUrl = await resolveExistingImageUrl(
-            asPublicImageUrl(m.participantProfileImageUrl),
-            groupImageCache,
-          );
-        }
-        if (!m.name) m.name = refNorm.includes('@') ? refNorm.split('@')[0] : refNorm || m.email;
-      }),
-    );
+      }
+    }
+    for (const m of memberList) {
+      const sub =
+        subsByRef.get(m.email) ||
+        (m.userRef ? subsByRef.get(String(m.userRef).trim().toLowerCase()) : null);
+      if (sub) {
+        if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
+        m.subscriptionType =
+          sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
+        m.profileImageUrl = asPublicImageUrl(subscriptionProfilePicFromRow(sub));
+      }
+      if (!m.profileImageUrl && m.participantProfileImageUrl) {
+        m.profileImageUrl = asPublicImageUrl(m.participantProfileImageUrl);
+      }
+      if (!m.name) m.name = m.email.includes('@') ? m.email.split('@')[0] : m.email || m.email;
+    }
     memberList.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
 
     res.json({ success: true, messages: list, conversation_id: convId, group, members: memberList });
@@ -6379,6 +6347,50 @@ async function markChatConversationRead(userEmail, conversationId, selfRefs = nu
   }
 }
 
+const CHAT_MESSAGE_SELECT_FULL =
+  'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share';
+const CHAT_MESSAGE_SELECT_FALLBACK =
+  'id, sender_id, body, created_at, media_type, media_url, listing_id';
+
+function mapChatMessageRow(m, myEmail, { withMedia = true, withListingShare = true } = {}) {
+  const isMe = normEmail(m.sender_id) === myEmail;
+  return {
+    id: m.id,
+    senderId: m.sender_id,
+    body: m.body,
+    mediaType: withMedia ? (m.media_type || null) : null,
+    mediaUrl: withMedia ? (m.media_url || null) : null,
+    listingId: m.listing_id != null ? String(m.listing_id) : null,
+    listingShare:
+      withListingShare && m.is_listing_share === true
+        ? true
+        : withListingShare && m.is_listing_share === false
+          ? false
+          : undefined,
+    createdAt: m.created_at,
+    isMe,
+  };
+}
+
+async function loadChatMessagesForConversation(conversationId, myEmail) {
+  let r = await supabase
+    .from('chat_messages')
+    .select(CHAT_MESSAGE_SELECT_FULL)
+    .eq('conversation_id', conversationId)
+    .order('created_at', { ascending: true });
+  if (!r.error) {
+    return (r.data || []).map((m) => mapChatMessageRow(m, myEmail, { withMedia: true, withListingShare: true }));
+  }
+  if (!isMissingColumnError(r.error)) throw r.error;
+  r = await supabase
+    .from('chat_messages')
+    .select(CHAT_MESSAGE_SELECT_FALLBACK)
+    .eq('conversation_id', conversationId)
+    .order('created_at', { ascending: true });
+  if (r.error) throw r.error;
+  return (r.data || []).map((m) => mapChatMessageRow(m, myEmail, { withMedia: true, withListingShare: false }));
+}
+
 function buildUnreadCountByConversation(convIds, lastMessages, isSelfRef, lastReadByConv = {}) {
   const unreadByConvId = {};
   (convIds || []).forEach((id) => {
@@ -7089,7 +7101,7 @@ app.get('/api/chat/participant-display', async (req, res) => {
       else if (type === 'professional') displayName = sub.name || sub.business_name || sub.contact_person_name || null;
       else displayName = sub.name || sub.contact_person_name || sub.business_name || null;
       const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
-      const profileImageUrl = await resolveExistingImageUrl(asPublicImageUrl(profilePic), new Map());
+      const profileImageUrl = asPublicImageUrl(profilePic);
       const phone = pickSubscriptionPhone(sub);
       return res.json({
         success: true,
@@ -7108,10 +7120,7 @@ app.get('/api/chat/participant-display', async (req, res) => {
       .limit(1);
     const row = participantRows && participantRows[0];
     if (row && (row.display_name || row.profile_picture_url)) {
-      const profileImageUrl = await resolveExistingImageUrl(
-        asPublicImageUrl(row.profile_picture_url || null),
-        new Map(),
-      );
+      const profileImageUrl = asPublicImageUrl(row.profile_picture_url || null);
       return res.json({
         success: true,
         name: row.display_name || null,
@@ -7132,8 +7141,10 @@ app.get('/api/chat/messages', async (req, res) => {
     const otherEmail = normEmail(req.query.other_user_email);
     if (!myEmail || !otherEmail) return res.status(400).json({ success: false, error: 'user_email and other_user_email required' });
 
-    const { data: myParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail);
-    const { data: otherParts } = await supabase.from('chat_participants').select('conversation_id').eq('user_id', otherEmail);
+    const [{ data: myParts }, { data: otherParts }] = await Promise.all([
+      supabase.from('chat_participants').select('conversation_id').eq('user_id', myEmail),
+      supabase.from('chat_participants').select('conversation_id').eq('user_id', otherEmail),
+    ]);
     const myConvIds = new Set((myParts || []).map(p => p.conversation_id));
     /** All conversations shared by both users (there may be duplicates from earlier bugs). */
     const sharedConvIds = (otherParts || [])
@@ -7176,73 +7187,32 @@ app.get('/api/chat/messages', async (req, res) => {
 
     if (!sharedConvId) return res.json({ success: true, messages: [] });
 
-    const mapRow = (m, withMedia) => {
-      const isMe = normEmail(m.sender_id) === myEmail;
-      return {
-        id: m.id,
-        senderId: m.sender_id,
-        body: m.body,
-        mediaType: withMedia ? (m.media_type || null) : null,
-        mediaUrl: withMedia ? (m.media_url || null) : null,
-        listingId: m.listing_id != null ? String(m.listing_id) : null,
-        listingShare:
-          m.is_listing_share === true
-            ? true
-            : m.is_listing_share === false
-              ? false
-              : undefined,
-        createdAt: m.created_at,
-        isMe,
-      };
-    };
+    markChatConversationRead(myEmail, sharedConvId);
 
-    const msgSelectVariants = [
-      'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share',
-      'id, sender_id, body, created_at, media_type, media_url, listing_id',
-      'id, sender_id, body, created_at, media_type, media_url',
-      'id, sender_id, body, created_at, listing_id',
-      'id, sender_id, body, created_at',
-    ];
     let list;
-    let loaded = false;
-    for (let vi = 0; vi < msgSelectVariants.length; vi++) {
-      const sel = msgSelectVariants[vi];
-      const r = await supabase
-        .from('chat_messages')
-        .select(sel)
-        .eq('conversation_id', sharedConvId)
-        .order('created_at', { ascending: true });
-      if (!r.error) {
-        const withMedia = sel.includes('media_type');
-        list = (r.data == null ? [] : r.data).map((m) => mapRow(m, withMedia));
-        loaded = true;
-        break;
-      }
-      if (!isMissingColumnError(r.error)) {
-        console.error('GET /api/chat/messages:', r.error.message);
-        return res.status(500).json({ success: false, error: r.error.message });
-      }
-    }
-    if (!loaded) {
-      return res.status(500).json({ success: false, error: 'Unable to load chat messages' });
-    }
-
-    await markChatConversationRead(myEmail, sharedConvId);
-
     let exclusiveOfferOut = null;
-    const eoRes = await supabase.from('chat_exclusive_offers').select('*').eq('conversation_id', sharedConvId).maybeSingle();
-    if (!eoRes.error && eoRes.data) {
-      exclusiveOfferOut = {
-        conversationId: sharedConvId,
-        status: eoRes.data.status,
-        brokerEmail: normEmail(eoRes.data.broker_email),
-        ownerEmail: normEmail(eoRes.data.owner_email),
-        monthsCommitted:
-          eoRes.data.months_committed != null ? Number(eoRes.data.months_committed) : null,
-        listingId: eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
-      };
-    } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
-      console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
+    try {
+      const [messages, eoRes] = await Promise.all([
+        loadChatMessagesForConversation(sharedConvId, myEmail),
+        supabase.from('chat_exclusive_offers').select('*').eq('conversation_id', sharedConvId).maybeSingle(),
+      ]);
+      list = messages;
+      if (!eoRes.error && eoRes.data) {
+        exclusiveOfferOut = {
+          conversationId: sharedConvId,
+          status: eoRes.data.status,
+          brokerEmail: normEmail(eoRes.data.broker_email),
+          ownerEmail: normEmail(eoRes.data.owner_email),
+          monthsCommitted:
+            eoRes.data.months_committed != null ? Number(eoRes.data.months_committed) : null,
+          listingId: eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
+        };
+      } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
+        console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
+      }
+    } catch (loadErr) {
+      console.error('GET /api/chat/messages:', loadErr?.message || loadErr);
+      return res.status(500).json({ success: false, error: loadErr?.message || 'Unable to load chat messages' });
     }
 
     res.json({
