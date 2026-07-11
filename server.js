@@ -5810,7 +5810,10 @@ app.get('/api/stories/feed', async (req, res) => {
       const s = subById.get(sid);
       if (!s) continue;
       const slides = [];
-      if (storyHasVideoUrl(s.video_url)) {
+      const profileVideoUrl = storyHasVideoUrl(s.video_url)
+        ? String(s.video_url).trim()
+        : null;
+      if (profileVideoUrl) {
         const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
         if (profileMedia) {
           slides.push({
@@ -5823,6 +5826,10 @@ app.get('/api/stories/feed', async (req, res) => {
       }
       const tableStories = storiesBySubId.get(s.id) || [];
       for (const st of tableStories) {
+        const storyUrl = st.media_url && String(st.media_url).trim();
+        if (!storyUrl) continue;
+        // Profile intro already appears as kind:profile — skip duplicate story rows.
+        if (profileVideoUrl && storyUrl === profileVideoUrl) continue;
         const storyMedia = muxVideo.shapeStorySlideFields(st, 'story');
         if (!storyMedia) continue;
         slides.push({
@@ -5942,16 +5949,18 @@ app.get('/api/companies/directory', async (req, res) => {
     const ids = list.map((c) => c.id).filter(Boolean);
     const countBySub = {};
     if (ids.length > 0) {
+      // Match CompanyProjectsScreen: published projects only (exclude feed posts).
       const { data: adRows, error: adErr } = await supabase
         .from('ads')
-        .select('subscription_id')
-        .in('subscription_id', ids);
+        .select('subscription_id, feed_post, property_type, description')
+        .in('subscription_id', ids)
+        .eq('status', 'published');
       if (adErr) {
         console.warn('GET /api/companies/directory ads count:', adErr.message);
       } else {
         for (const row of adRows || []) {
           const sid = row.subscription_id;
-          if (!sid) continue;
+          if (!sid || isPostListingRow(row)) continue;
           countBySub[sid] = (countBySub[sid] || 0) + 1;
         }
       }
@@ -5978,7 +5987,7 @@ app.get('/api/professionals/directory', async (req, res) => {
     const { data: rows, error } = await supabase
       .from('subscriptions')
       .select(
-        'id, email, name, contact_person_name, business_name, business_address, description, profile_picture_url, video_url, specializations, types, status, updated_at',
+        'id, email, name, contact_person_name, business_name, business_address, description, profile_picture_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, types, status, updated_at',
       )
       .eq('subscription_type', 'professional')
       .in('status', ['verified', 'active'])
@@ -6061,6 +6070,9 @@ app.get('/api/professionals/directory', async (req, res) => {
         display_name: displayName,
         profile_image_url: asPublicImageUrl(row.profile_picture_url),
         video_url: asPublicImageUrl(row.video_url),
+        video_hls_url: row.video_hls_url || null,
+        video_playback_url: muxVideo.resolveSubscriptionPlaybackUrl(row),
+        video_status: row.video_status || null,
         address: row.business_address && String(row.business_address).trim() ? String(row.business_address).trim() : null,
         bio: row.description && String(row.description).trim() ? String(row.description).trim() : null,
         specializations,
