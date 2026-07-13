@@ -6775,7 +6775,11 @@ app.get('/api/chat/conversations', async (req, res) => {
           ) ||
           null;
         if (e && otherRefs.some((r) => normEmail(r) === e)) {
-          displayByRef[e] = {name: name || null, profile_picture_url: pic};
+          displayByRef[e] = {
+            name: name || null,
+            profile_picture_url: pic,
+            subscription_type: type || null,
+          };
         }
         if (s.id) {
           const idKey = String(s.id).toLowerCase();
@@ -6783,6 +6787,7 @@ app.get('/api/chat/conversations', async (req, res) => {
             displayByRef[idKey] = {
               name: name || null,
               profile_picture_url: pic,
+              subscription_type: type || null,
             };
           }
         }
@@ -6801,7 +6806,11 @@ app.get('/api/chat/conversations', async (req, res) => {
         const existing = displayByRef[e];
         if (!existing) {
           if (pName || pPic) {
-            displayByRef[e] = {name: pName, profile_picture_url: pPic};
+            displayByRef[e] = {
+              name: pName,
+              profile_picture_url: pPic,
+              subscription_type: null,
+            };
           }
           return;
         }
@@ -6890,6 +6899,10 @@ app.get('/api/chat/conversations', async (req, res) => {
       const profileImageUrl = asPublicImageUrl(
         display?.profile_picture_url || (other && other.profile_picture_url) || null,
       );
+      const subscriptionType =
+        display?.subscription_type != null && String(display.subscription_type).trim()
+          ? String(display.subscription_type).trim().toLowerCase()
+          : null;
       const last = lastByConv[c.id];
       let preview = '';
       if (last) {
@@ -6909,6 +6922,8 @@ app.get('/api/chat/conversations', async (req, res) => {
         otherUserEmail: otherEmail,
         name,
         profileImageUrl,
+        subscriptionType,
+        subscription_type: subscriptionType,
         preview,
         time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
         lastMessageAt: last?.created_at || c.last_message_at || null,
