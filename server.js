@@ -4533,9 +4533,13 @@ app.get('/api/follows/hub', async (req, res) => {
         .eq('requester_subscription_id', viewerId)
         .eq('status', 'pending')
         .in('target_subscription_id', uniqueIds);
-      (viewerPending || []).forEach(r =>
-        viewerPendingSet.add(String(r.target_subscription_id)),
-      );
+      (viewerPending || []).forEach(r => {
+        const tid = String(r.target_subscription_id || '');
+        // If already following, ignore a leftover pending request so the hub still lists them.
+        if (tid && !viewerFollowingSet.has(tid)) {
+          viewerPendingSet.add(tid);
+        }
+      });
 
       const { data: viewerRatings } = await supabase
         .from('profile_reviews')
@@ -5323,6 +5327,27 @@ app.get('/api/listings', async (req, res) => {
       ? subscriptionTypeParam.split(',').map(s => s.trim()).filter(s => allowedSubscriptionTypes.includes(s))
       : [];
 
+    // BnB (5) + שותפים (3): public feed is regular-user ads only.
+    // Exception: שותפים "נותני שירות" may request subscription_type=professional.
+    // Owner view (subscription_id) keeps all of that owner's ads unfiltered by type.
+    const REGULAR_USER_ONLY_CATEGORIES = new Set([3, 5]);
+    const isOwnerViewEarly =
+      !favoritesOnly && subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
+    const isRegularUserOnlyCategory =
+      category != null &&
+      !isNaN(category) &&
+      REGULAR_USER_ONLY_CATEGORIES.has(category);
+    let effectiveSubscriptionTypes = subscriptionTypes;
+    if (isRegularUserOnlyCategory && !favoritesOnly && !isOwnerViewEarly) {
+      const wantsProfessionalOnly =
+        category === 3 &&
+        subscriptionTypes.length === 1 &&
+        subscriptionTypes[0] === 'professional';
+      if (!wantsProfessionalOnly) {
+        effectiveSubscriptionTypes = ['user'];
+      }
+    }
+
     let query = supabase
       .from('ads')
       .select('*')
@@ -5339,10 +5364,10 @@ app.get('/api/listings', async (req, res) => {
     }
     // Other feed-only filters never apply to favorites_only (avoid hiding cross-category likes).
     if (!favoritesOnly) {
-      if (subscriptionTypes.length === 1) {
-        query = query.eq('subscription_type', subscriptionTypes[0]);
-      } else if (subscriptionTypes.length > 1) {
-        query = query.in('subscription_type', subscriptionTypes);
+      if (effectiveSubscriptionTypes.length === 1) {
+        query = query.eq('subscription_type', effectiveSubscriptionTypes[0]);
+      } else if (effectiveSubscriptionTypes.length > 1) {
+        query = query.in('subscription_type', effectiveSubscriptionTypes);
       }
       if (hasVideo) {
         query = query.not('video_url', 'is', null);
@@ -5391,10 +5416,10 @@ app.get('/api/listings', async (req, res) => {
         fallbackQuery = fallbackQuery.eq('category', category);
       }
       if (!favoritesOnly) {
-        if (subscriptionTypes.length === 1) {
-          fallbackQuery = fallbackQuery.eq('subscription_type', subscriptionTypes[0]);
-        } else if (subscriptionTypes.length > 1) {
-          fallbackQuery = fallbackQuery.in('subscription_type', subscriptionTypes);
+        if (effectiveSubscriptionTypes.length === 1) {
+          fallbackQuery = fallbackQuery.eq('subscription_type', effectiveSubscriptionTypes[0]);
+        } else if (effectiveSubscriptionTypes.length > 1) {
+          fallbackQuery = fallbackQuery.in('subscription_type', effectiveSubscriptionTypes);
         }
         if (hasVideo) {
           fallbackQuery = fallbackQuery.not('video_url', 'is', null);

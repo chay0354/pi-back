@@ -58,7 +58,7 @@ function amenities(parking = 1, extra = {}) {
   };
 }
 
-/** 2 ads × 10 categories = 20 listings */
+/** Broker seed ads (excludes BnB/partners — those are regular-user only). */
 const ADS = [
   // 1 — חדש מקבלן
   {
@@ -153,61 +153,7 @@ const ADS = [
     amenities: amenities(4, {open_space: true, sea_view: true}),
   },
 
-  // 3 — שותפים
-  {
-    category: 3,
-    property_type: 'apartment',
-    project_name: 'מחפש שותף — רחוב הארגמן, תל אביב',
-    address: 'רחוב הארגמן 22, תל אביב',
-    purpose: 'rent',
-    budget: 4500,
-    area: 95,
-    rooms: 3,
-    floor: 3,
-    search_purpose: 'partner',
-    preferred_apartment_type: 'shared_apt',
-    preferred_gender: 'male',
-    preferred_age_min: 24,
-    preferred_age_max: 35,
-    preferences: {
-      non_smoker: true,
-      students: false,
-      stable_job: true,
-      immediate_entry: true,
-    },
-    display_option: 'images',
-    main_image_url: IMG.apt,
-    additional_image_urls: [IMG.apt2],
-    description:
-      'דירת 3.5 חדרים מרוהטת ברחוב הארגמן. מחפש שותף נקי ושקט, עובד מסודר. חדר פרטי 14 מ"ר, מרפסת משותפת, מיזוג בכל החדרים.',
-  },
-  {
-    category: 3,
-    property_type: 'apartment',
-    project_name: 'שותפה לדירה — גבעתיים',
-    address: 'סירקין 14, גבעתיים',
-    purpose: 'rent',
-    budget: 3800,
-    area: 88,
-    rooms: 4,
-    floor: 2,
-    search_purpose: 'enter',
-    preferred_apartment_type: 'shared_apt',
-    preferred_gender: 'female',
-    preferred_age_min: 22,
-    preferred_age_max: 30,
-    preferences: {
-      non_smoker: true,
-      students: true,
-      stable_job: false,
-      immediate_entry: false,
-    },
-    display_option: 'images',
-    main_image_url: IMG.apt2,
-    additional_image_urls: [IMG.apt],
-    description:
-      'סטודנטית מחפשת שותפה לדירת 4 חדרים שקטה. קרוב לאוניברסיטת בר-אילן, תחבורה ציבורית מצוינת, כולל מכונת כביסה.',
-  },
+  // 3 — שותפים / 5 — BnB: regular-user only — do not seed broker ads here.
 
   // 4 — גלובל
   {
@@ -244,79 +190,6 @@ const ADS = [
     additional_image_urls: [IMG.global],
     description:
       'וילה חדשה 4 חדרים במרחק 300 מטר מהים. מתאימה לתושבי חוזר / נופש. אפשרות לקבלת תוכניות EU.',
-  },
-
-  // 5 — BnB
-  {
-    category: 5,
-    property_type: 'B&B',
-    project_name: 'בית המעיינות — מושב לכיש',
-    address: 'המסיק 140, מושב לכיש',
-    purpose: 'rent',
-    price_per_night: 850,
-    price: 850,
-    area: 120,
-    rooms: 3,
-    floor: 1,
-    condition: 'renovated',
-    hospitality_nature: 'with_pool',
-    cancellation_policy: 'without_penalty',
-    hot_deal: true,
-    display_option: 'images',
-    feed_display_priority: 'mainImage',
-    main_image_url: IMG.bnb,
-    additional_image_urls: [IMG.bnb2, IMG.apt],
-    description:
-      'צימור חווייתי עם בריכה מחוממת וארוחת בוקר עשירה. 3 חדרי אירוח, מתאים למשפחות. מרגלות יער עופר.',
-    service_facility: {
-      selected: 'pool',
-      pool: true,
-      wifi_internet: true,
-      kitchen: true,
-      suitable_for_animals: true,
-    },
-    accommodation_offers: {
-      check_in_date: '2026-06-01',
-      check_out_date: '2026-09-30',
-      guest_count: 6,
-    },
-    general_details: {
-      bnb_host_type: 'private',
-      hospitality_natures: {with_pool: true, nature: true, rural: true},
-    },
-    amenities: amenities(2),
-  },
-  {
-    category: 5,
-    property_type: 'B&B',
-    project_name: 'סוויטת ים — נתניה',
-    address: 'הרצל 88, נתניה',
-    purpose: 'rent',
-    price_per_night: 620,
-    price: 620,
-    area: 75,
-    rooms: 2,
-    floor: 5,
-    condition: 'renovated',
-    hospitality_nature: 'on_the_beach',
-    cancellation_policy: 'partial_refund',
-    display_option: 'images',
-    main_image_url: IMG.bnb2,
-    additional_image_urls: [IMG.bnb],
-    description:
-      'סוויטה מול הים עם מרפסת ונוף רחב על הים. 2 חדרים, מיטה זוגית + ספת נפתחת, מטבחון מאובזר. כניסה מיידית.',
-    service_facility: {
-      selected: 'wifi_internet',
-      wifi_internet: true,
-      tv: true,
-      private_shower: true,
-      suitable_for_smokers: false,
-    },
-    general_details: {
-      bnb_host_type: 'business',
-      hospitality_natures: {on_the_beach: true, landscapes: true},
-    },
-    amenities: amenities(1, {sea_view: true}),
   },
 
   // 6 — מגזר דתי
