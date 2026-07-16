@@ -162,6 +162,49 @@ function hashPassword(password) {
   return `${salt}:${hash}`;
 }
 
+const EMAIL_ALREADY_REGISTERED_HE =
+  'כתובת המייל כבר רשומה במערכת. התחבר עם המייל הקיים או השתמש במייל אחר.';
+
+function normalizeSubscriptionEmail(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function isValidSubscriptionEmail(emailNorm) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm);
+}
+
+/** First subscription row for an email (any type / status). */
+async function findSubscriptionByEmail(email) {
+  const emailNorm = normalizeSubscriptionEmail(email);
+  if (!isValidSubscriptionEmail(emailNorm)) return null;
+  const {data, error} = await supabase
+    .from('subscriptions')
+    .select('id, email, subscription_type, status')
+    .ilike('email', emailNorm)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function assertEmailAvailableForRegistration(email) {
+  const existing = await findSubscriptionByEmail(email);
+  if (existing) {
+    const err = new Error(EMAIL_ALREADY_REGISTERED_HE);
+    err.statusCode = 409;
+    err.code = 'EMAIL_ALREADY_EXISTS';
+    throw err;
+  }
+}
+
+function registrationEmailTakenResponse(res) {
+  return res.status(409).json({
+    success: false,
+    error: EMAIL_ALREADY_REGISTERED_HE,
+    code: 'EMAIL_ALREADY_EXISTS',
+  });
+}
+
 function generateTemporaryPassword(length = 12) {
   const chars =
     'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$';
@@ -1118,6 +1161,23 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       }
     }
 
+    const emailNorm = normalizeSubscriptionEmail(email);
+    if (!isValidSubscriptionEmail(emailNorm)) {
+      return res.status(400).json({
+        success: false,
+        error: 'כתובת מייל לא תקינה',
+      });
+    }
+
+    try {
+      await assertEmailAvailableForRegistration(emailNorm);
+    } catch (emailErr) {
+      if (emailErr.statusCode === 409) {
+        return registrationEmailTakenResponse(res);
+      }
+      throw emailErr;
+    }
+
     // Upload files to Supabase Storage (or use profile_picture_url if already uploaded at stage 1)
     const fileUrls = {};
     if (profile_picture_url && typeof profile_picture_url === 'string' && profile_picture_url.trim()) {
@@ -1251,7 +1311,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
     // Ensure subscription_type is preserved correctly for all 3 flows: broker, company, professional
     const subscriptionData = {
       subscription_type: subscriptionType, // 'broker', 'company', or 'professional' - PRESERVED
-      email,
+      email: emailNorm,
       phone: phone || officePhone,
       name: name || agentName || businessName || contactPersonName, // Use name, agentName, businessName, or contactPersonName
       business_name: businessName || brokerOfficeName, // For broker: brokerOfficeName, for others: businessName
@@ -1315,7 +1375,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       deferVerificationEmail === '1';
 
     if (!shouldDeferEmail) {
-      await sendVerificationEmail(email, verificationCode, subscriptionType);
+      await sendVerificationEmail(emailNorm, verificationCode, subscriptionType);
     }
 
     if (subscription.video_url && muxVideo.isVideoUrl(subscription.video_url)) {
@@ -1965,6 +2025,28 @@ app.post('/api/auth/forgot-password', handleForgotPasswordByEmail);
 // Legacy route — same forgot-password behavior
 app.post('/api/subscription/recover-subscriber-code', handleForgotPasswordByEmail);
 
+app.get('/api/subscription/email-available', async (req, res) => {
+  try {
+    const emailNorm = normalizeSubscriptionEmail(req.query?.email);
+    if (!isValidSubscriptionEmail(emailNorm)) {
+      return res.status(400).json({
+        success: false,
+        available: false,
+        error: 'כתובת מייל לא תקינה',
+      });
+    }
+    const existing = await findSubscriptionByEmail(emailNorm);
+    return res.json({success: true, available: !existing});
+  } catch (err) {
+    console.error('[subscription/email-available]', err);
+    return res.status(500).json({
+      success: false,
+      available: false,
+      error: err?.message || 'Unexpected error',
+    });
+  }
+});
+
 // POST /api/users/register-regular – upsert a regular (subscription_type='user') verified subscription by email
 // Returns the existing or newly created subscription so the client always gets a real UUID `id`.
 app.post('/api/users/register-regular', async (req, res) => {
@@ -2013,6 +2095,11 @@ app.post('/api/users/register-regular', async (req, res) => {
     }
 
     if (existing) {
+      // Explicit registration (password provided) — email must be unique.
+      if (password.length >= MIN_PASSWORD_LENGTH) {
+        return registrationEmailTakenResponse(res);
+      }
+
       // Promote/refresh fields if needed but keep a stable UUID id.
       const updates = {};
       if (existing.status !== 'verified') updates.status = 'verified';
@@ -2187,39 +2274,7 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     if (existing) {
-      const updates = {};
-      if (existing.status !== 'verified' && existing.status !== 'active') {
-        updates.status = 'verified';
-      }
-      if (!existing.subscription_type) updates.subscription_type = 'user';
-      if (name && !existing.name) updates.name = name;
-      if (profilePictureUrl && !existing.profile_picture_url) {
-        updates.profile_picture_url = profilePictureUrl;
-      }
-      if (!existing.verified_at) updates.verified_at = new Date().toISOString();
-
-      if (Object.keys(updates).length > 0) {
-        const {data: updated, error: updErr} = await supabase
-          .from('subscriptions')
-          .update(updates)
-          .eq('id', existing.id)
-          .select('*')
-          .maybeSingle();
-        if (updErr) {
-          console.warn('[auth/google] update warn:', updErr.message);
-        }
-        return res.json({
-          success: true,
-          subscription: sanitizeSubscriptionForClient(updated || existing),
-          created: false,
-        });
-      }
-
-      return res.json({
-        success: true,
-        subscription: sanitizeSubscriptionForClient(existing),
-        created: false,
-      });
+      return registrationEmailTakenResponse(res);
     }
 
     const insertRow = {
