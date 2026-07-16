@@ -4466,56 +4466,50 @@ app.get('/api/follows/hub', async (req, res) => {
       if (error) return res.status(500).json({ success: false, error: error.message });
       relationRows = data || [];
     } else if (tab === 'following') {
-      const [{ data: followRows, error: fErr }, { data: pendingRows, error: pErr }] =
-        await Promise.all([
-          supabase
-            .from('user_follows')
-            .select('following_subscription_id, created_at')
-            .eq('follower_subscription_id', userId)
-            .order('created_at', { ascending: false }),
-          supabase
-            .from('user_follow_requests')
-            .select('id, target_subscription_id, created_at')
-            .eq('requester_subscription_id', userId)
-            .eq('status', 'pending')
-            .order('created_at', { ascending: false }),
-        ]);
+      const { data: followRows, error: fErr } = await supabase
+        .from('user_follows')
+        .select('following_subscription_id, created_at')
+        .eq('follower_subscription_id', userId)
+        .order('created_at', { ascending: false });
       if (fErr) {
         return res.status(500).json({ success: false, error: fErr.message });
       }
-      if (pErr) {
-        return res.status(500).json({ success: false, error: pErr.message });
+      relationRows = (followRows || []).map(r => ({
+        following_subscription_id: r.following_subscription_id,
+        created_at: r.created_at,
+        pending_request_id: null,
+      }));
+      // Only the account owner sees unapproved outgoing requests in "עוקב".
+      if (viewerId === userId) {
+        const { data: pendingRows, error: pErr } = await supabase
+          .from('user_follow_requests')
+          .select('id, target_subscription_id, created_at')
+          .eq('requester_subscription_id', userId)
+          .eq('status', 'pending')
+          .order('created_at', { ascending: false });
+        if (pErr) {
+          return res.status(500).json({ success: false, error: pErr.message });
+        }
+        const byTarget = new Map();
+        relationRows.forEach(r => {
+          const id = String(r.following_subscription_id || '');
+          if (id) byTarget.set(id, r);
+        });
+        (pendingRows || []).forEach(r => {
+          if (!r?.target_subscription_id) return;
+          const id = String(r.target_subscription_id);
+          if (!byTarget.has(id)) {
+            byTarget.set(id, {
+              following_subscription_id: r.target_subscription_id,
+              created_at: r.created_at,
+              pending_request_id: r.id,
+            });
+          }
+        });
+        relationRows = [...byTarget.values()].sort(
+          (a, b) => new Date(b.created_at) - new Date(a.created_at),
+        );
       }
-      const byTarget = new Map();
-      (followRows || []).forEach(r => {
-        if (!r?.following_subscription_id) {
-          return;
-        }
-        const id = String(r.following_subscription_id);
-        if (!byTarget.has(id)) {
-          byTarget.set(id, {
-            following_subscription_id: r.following_subscription_id,
-            created_at: r.created_at,
-            pending_request_id: null,
-          });
-        }
-      });
-      (pendingRows || []).forEach(r => {
-        if (!r?.target_subscription_id) {
-          return;
-        }
-        const id = String(r.target_subscription_id);
-        if (!byTarget.has(id)) {
-          byTarget.set(id, {
-            following_subscription_id: r.target_subscription_id,
-            created_at: r.created_at,
-            pending_request_id: r.id,
-          });
-        }
-      });
-      relationRows = [...byTarget.values()].sort(
-        (a, b) => new Date(b.created_at) - new Date(a.created_at),
-      );
     } else {
       const { data, error } = await supabase
         .from('user_follow_requests')
@@ -6061,15 +6055,15 @@ app.get('/api/companies/directory', async (req, res) => {
   }
 });
 
-// GET /api/professionals/directory — professional subscriptions for home "חפשו עוד"
+// GET /api/professionals/directory — professionals + brokers for "בעלי מקצוע בתחום הנדל״ן"
 app.get('/api/professionals/directory', async (req, res) => {
   try {
     const { data: rows, error } = await supabase
       .from('subscriptions')
       .select(
-        'id, email, name, contact_person_name, business_name, business_address, description, profile_picture_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, types, status, updated_at',
+        'id, email, name, contact_person_name, business_name, broker_office_name, business_address, description, profile_picture_url, company_logo_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, activity_regions, types, subscription_type, status, updated_at',
       )
-      .eq('subscription_type', 'professional')
+      .in('subscription_type', ['professional', 'broker'])
       .in('status', ['verified', 'active'])
       .order('updated_at', { ascending: false });
 
@@ -6136,19 +6130,36 @@ app.get('/api/professionals/directory', async (req, res) => {
     };
 
     const professionals = list.map(row => {
-      const displayName =
-        (row.name && String(row.name).trim()) ||
-        (row.business_name && String(row.business_name).trim()) ||
-        (row.contact_person_name && String(row.contact_person_name).trim()) ||
-        'בעל מקצוע';
-      const specializations = parseJsonArray(row.specializations);
-      const types = parseJsonArray(row.types);
+      const subType = String(row.subscription_type || '')
+        .trim()
+        .toLowerCase();
+      const isBroker = subType === 'broker';
+      const displayName = isBroker
+        ? (row.broker_office_name && String(row.broker_office_name).trim()) ||
+          (row.name && String(row.name).trim()) ||
+          (row.contact_person_name && String(row.contact_person_name).trim()) ||
+          (row.business_name && String(row.business_name).trim()) ||
+          'מתווך'
+        : (row.name && String(row.name).trim()) ||
+          (row.business_name && String(row.business_name).trim()) ||
+          (row.contact_person_name && String(row.contact_person_name).trim()) ||
+          'בעל מקצוע';
+      // Pros: סוג = types, tags = התמחויות.
+      // Brokers: סוג = מתווך, tags = אזורי פעילות (same chip row as specialties).
+      const types = isBroker ? ['מתווך'] : parseJsonArray(row.types);
+      const specializations = isBroker
+        ? parseJsonArray(row.activity_regions)
+        : parseJsonArray(row.specializations);
+      const activityRegions = parseJsonArray(row.activity_regions);
+      const avatarUrl =
+        asPublicImageUrl(row.profile_picture_url) ||
+        asPublicImageUrl(row.company_logo_url);
       return {
         id: row.id,
         email: row.email || null,
-        subscription_type: 'professional',
+        subscription_type: isBroker ? 'broker' : 'professional',
         display_name: displayName,
-        profile_image_url: asPublicImageUrl(row.profile_picture_url),
+        profile_image_url: avatarUrl,
         video_url: asPublicImageUrl(row.video_url),
         video_hls_url: row.video_hls_url || null,
         video_playback_url: muxVideo.resolveSubscriptionPlaybackUrl(row),
@@ -6156,6 +6167,7 @@ app.get('/api/professionals/directory', async (req, res) => {
         address: row.business_address && String(row.business_address).trim() ? String(row.business_address).trim() : null,
         bio: row.description && String(row.description).trim() ? String(row.description).trim() : null,
         specializations,
+        activity_regions: activityRegions,
         types,
         listing_count: listingCountBySub[row.id] || 0,
         average_rating: ratingBySub[row.id] != null ? Number(ratingBySub[row.id]) : 5,
