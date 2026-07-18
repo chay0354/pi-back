@@ -205,6 +205,14 @@ function registrationEmailTakenResponse(res) {
   });
 }
 
+/** Postgres unique_violation (e.g. subscriptions_email_unique_ci). */
+function isUniqueEmailViolation(err) {
+  if (!err) return false;
+  if (err.code === '23505') return true;
+  const msg = String(err.message || '');
+  return /subscriptions_email_unique_ci|duplicate key.*email/i.test(msg);
+}
+
 function generateTemporaryPassword(length = 12) {
   const chars =
     'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$';
@@ -1348,6 +1356,9 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
 
     if (dbError) {
       console.error('Database error:', dbError);
+      if (isUniqueEmailViolation(dbError)) {
+        return registrationEmailTakenResponse(res);
+      }
       return res.status(500).json({ 
         success: false, 
         error: 'Failed to save subscription data',
@@ -2183,6 +2194,9 @@ app.post('/api/users/register-regular', async (req, res) => {
 
     if (insertErr) {
       console.error('[users/register-regular] insert error:', insertErr);
+      if (isUniqueEmailViolation(insertErr)) {
+        return registrationEmailTakenResponse(res);
+      }
       return res.status(500).json({ success: false, error: insertErr.message });
     }
 
@@ -2294,6 +2308,9 @@ app.post('/api/auth/google', async (req, res) => {
 
     if (insertErr) {
       console.error('[auth/google] insert error:', insertErr);
+      if (isUniqueEmailViolation(insertErr)) {
+        return registrationEmailTakenResponse(res);
+      }
       return res.status(500).json({success: false, error: insertErr.message});
     }
 
@@ -2349,6 +2366,162 @@ app.get('/api/subscription/:id', async (req, res) => {
   }
 });
 
+const STORY_ACTIVE_MS = 48 * 60 * 60 * 1000;
+
+function normalizeMediaUrl(url) {
+  const s = url != null ? String(url).trim() : '';
+  return s || null;
+}
+
+/** If profile video changed, update matching active story rows (same URL, still within 48h). */
+async function syncActiveStoriesWithOldProfileVideo(
+  supabaseClient,
+  subscriptionId,
+  oldVideoUrl,
+  newVideoUrl,
+) {
+  const oldUrl = normalizeMediaUrl(oldVideoUrl);
+  const newUrl = normalizeMediaUrl(newVideoUrl);
+  if (!oldUrl || !newUrl || oldUrl === newUrl) return { updated: 0 };
+
+  const storyCutoff = new Date(Date.now() - STORY_ACTIVE_MS).toISOString();
+  const subId = String(subscriptionId).trim();
+
+  try {
+    const { data: rows, error } = await supabaseClient
+      .from('stories')
+      .select('id, media_url')
+      .eq('subscription_id', subId)
+      .gte('created_at', storyCutoff);
+
+    if (error) {
+      console.error('[syncActiveStoriesWithOldProfileVideo]', error);
+      return { updated: 0, error: error.message };
+    }
+
+    const matching = (rows || []).filter(
+      (row) => normalizeMediaUrl(row.media_url) === oldUrl,
+    );
+    if (matching.length === 0) return { updated: 0 };
+
+    let updated = 0;
+    for (const row of matching) {
+      const storyUpdates = {
+        media_url: newUrl,
+        media_hls_url: null,
+        mux_asset_id: null,
+        mux_playback_id: null,
+        video_status: muxVideo.isVideoUrl(newUrl) ? 'processing' : null,
+      };
+      const { error: upErr } = await supabaseClient
+        .from('stories')
+        .update(storyUpdates)
+        .eq('id', row.id);
+      if (upErr) {
+        console.error(
+          '[syncActiveStoriesWithOldProfileVideo] update',
+          row.id,
+          upErr,
+        );
+        continue;
+      }
+      updated += 1;
+      if (muxVideo.isVideoUrl(newUrl)) {
+        muxVideo.scheduleVideoProcessing(
+          supabaseClient,
+          'story',
+          row.id,
+          newUrl,
+        );
+      }
+    }
+    return { updated };
+  } catch (err) {
+    console.error('[syncActiveStoriesWithOldProfileVideo]', err);
+    return { updated: 0, error: err.message };
+  }
+}
+
+/**
+ * When תמונה מכירתית changes:
+ * - remove previous active story slide(s) that used the old image
+ * - update companion feed posts that still point at the old image URL
+ *
+ * The new story is created by the client on ad save (createSalesImageStory)
+ * so it appears as a fresh slide with a new 48h window.
+ */
+async function syncSalesImageMirrors(
+  supabaseClient,
+  subscriptionId,
+  oldSalesUrl,
+  newSalesUrl,
+) {
+  const oldUrl = normalizeMediaUrl(oldSalesUrl);
+  const newUrl = normalizeMediaUrl(newSalesUrl);
+  if (!oldUrl || !newUrl || oldUrl === newUrl) {
+    return { storiesRemoved: 0, postsUpdated: 0 };
+  }
+
+  const subId = String(subscriptionId || '').trim();
+  if (!subId) return { storiesRemoved: 0, postsUpdated: 0 };
+
+  let storiesRemoved = 0;
+  let postsUpdated = 0;
+
+  try {
+    const storyCutoff = new Date(Date.now() - STORY_ACTIVE_MS).toISOString();
+    const { data: storyRows, error: storyErr } = await supabaseClient
+      .from('stories')
+      .select('id, media_url')
+      .eq('subscription_id', subId)
+      .gte('created_at', storyCutoff);
+
+    if (storyErr) {
+      console.error('[syncSalesImageMirrors] stories query:', storyErr);
+    } else {
+      const matchingOld = (storyRows || []).filter(
+        (row) => normalizeMediaUrl(row.media_url) === oldUrl,
+      );
+      for (const row of matchingOld) {
+        const { error: delErr } = await supabaseClient
+          .from('stories')
+          .delete()
+          .eq('id', row.id);
+        if (!delErr) storiesRemoved += 1;
+        else {
+          console.error('[syncSalesImageMirrors] story delete', row.id, delErr);
+        }
+      }
+    }
+
+    const { data: postRows, error: postErr } = await supabaseClient
+      .from('ads')
+      .select('id, main_image_url')
+      .eq('subscription_id', subId)
+      .eq('feed_post', true)
+      .eq('main_image_url', oldUrl);
+
+    if (postErr) {
+      console.error('[syncSalesImageMirrors] posts query:', postErr);
+    } else {
+      for (const row of postRows || []) {
+        const { error: upErr } = await supabaseClient
+          .from('ads')
+          .update({ main_image_url: newUrl })
+          .eq('id', row.id);
+        if (!upErr) postsUpdated += 1;
+        else {
+          console.error('[syncSalesImageMirrors] post update', row.id, upErr);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[syncSalesImageMirrors]', err);
+  }
+
+  return { storiesRemoved, postsUpdated };
+}
+
 /** Profile fields a user may edit from the "edit profile" screen (all account types). */
 const EDITABLE_SUBSCRIPTION_FIELDS = [
   'name',
@@ -2377,6 +2550,34 @@ app.patch('/api/subscription/:id', async (req, res) => {
     }
 
     const body = req.body || {};
+    const wantsVideoUpdate = Object.prototype.hasOwnProperty.call(body, 'video_url');
+    let existingForVideo = null;
+
+    if (wantsVideoUpdate) {
+      const { data: existing, error: fetchErr } = await supabase
+        .from('subscriptions')
+        .select('id, subscription_type, video_url')
+        .eq('id', String(id).trim())
+        .maybeSingle();
+
+      if (fetchErr || !existing) {
+        return res.status(404).json({
+          success: false,
+          error: 'Subscription not found',
+        });
+      }
+
+      const subType = String(existing.subscription_type || '').toLowerCase();
+      if (subType !== 'broker' && subType !== 'professional') {
+        return res.status(403).json({
+          success: false,
+          error:
+            'Profile video can only be updated for broker or professional accounts',
+        });
+      }
+      existingForVideo = existing;
+    }
+
     const updates = {};
     for (const key of EDITABLE_SUBSCRIPTION_FIELDS) {
       if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
@@ -2386,6 +2587,27 @@ app.patch('/api/subscription/:id', async (req, res) => {
         if (value === '') value = null;
       }
       updates[key] = value;
+    }
+
+    if (wantsVideoUpdate) {
+      let newVideo = body.video_url;
+      if (typeof newVideo === 'string') {
+        newVideo = newVideo.trim() || null;
+      } else if (newVideo != null) {
+        newVideo = String(newVideo).trim() || null;
+      } else {
+        newVideo = null;
+      }
+      updates.video_url = newVideo;
+
+      const oldUrl = normalizeMediaUrl(existingForVideo.video_url);
+      if (newVideo !== oldUrl) {
+        updates.video_hls_url = null;
+        updates.mux_asset_id = null;
+        updates.mux_playback_id = null;
+        updates.video_status =
+          newVideo && muxVideo.isVideoUrl(newVideo) ? 'processing' : null;
+      }
     }
 
     if (Object.keys(updates).length === 0) {
@@ -2406,6 +2628,27 @@ app.patch('/api/subscription/:id', async (req, res) => {
         success: false,
         error: updateError?.message || 'Failed to update profile',
       });
+    }
+
+    if (wantsVideoUpdate && existingForVideo) {
+      const oldUrl = normalizeMediaUrl(existingForVideo.video_url);
+      const newUrl = normalizeMediaUrl(updated.video_url);
+      if (oldUrl && newUrl && oldUrl !== newUrl) {
+        await syncActiveStoriesWithOldProfileVideo(
+          supabase,
+          updated.id,
+          oldUrl,
+          newUrl,
+        );
+      }
+      if (newUrl && newUrl !== oldUrl && muxVideo.isVideoUrl(newUrl)) {
+        muxVideo.scheduleVideoProcessing(
+          supabase,
+          'subscription',
+          updated.id,
+          newUrl,
+        );
+      }
     }
 
     res.json({ success: true, subscription: sanitizeSubscriptionForClient(updated) });
@@ -4696,21 +4939,33 @@ app.get('/api/reviews', async (req, res) => {
     }
 
     const reviews = rows || [];
-    const needEnrich = reviews.filter(r => r.reviewer_subscription_id && (!r.reviewer_name || !r.reviewer_image_url));
-    if (needEnrich.length > 0) {
-      const ids = [...new Set(needEnrich.map(r => r.reviewer_subscription_id))];
+    const reviewerIds = [
+      ...new Set(
+        reviews
+          .map(r => r.reviewer_subscription_id)
+          .filter(Boolean)
+          .map(id => String(id).trim()),
+      ),
+    ];
+    if (reviewerIds.length > 0) {
       const { data: subs } = await supabase
         .from('subscriptions')
         .select('id, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url')
-        .in('id', ids);
+        .in('id', reviewerIds);
       const byId = {};
       (subs || []).forEach(s => { byId[s.id] = s; });
       reviews.forEach(r => {
         if (!r.reviewer_subscription_id) return;
         const sub = byId[r.reviewer_subscription_id];
+        if (!sub) return;
         const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
         if (name && !r.reviewer_name) r.reviewer_name = name;
         if (imageUrl && !r.reviewer_image_url) r.reviewer_image_url = imageUrl;
+        if (sub.subscription_type) {
+          r.reviewer_subscription_type = String(sub.subscription_type)
+            .trim()
+            .toLowerCase();
+        }
       });
     }
     res.json({ success: true, reviews });
@@ -6145,8 +6400,8 @@ app.get('/api/professionals/directory', async (req, res) => {
           (row.contact_person_name && String(row.contact_person_name).trim()) ||
           'בעל מקצוע';
       // Pros: סוג = types, tags = התמחויות.
-      // Brokers: סוג = מתווך, tags = אזורי פעילות (same chip row as specialties).
-      const types = isBroker ? ['מתווך'] : parseJsonArray(row.types);
+      // Brokers: סוג = תיווך, tags = אזורי פעילות (same chip row as specialties).
+      const types = isBroker ? ['תיווך'] : parseJsonArray(row.types);
       const specializations = isBroker
         ? parseJsonArray(row.activity_regions)
         : parseJsonArray(row.specializations);
@@ -8722,7 +8977,7 @@ app.put('/api/listings/:id', async (req, res) => {
     const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
     const { data: existingAd } = await supabase
       .from('ads')
-      .select('video_url')
+      .select('video_url, sales_image_url, subscription_id')
       .eq('id', id)
       .maybeSingle();
     const { data: ad, error: updateError } = await supabase
@@ -8765,6 +9020,22 @@ app.put('/api/listings/:id', async (req, res) => {
           console.error('[mux] ad update processing failed:', muxErr.message);
         }
       }
+    }
+
+    const prevSales = normalizeMediaUrl(existingAd?.sales_image_url);
+    const nextSales = normalizeMediaUrl(ad.sales_image_url);
+    if (
+      prevSales &&
+      nextSales &&
+      prevSales !== nextSales &&
+      ad.subscription_id
+    ) {
+      await syncSalesImageMirrors(
+        supabase,
+        ad.subscription_id,
+        prevSales,
+        nextSales,
+      );
     }
 
     res.status(200).json({
@@ -8844,7 +9115,9 @@ app.patch('/api/listings/:id', async (req, res) => {
 });
 
 // DELETE /api/listings/:id — remove an ad/post owned by the current user.
-// Query: user_email (required). Cleans related likes/comments/boosts then deletes the ad row.
+// Query: user_email (required), subscription_id (optional — logged-in account).
+// One email can map to multiple subscriptions; ownership matches ANY of them
+// (or the explicit subscription_id if it belongs to that email).
 app.delete('/api/listings/:id', async (req, res) => {
   try {
     const id = req.params.id != null ? String(req.params.id).trim() : '';
@@ -8858,11 +9131,30 @@ app.delete('/api/listings/:id', async (req, res) => {
         : typeof req.body?.user_email === 'string'
           ? req.body.user_email.trim()
           : '';
-    const subscriptionId = await resolveSubscriptionIdByEmail(userEmail);
-    if (!subscriptionId) {
+    const preferredSubRaw =
+      typeof req.query.subscription_id === 'string'
+        ? req.query.subscription_id.trim()
+        : typeof req.body?.subscription_id === 'string'
+          ? req.body.subscription_id.trim()
+          : '';
+    const preferredSubId = LISTING_AD_UUID_RE.test(preferredSubRaw)
+      ? preferredSubRaw
+      : '';
+
+    const emailSubIds = await resolveSubscriptionIdsByEmail(userEmail);
+    if (!emailSubIds.length) {
       return res.status(400).json({
         success: false,
         error: 'user_email invalid or not a subscription',
+      });
+    }
+
+    // If client sends the logged-in subscription_id, it must belong to this email
+    // (prevents deleting with someone else's sub id + a shared/guessed email).
+    if (preferredSubId && !emailSubIds.includes(preferredSubId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Not allowed to delete this listing',
       });
     }
 
@@ -8878,11 +9170,8 @@ app.delete('/api/listings/:id', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Listing not found' });
     }
 
-    const subStr = String(subscriptionId);
-    const ownsAd =
-      (ad.subscription_id != null && String(ad.subscription_id) === subStr) ||
-      (ad.owner_id != null && String(ad.owner_id).trim() === subStr);
-    if (!ownsAd) {
+    // Own if ad belongs to ANY subscription on this email (multi-account).
+    if (!listingOwnedBySubscriptionIds(ad, emailSubIds)) {
       return res.status(403).json({
         success: false,
         error: 'Not allowed to delete this listing',
@@ -9083,15 +9372,37 @@ function currentMonthStartIso() {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
 }
 
-async function resolveSubscriptionIdByEmail(emailRaw) {
+/**
+ * All subscription UUIDs for an email (one email can have multiple accounts:
+ * user + broker + company, etc.). Used for ownership checks.
+ */
+async function resolveSubscriptionIdsByEmail(emailRaw) {
   const email = normEmail(emailRaw);
-  if (!email) return null;
-  const { data } = await supabase
+  if (!email) return [];
+  const { data, error } = await supabase
     .from('subscriptions')
     .select('id')
-    .ilike('email', email)
-    .maybeSingle();
-  return data?.id || null;
+    .ilike('email', email);
+  if (error) {
+    console.warn('resolveSubscriptionIdsByEmail:', error.message || error);
+    return [];
+  }
+  return [...new Set((data || []).map(r => String(r.id).trim()).filter(Boolean))];
+}
+
+/** First subscription id for an email (legacy helpers). Prefer resolveSubscriptionIdsByEmail for authz. */
+async function resolveSubscriptionIdByEmail(emailRaw) {
+  const ids = await resolveSubscriptionIdsByEmail(emailRaw);
+  return ids[0] || null;
+}
+
+/** True if ad.subscription_id or ad.owner_id is in the caller's subscription id set. */
+function listingOwnedBySubscriptionIds(ad, subscriptionIds) {
+  if (!ad || !subscriptionIds?.length) return false;
+  const idSet = new Set(subscriptionIds.map(id => String(id).trim()).filter(Boolean));
+  const sub = ad.subscription_id != null ? String(ad.subscription_id).trim() : '';
+  const owner = ad.owner_id != null ? String(ad.owner_id).trim() : '';
+  return (sub && idSet.has(sub)) || (owner && idSet.has(owner));
 }
 
 // GET /api/listings/boost-quota?user_email=...
