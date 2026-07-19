@@ -2496,18 +2496,26 @@ async function syncSalesImageMirrors(
 
     const { data: postRows, error: postErr } = await supabaseClient
       .from('ads')
-      .select('id, main_image_url')
+      .select('id, main_image_url, video_url')
       .eq('subscription_id', subId)
-      .eq('feed_post', true)
-      .eq('main_image_url', oldUrl);
+      .eq('feed_post', true);
 
     if (postErr) {
       console.error('[syncSalesImageMirrors] posts query:', postErr);
     } else {
-      for (const row of postRows || []) {
+      const matchingPosts = (postRows || []).filter(
+        (row) =>
+          normalizeMediaUrl(row.main_image_url) === oldUrl ||
+          normalizeMediaUrl(row.video_url) === oldUrl,
+      );
+      for (const row of matchingPosts) {
+        const matchedImage = normalizeMediaUrl(row.main_image_url) === oldUrl;
+        const updates = matchedImage
+          ? { main_image_url: newUrl }
+          : { video_url: newUrl };
         const { error: upErr } = await supabaseClient
           .from('ads')
-          .update({ main_image_url: newUrl })
+          .update(updates)
           .eq('id', row.id);
         if (!upErr) postsUpdated += 1;
         else {
@@ -6073,12 +6081,26 @@ app.get('/api/stories/feed', async (req, res) => {
     const storyCutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
     const storiesBySubId = new Map();
     try {
-      const { data: storyRows, error: storyErr } = await supabase
+      let storyRows = null;
+      let storyErr = null;
+      ({ data: storyRows, error: storyErr } = await supabase
         .from('stories')
-        .select('id, subscription_id, media_url, media_hls_url, video_status, created_at')
+        .select(
+          'id, subscription_id, media_url, media_hls_url, video_status, created_at, general_details',
+        )
         .gte('created_at', storyCutoff)
         .order('created_at', { ascending: false })
-        .limit(2000);
+        .limit(2000));
+      if (storyErr && /general_details/i.test(String(storyErr.message || ''))) {
+        ({ data: storyRows, error: storyErr } = await supabase
+          .from('stories')
+          .select(
+            'id, subscription_id, media_url, media_hls_url, video_status, created_at',
+          )
+          .gte('created_at', storyCutoff)
+          .order('created_at', { ascending: false })
+          .limit(2000));
+      }
       if (!storyErr && storyRows) {
         for (const row of storyRows) {
           const sid = row.subscription_id;
@@ -6166,6 +6188,7 @@ app.get('/api/stories/feed', async (req, res) => {
           ...storyMedia,
           media_type: storyMediaTypeFromUrl(storyMedia.media_url),
           kind: 'story',
+          general_details: st.general_details || null,
         });
       }
       if (slides.length === 0) continue;
@@ -6209,10 +6232,14 @@ app.get('/api/stories/feed', async (req, res) => {
   }
 });
 
-// POST /api/stories — body: { subscription_id, media_url }
+// POST /api/stories — body: { subscription_id, media_url, general_details? }
 app.post('/api/stories', async (req, res) => {
   try {
-    const { subscription_id: subscriptionId, media_url: mediaUrl } = req.body || {};
+    const {
+      subscription_id: subscriptionId,
+      media_url: mediaUrl,
+      general_details: generalDetails,
+    } = req.body || {};
     const sid = subscriptionId && String(subscriptionId).trim();
     const url = mediaUrl && String(mediaUrl).trim();
     if (!sid || !url) {
@@ -6222,11 +6249,30 @@ app.post('/api/stories', async (req, res) => {
       });
     }
 
-    const { data, error } = await supabase
+    const insertRow = { subscription_id: sid, media_url: url };
+    if (generalDetails && typeof generalDetails === 'object') {
+      insertRow.general_details = generalDetails;
+    }
+
+    let { data, error } = await supabase
       .from('stories')
-      .insert([{ subscription_id: sid, media_url: url }])
+      .insert([insertRow])
       .select()
       .single();
+
+    // Older DBs without general_details column — retry media-only insert.
+    if (
+      error &&
+      insertRow.general_details &&
+      /general_details/i.test(String(error.message || ''))
+    ) {
+      delete insertRow.general_details;
+      ({ data, error } = await supabase
+        .from('stories')
+        .insert([insertRow])
+        .select()
+        .single());
+    }
 
     if (error) {
       console.error('POST /api/stories:', error);
@@ -9036,6 +9082,31 @@ app.put('/api/listings/:id', async (req, res) => {
         prevSales,
         nextSales,
       );
+    }
+    // Older companion posts were created with the ad's description, which the
+    // feed then drew as text on the post. Normalize them to a neutral caption.
+    if (nextSales && ad.subscription_id) {
+      try {
+        const { data: mirrorPosts } = await supabase
+          .from('ads')
+          .select('id, main_image_url, video_url, description')
+          .eq('subscription_id', String(ad.subscription_id).trim())
+          .eq('feed_post', true);
+        const staleCaption = (mirrorPosts || []).filter(
+          (row) =>
+            (normalizeMediaUrl(row.main_image_url) === nextSales ||
+              normalizeMediaUrl(row.video_url) === nextSales) &&
+            String(row.description || '').trim() !== 'פוסט',
+        );
+        for (const row of staleCaption) {
+          await supabase
+            .from('ads')
+            .update({ description: 'פוסט' })
+            .eq('id', row.id);
+        }
+      } catch (descErr) {
+        console.error('[sales-image] companion post caption cleanup:', descErr);
+      }
     }
 
     res.status(200).json({
