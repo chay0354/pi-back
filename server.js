@@ -387,6 +387,34 @@ const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KE
 // Configure multer for file uploads (in-memory storage)
 const upload = multer({ storage: multer.memoryStorage() });
 
+const CHAT_MEDIA_TYPES = new Set(['image', 'audio', 'file']);
+
+function normalizeChatMediaType(raw) {
+  const t = raw != null ? String(raw).trim().toLowerCase() : '';
+  return CHAT_MEDIA_TYPES.has(t) ? t : '';
+}
+
+function isAllowedChatUploadMime(mime) {
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('image/') || m.startsWith('audio/')) return true;
+  if (m.startsWith('text/')) return true;
+  if (m === 'application/pdf') return true;
+  if (
+    m.includes('word') ||
+    m.includes('excel') ||
+    m.includes('spreadsheet') ||
+    m.includes('powerpoint') ||
+    m.includes('presentation') ||
+    m.includes('zip') ||
+    m.includes('json') ||
+    m.includes('csv')
+  ) {
+    return true;
+  }
+  // iOS document picker often reports generic octet-stream.
+  return m === 'application/octet-stream';
+}
+
 // Helper function to send verification email
 const sendVerificationEmail = async (email, verificationCode, subscriptionType) => {
   const typeNames = {
@@ -3925,7 +3953,7 @@ app.post('/api/chat/group-messages', async (req, res) => {
     const bodyRaw = req.body.body != null ? String(req.body.body).trim() : '';
     const mediaTypeRaw = req.body.media_type != null ? String(req.body.media_type).trim().toLowerCase() : '';
     const mediaUrlRaw = req.body.media_url != null ? String(req.body.media_url).trim() : '';
-    const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'audio' ? mediaTypeRaw : '';
+    const mediaType = normalizeChatMediaType(mediaTypeRaw);
     const mediaUrl = mediaUrlRaw;
     const listingIdRaw = req.body.listing_id != null ? String(req.body.listing_id).trim() : '';
     const listingIdForMessage =
@@ -8043,7 +8071,7 @@ app.post('/api/chat/messages', async (req, res) => {
     const body = bodyRaw;
     const mediaTypeRaw = req.body.media_type != null ? String(req.body.media_type).trim().toLowerCase() : '';
     const mediaUrlRaw = req.body.media_url != null ? String(req.body.media_url).trim() : '';
-    const mediaType = mediaTypeRaw === 'image' || mediaTypeRaw === 'audio' ? mediaTypeRaw : '';
+    const mediaType = normalizeChatMediaType(mediaTypeRaw);
     const mediaUrl = mediaUrlRaw;
     const receiverDisplayName = req.body.receiver_display_name != null ? String(req.body.receiver_display_name).trim() || null : null;
     const receiverProfilePictureUrl = req.body.receiver_profile_picture_url != null ? String(req.body.receiver_profile_picture_url).trim() || null : null;
@@ -8065,7 +8093,7 @@ app.post('/api/chat/messages', async (req, res) => {
       return res.status(400).json({ success: false, error: 'body or media_url required' });
     }
     if (mediaUrl && !mediaType) {
-      return res.status(400).json({ success: false, error: 'media_type must be image or audio when media_url is set' });
+      return res.status(400).json({ success: false, error: 'media_type must be image, audio, or file when media_url is set' });
     }
     if (mediaType && !mediaUrl) {
       return res.status(400).json({ success: false, error: 'media_url required when media_type is set' });
@@ -9798,7 +9826,7 @@ app.post('/api/listings/:id/boost', async (req, res) => {
 
 // ==================== FILE UPLOAD ENDPOINTS ====================
 
-// Chat images / voice: bucket "chat" (public read recommended for getPublicUrl)
+// Chat images / voice / documents: bucket "chat" (public read recommended for getPublicUrl)
 app.post('/api/chat/upload-media', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -9808,8 +9836,8 @@ app.post('/api/chat/upload-media', upload.single('file'), async (req, res) => {
       return res.status(503).json({ success: false, error: 'Server upload not configured.' });
     }
     const mime = (req.file.mimetype || '').toLowerCase();
-    if (!mime.startsWith('image/') && !mime.startsWith('audio/')) {
-      return res.status(400).json({ success: false, error: 'Only image or audio files are allowed.' });
+    if (!isAllowedChatUploadMime(mime)) {
+      return res.status(400).json({ success: false, error: 'File type not allowed for chat upload.' });
     }
     const fromName = (req.file.originalname || '').match(/\.([a-zA-Z0-9]+)$/)?.[1];
     const guessExt =
