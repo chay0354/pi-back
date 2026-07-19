@@ -8,7 +8,9 @@
     "dev": "nodemon server.js",
     "who-texted": "node scripts/who-texted-who.js",
     "list-regular-users": "node scripts/list-regular-users.js",
-    "backfill-mux-videos": "node scripts/backfill-mux-videos.js"
+    "backfill-mux-videos": "node scripts/backfill-mux-videos.js",
+    "migrate:pending": "node scripts/run-pending-migrations.js",
+    "probe:schema": "node scripts/probe-schema.js"
   },
   "keywords": [],
   "author": "",

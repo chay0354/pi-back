@@ -2331,7 +2331,62 @@ const SUBSCRIPTION_SELECT =
   'business_name, contact_person_name, company_id, office_phone, mobile_phone, company_website, ' +
   'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
   'profile_picture_url, company_logo_url, video_url, additional_images_urls, ' +
-  'specializations, activity_regions, types, description, phone, created_at, updated_at';
+  'specializations, activity_regions, types, description, phone, ' +
+  'block_exclusive_offers, block_collab_offers, ' +
+  'created_at, updated_at';
+
+const CHAT_OFFER_PREFERENCE_FIELDS = [
+  'block_exclusive_offers',
+  'block_collab_offers',
+];
+
+function isMissingBlockOffersColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  const code = String((err && err.code) || '');
+  return (
+    (/block_exclusive_offers/i.test(msg) || /block_collab_offers/i.test(msg)) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
+}
+
+async function loadReceiverOfferBlocks(receiverEmail) {
+  const email = normEmail(receiverEmail);
+  if (!email) {
+    return { blockExclusive: false, blockCollab: false };
+  }
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('block_exclusive_offers, block_collab_offers')
+    .ilike('email', email)
+    .maybeSingle();
+  if (error) {
+    if (isMissingBlockOffersColumnError(error)) {
+      return { blockExclusive: false, blockCollab: false };
+    }
+    console.warn('[chat] loadReceiverOfferBlocks:', error.message);
+    return { blockExclusive: false, blockCollab: false };
+  }
+  return {
+    blockExclusive: data?.block_exclusive_offers === true,
+    blockCollab: data?.block_collab_offers === true,
+  };
+}
+
+async function assertReceiverAllowsOffer(receiverEmail, offerKind) {
+  if (!offerKind) return null;
+  const blocks = await loadReceiverOfferBlocks(receiverEmail);
+  if (offerKind === 'exclusive' && blocks.blockExclusive) {
+    return 'המשתמש הזה חסם הצעות לבלעדיות';
+  }
+  if (offerKind === 'collab' && blocks.blockCollab) {
+    return 'המשתמש הזה חסם הצעות לשת"פ';
+  }
+  return null;
+}
 app.get('/api/subscription/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -2595,6 +2650,13 @@ app.patch('/api/subscription/:id', async (req, res) => {
         if (value === '') value = null;
       }
       updates[key] = value;
+    }
+
+    for (const key of CHAT_OFFER_PREFERENCE_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
+      const raw = body[key];
+      updates[key] =
+        raw === true || raw === 'true' || raw === 1 || raw === '1';
     }
 
     if (wantsVideoUpdate) {
@@ -2866,13 +2928,9 @@ app.get('/api/users/group-picker', async (req, res) => {
 
     const isRegularType = (st) => {
       const t = st != null ? String(st).trim().toLowerCase() : '';
-      if (!t) return true;
-      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+      return t !== 'broker' && t !== 'company' && t !== 'professional';
     };
-    const isNonRegularType = (st) => {
-      const t = st != null ? String(st).trim().toLowerCase() : '';
-      return t === 'broker' || t === 'company' || t === 'professional';
-    };
+    const isNonRegularType = (st) => !isRegularType(st);
     const typeLabel = (st) => {
       const t = st != null ? String(st).trim().toLowerCase() : '';
       if (t === 'broker') return 'מתווך';
@@ -2937,7 +2995,7 @@ app.get('/api/users/group-picker', async (req, res) => {
         id: sub.id || email,
         email,
         title,
-        subtitle: typeLabel(sub.subscription_type),
+        subtitle: audience === 'regular' ? '' : typeLabel(sub.subscription_type),
         profileImageUrl: imageUrl || null,
         subscriptionType:
           sub.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null,
@@ -3115,26 +3173,61 @@ app.post('/api/chat/groups', async (req, res) => {
         : null;
     const isRegularType = (st) => {
       const t = st != null ? String(st).trim().toLowerCase() : '';
-      if (!t) return true;
-      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+      return t !== 'broker' && t !== 'company' && t !== 'professional';
     };
     const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
 
     if (!creator) return res.status(400).json({ success: false, error: 'creator_email required' });
     if (memberEmails.length < 1) return res.status(400).json({ success: false, error: 'At least one member required' });
 
-    // Rule 1: only brokers can open any group.
-    const { data: creatorSub, error: creatorErr } = await supabase
-      .from('subscriptions')
-      .select('email, subscription_type')
-      .ilike('email', creator)
-      .limit(1)
-      .maybeSingle();
-    if (creatorErr) {
-      return res.status(500).json({ success: false, error: creatorErr.message });
+    const creatorSubIdRaw =
+      req.body.creator_subscription_id != null
+        ? String(req.body.creator_subscription_id).trim()
+        : '';
+
+    // Rule 1: brokers can open any group; regular users can open regular (customers) groups only.
+    let creatorSub = null;
+    if (creatorSubIdRaw && LISTING_AD_UUID_RE.test(creatorSubIdRaw)) {
+      const byId = await supabase
+        .from('subscriptions')
+        .select('email, subscription_type')
+        .eq('id', creatorSubIdRaw)
+        .maybeSingle();
+      if (byId.error) {
+        return res.status(500).json({ success: false, error: byId.error.message });
+      }
+      creatorSub = byId.data || null;
     }
-    if (!isBrokerType(creatorSub?.subscription_type)) {
-      return res.status(403).json({ success: false, error: 'רק מתווכים יכולים לפתוח קבוצות' });
+    if (!creatorSub) {
+      const { data: byEmail, error: creatorErr } = await supabase
+        .from('subscriptions')
+        .select('email, subscription_type')
+        .ilike('email', creator)
+        .limit(1)
+        .maybeSingle();
+      if (creatorErr) {
+        return res.status(500).json({ success: false, error: creatorErr.message });
+      }
+      creatorSub = byEmail || null;
+    }
+    if (
+      creatorSub?.email &&
+      normEmail(creatorSub.email) !== creator &&
+      creatorSubIdRaw &&
+      LISTING_AD_UUID_RE.test(creatorSubIdRaw)
+    ) {
+      return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
+    }
+    const creatorIsBroker = isBrokerType(creatorSub?.subscription_type);
+    const creatorIsRegular = isRegularType(creatorSub?.subscription_type);
+    if (!creatorIsBroker && !creatorIsRegular) {
+      return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
+    }
+    if (!creatorIsBroker && kind === 'brokers') {
+      return res.status(403).json({
+        success: false,
+        error: 'משתמשים רגילים יכולים לפתוח רק קבוצה רגילה',
+      });
     }
 
     // Rule 2: enforce allowed member types by group kind.
@@ -3162,7 +3255,12 @@ app.post('/api/chat/groups', async (req, res) => {
       });
     }
 
-    const defaultTitle = kind === 'brokers' ? 'קבוצת מתווכים' : 'קבוצת לקוחות';
+    const defaultTitle =
+      kind === 'brokers'
+        ? 'קבוצת מתווכים'
+        : creatorIsBroker
+          ? 'קבוצת לקוחות'
+          : 'קבוצה';
     const title = titleIn || defaultTitle;
 
     const insertRow = { type: 'group', title };
@@ -3253,8 +3351,7 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     const memberEmails = [...new Set(rawMembers.map(normEmail).filter(Boolean))];
     const isRegularType = (st) => {
       const t = st != null ? String(st).trim().toLowerCase() : '';
-      if (!t) return true;
-      return t === 'user' || t === 'private' || t === 'regular' || t === 'customer';
+      return t !== 'broker' && t !== 'company' && t !== 'professional';
     };
     const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
 
@@ -3277,8 +3374,10 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
       .limit(1)
       .maybeSingle();
     if (actorErr) return res.status(500).json({ success: false, error: actorErr.message });
-    if (!isBrokerType(actorSub?.subscription_type)) {
-      return res.status(403).json({ success: false, error: 'Only brokers can add members to groups' });
+    const actorIsBroker = isBrokerType(actorSub?.subscription_type);
+    const actorIsRegular = isRegularType(actorSub?.subscription_type);
+    if (!actorIsBroker && !actorIsRegular) {
+      return res.status(403).json({ success: false, error: 'אין הרשאה להוסיף חברים לקבוצה' });
     }
 
     const { data: parts, error: partsErr } = await supabase
@@ -3300,6 +3399,14 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     });
     const currentKind =
       currentEmails.some((e) => isRegularType(currentTypeByEmail.get(e))) ? 'customers' : 'brokers';
+
+    // Regular users may only manage regular (customers) groups.
+    if (!actorIsBroker && currentKind === 'brokers') {
+      return res.status(403).json({
+        success: false,
+        error: 'משתמשים רגילים יכולים להוסיף חברים רק לקבוצה רגילה',
+      });
+    }
 
     const targetMembers = memberEmails.filter((e) => !existingMembers.includes(e));
     if (targetMembers.length === 0) {
@@ -3323,8 +3430,8 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
         success: false,
         error:
           currentKind === 'brokers'
-            ? 'In broker groups, only brokers can be added'
-            : 'In regular groups, only regular users can be added',
+            ? 'בקבוצת מתווכים ניתן לצרף רק מתווכים'
+            : 'בקבוצה רגילה ניתן לצרף רק משתמשים רגילים',
       });
     }
 
@@ -6698,8 +6805,17 @@ const CHAT_LISTING_CATEGORY_LABELS = {
 const CHAT_LISTING_ID_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Matches Pi Chat exclusive-offer template body — sync with pi-front ChatScreen EXCLUSIVE_OFFER_BODY_MARKER */
+/** Matches Pi Chat offer templates — sync with pi-front ChatScreen markers */
 const CHAT_EXCLUSIVE_OFFER_BODY_MARKER = 'להציע בלעדיות על הנכס';
+/** Broker→broker collaboration offer (same workflow, different copy). */
+const CHAT_COLLAB_OFFER_BODY_MARKER = 'להציע שיתוף פעולה על הנכס';
+
+function chatOfferKindFromBody(body) {
+  const text = String(body || '');
+  if (text.includes(CHAT_COLLAB_OFFER_BODY_MARKER)) return 'collab';
+  if (text.includes(CHAT_EXCLUSIVE_OFFER_BODY_MARKER)) return 'exclusive';
+  return null;
+}
 
 function isMissingExclusiveOfferTableError(err) {
   const msg = String((err && err.message) || (err && err.details) || err || '');
@@ -6716,9 +6832,15 @@ function isMissingExclusiveOfferTableError(err) {
 }
 
 async function upsertExclusiveOfferPending(supabase, { convId, body, listingId, brokerEmail, ownerEmail }) {
-  if (!convId || !listingId || !body || !String(body).includes(CHAT_EXCLUSIVE_OFFER_BODY_MARKER)) return;
-  const monthsMatch = String(body).match(/בתוך\s+(\d+)\s+חודשים/);
-  const months = monthsMatch ? parseInt(monthsMatch[1], 10) : null;
+  const offerKind = chatOfferKindFromBody(body);
+  if (!convId || !listingId || !body || !offerKind) return;
+  const bodyText = String(body);
+  const monthsMatch = bodyText.match(/בתוך\s+(\d+)\s+חודשים/);
+  let months = monthsMatch ? parseInt(monthsMatch[1], 10) : null;
+  // Singular Hebrew: "בתוך חודש" = 1 month (sale/rent templates).
+  if (!Number.isFinite(months) && /בתוך\s+חודש/.test(bodyText)) {
+    months = 1;
+  }
   const row = {
     conversation_id: convId,
     listing_id: listingId,
@@ -6726,9 +6848,19 @@ async function upsertExclusiveOfferPending(supabase, { convId, body, listingId, 
     owner_email: ownerEmail,
     status: 'pending',
     months_committed: Number.isFinite(months) ? months : null,
+    offer_kind: offerKind,
     updated_at: new Date().toISOString(),
   };
-  const r = await supabase.from('chat_exclusive_offers').upsert(row, { onConflict: 'conversation_id' });
+  let r = await supabase.from('chat_exclusive_offers').upsert(row, { onConflict: 'conversation_id' });
+  // Older DBs without offer_kind — retry without that column.
+  if (
+    r.error &&
+    /offer_kind/i.test(String(r.error.message || '')) &&
+    !isMissingExclusiveOfferTableError(r.error)
+  ) {
+    delete row.offer_kind;
+    r = await supabase.from('chat_exclusive_offers').upsert(row, { onConflict: 'conversation_id' });
+  }
   if (r.error && !isMissingExclusiveOfferTableError(r.error)) {
     console.warn('[chat] exclusive offer upsert:', r.error.message);
   }
@@ -6965,11 +7097,32 @@ app.get('/api/chat/conversations', async (req, res) => {
     });
 
     let offerStatusByConvId = {};
-    const eoList = await supabase.from('chat_exclusive_offers').select('conversation_id, status').in('conversation_id', convIds);
+    let offerKindByConvId = {};
+    const eoList = await supabase
+      .from('chat_exclusive_offers')
+      .select('conversation_id, status, offer_kind')
+      .in('conversation_id', convIds);
     if (!eoList.error && eoList.data) {
       eoList.data.forEach((r) => {
         offerStatusByConvId[r.conversation_id] = r.status;
+        const kind = String(r.offer_kind || '').trim().toLowerCase();
+        offerKindByConvId[r.conversation_id] =
+          kind === 'collab' ? 'collab' : 'exclusive';
       });
+    } else if (
+      eoList.error &&
+      /offer_kind/i.test(String(eoList.error.message || ''))
+    ) {
+      const eoFallback = await supabase
+        .from('chat_exclusive_offers')
+        .select('conversation_id, status')
+        .in('conversation_id', convIds);
+      if (!eoFallback.error && eoFallback.data) {
+        eoFallback.data.forEach((r) => {
+          offerStatusByConvId[r.conversation_id] = r.status;
+          offerKindByConvId[r.conversation_id] = 'exclusive';
+        });
+      }
     } else if (eoList.error && !isMissingExclusiveOfferTableError(eoList.error)) {
       console.warn('GET /api/chat/conversations exclusive offers:', eoList.error.message);
     }
@@ -7324,6 +7477,7 @@ app.get('/api/chat/conversations', async (req, res) => {
         listingDisplayNumber,
         listingCategoryLabel,
         exclusiveOfferStatus: offerStatusByConvId[c.id] || null,
+        exclusiveOfferKind: offerKindByConvId[c.id] || null,
         unreadCount: unreadByConvId[c.id] || 0,
       };
     }));
@@ -7538,20 +7692,42 @@ app.get('/api/chat/participant-display', async (req, res) => {
       const byEmail = await supabase
         .from('subscriptions')
         .select(
-          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone, block_exclusive_offers, block_collab_offers',
         )
         .ilike('email', userRef)
         .maybeSingle();
-      sub = byEmail.data || null;
+      if (byEmail.error && isMissingBlockOffersColumnError(byEmail.error)) {
+        const fallback = await supabase
+          .from('subscriptions')
+          .select(
+            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+          )
+          .ilike('email', userRef)
+          .maybeSingle();
+        sub = fallback.data || null;
+      } else {
+        sub = byEmail.data || null;
+      }
     } else if (CHAT_UUID_RE.test(userRef)) {
       const byId = await supabase
         .from('subscriptions')
         .select(
-          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone, block_exclusive_offers, block_collab_offers',
         )
         .eq('id', userRef)
         .maybeSingle();
-      sub = byId.data || null;
+      if (byId.error && isMissingBlockOffersColumnError(byId.error)) {
+        const fallback = await supabase
+          .from('subscriptions')
+          .select(
+            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+          )
+          .eq('id', userRef)
+          .maybeSingle();
+        sub = fallback.data || null;
+      } else {
+        sub = byId.data || null;
+      }
     }
     if (sub) {
       const type = (sub.subscription_type || '').toLowerCase();
@@ -7569,6 +7745,8 @@ app.get('/api/chat/participant-display', async (req, res) => {
         profileImageUrl: profileImageUrl || null,
         phone: phone || null,
         subscription_type: type || null,
+        block_exclusive_offers: sub.block_exclusive_offers === true,
+        block_collab_offers: sub.block_collab_offers === true,
       });
     }
 
@@ -7677,6 +7855,15 @@ app.get('/api/chat/messages', async (req, res) => {
 
     markChatConversationRead(myEmail, sharedConvId);
 
+    let peerOfferBlocks = null;
+    if (otherRefRaw) {
+      const blocks = await loadReceiverOfferBlocks(otherRefRaw);
+      peerOfferBlocks = {
+        blockExclusiveOffers: blocks.blockExclusive,
+        blockCollabOffers: blocks.blockCollab,
+      };
+    }
+
     let list;
     let exclusiveOfferOut = null;
     try {
@@ -7690,6 +7877,9 @@ app.get('/api/chat/messages', async (req, res) => {
       ]);
       list = messages;
       if (!eoRes.error && eoRes.data) {
+        const kindRaw = String(eoRes.data.offer_kind || '')
+          .trim()
+          .toLowerCase();
         exclusiveOfferOut = {
           conversationId: sharedConvId,
           status: eoRes.data.status,
@@ -7701,6 +7891,7 @@ app.get('/api/chat/messages', async (req, res) => {
               : null,
           listingId:
             eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
+          offerKind: kindRaw === 'collab' ? 'collab' : 'exclusive',
         };
       } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
         console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
@@ -7718,6 +7909,7 @@ app.get('/api/chat/messages', async (req, res) => {
       messages: list,
       conversation_id: sharedConvId,
       exclusiveOffer: exclusiveOfferOut,
+      peerOfferBlocks,
     });
   } catch (err) {
     console.error('GET /api/chat/messages:', err);
@@ -7877,6 +8069,14 @@ app.post('/api/chat/messages', async (req, res) => {
     }
     if (mediaType && !mediaUrl) {
       return res.status(400).json({ success: false, error: 'media_url required when media_type is set' });
+    }
+
+    const offerKind = chatOfferKindFromBody(body);
+    if (offerKind) {
+      const blockedMsg = await assertReceiverAllowsOffer(receiverEmail, offerKind);
+      if (blockedMsg) {
+        return res.status(403).json({ success: false, error: blockedMsg });
+      }
     }
 
     let convId = null;
