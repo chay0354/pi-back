@@ -34,5 +34,21 @@ ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS group_image_url TEXT NUL
 -- migration-chat-group-description.sql
 ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS group_description TEXT NULL;
 
+-- migration-chat-messages-realtime.sql (fixes ChatScreen CHANNEL_ERROR)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public'
+      AND tablename = 'chat_messages'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.chat_messages;
+  END IF;
+END $$;
+
+ALTER TABLE public.chat_messages REPLICA IDENTITY FULL;
+
 -- Refresh PostgREST schema cache
 NOTIFY pgrst, 'reload schema';
