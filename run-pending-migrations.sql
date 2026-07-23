@@ -8,6 +8,15 @@ ALTER TABLE stories
 COMMENT ON COLUMN stories.general_details IS
   'Optional post_text_overlays payload for live text on story media (mainly video).';
 
+-- migration-stories-24h-expiry.sql
+CREATE INDEX IF NOT EXISTS stories_created_at_idx ON stories (created_at DESC);
+
+COMMENT ON TABLE stories IS
+  'Ephemeral story slides (24h TTL). Feed hides and deletes rows older than 24h.';
+
+DELETE FROM stories
+WHERE created_at < NOW() - INTERVAL '24 hours';
+
 -- migration-chat-exclusive-offer-kind.sql
 ALTER TABLE chat_exclusive_offers
   ADD COLUMN IF NOT EXISTS offer_kind TEXT DEFAULT 'exclusive';

@@ -2449,14 +2449,124 @@ app.get('/api/subscription/:id', async (req, res) => {
   }
 });
 
-const STORY_ACTIVE_MS = 48 * 60 * 60 * 1000;
+const STORY_ACTIVE_MS = 24 * 60 * 60 * 1000;
+
+function storyActiveCutoffIso() {
+  return new Date(Date.now() - STORY_ACTIVE_MS).toISOString();
+}
 
 function normalizeMediaUrl(url) {
   const s = url != null ? String(url).trim() : '';
   return s || null;
 }
 
-/** If profile video changed, update matching active story rows (same URL, still within 48h). */
+/**
+ * Hard-delete story slides older than 24h (all kinds: post, sales image, profile mirror).
+ * Safe to call often — feed/create paths invoke it so expiry is not filter-only.
+ */
+async function purgeExpiredStories(supabaseClient = supabase) {
+  const cutoff = storyActiveCutoffIso();
+  try {
+    const { error, count } = await supabaseClient
+      .from('stories')
+      .delete({ count: 'exact' })
+      .lt('created_at', cutoff);
+    if (error) {
+      console.error('[purgeExpiredStories]', error.message || error);
+      return { deleted: 0, error: error.message };
+    }
+    return { deleted: count || 0 };
+  } catch (err) {
+    console.error('[purgeExpiredStories]', err);
+    return { deleted: 0, error: err?.message };
+  }
+}
+
+/** Create or refresh a 24h story slide for a profile intro video. */
+async function ensureProfileVideoStory(supabaseClient, subscriptionId, videoUrl) {
+  const subId = String(subscriptionId || '').trim();
+  const url = normalizeMediaUrl(videoUrl);
+  if (!subId || !url) return null;
+
+  const cutoff = storyActiveCutoffIso();
+  try {
+    const { data: existing } = await supabaseClient
+      .from('stories')
+      .select('id, media_url, created_at')
+      .eq('subscription_id', subId)
+      .gte('created_at', cutoff)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    const match = (existing || []).find(
+      (row) => normalizeMediaUrl(row.media_url) === url,
+    );
+    if (match) return match;
+
+    const { data: inserted, error } = await supabaseClient
+      .from('stories')
+      .insert([{ subscription_id: subId, media_url: url }])
+      .select()
+      .single();
+    if (error) {
+      console.error('[ensureProfileVideoStory]', error);
+      return null;
+    }
+    if (inserted?.id && muxVideo.isVideoUrl(url)) {
+      muxVideo.scheduleVideoProcessing(
+        supabaseClient,
+        'story',
+        inserted.id,
+        url,
+      );
+    }
+    return inserted;
+  } catch (err) {
+    console.error('[ensureProfileVideoStory]', err);
+    return null;
+  }
+}
+
+/** Remove active story slides that mirrored a profile video URL. */
+async function removeProfileVideoStories(
+  supabaseClient,
+  subscriptionId,
+  videoUrl,
+) {
+  const subId = String(subscriptionId || '').trim();
+  const url = normalizeMediaUrl(videoUrl);
+  if (!subId || !url) return { deleted: 0 };
+
+  const cutoff = storyActiveCutoffIso();
+  try {
+    const { data: rows, error } = await supabaseClient
+      .from('stories')
+      .select('id, media_url')
+      .eq('subscription_id', subId)
+      .gte('created_at', cutoff);
+    if (error) {
+      console.error('[removeProfileVideoStories]', error);
+      return { deleted: 0 };
+    }
+    const matching = (rows || []).filter(
+      (row) => normalizeMediaUrl(row.media_url) === url,
+    );
+    let deleted = 0;
+    for (const row of matching) {
+      const { error: delErr } = await supabaseClient
+        .from('stories')
+        .delete()
+        .eq('id', row.id);
+      if (!delErr) deleted += 1;
+    }
+    return { deleted };
+  } catch (err) {
+    console.error('[removeProfileVideoStories]', err);
+    return { deleted: 0 };
+  }
+}
+
+/** If profile video changed, update matching active story rows (same URL, still within 24h). */
 async function syncActiveStoriesWithOldProfileVideo(
   supabaseClient,
   subscriptionId,
@@ -2467,7 +2577,7 @@ async function syncActiveStoriesWithOldProfileVideo(
   const newUrl = normalizeMediaUrl(newVideoUrl);
   if (!oldUrl || !newUrl || oldUrl === newUrl) return { updated: 0 };
 
-  const storyCutoff = new Date(Date.now() - STORY_ACTIVE_MS).toISOString();
+  const storyCutoff = storyActiveCutoffIso();
   const subId = String(subscriptionId).trim();
 
   try {
@@ -2531,7 +2641,7 @@ async function syncActiveStoriesWithOldProfileVideo(
  * - update companion feed posts that still point at the old image URL
  *
  * The new story is created by the client on ad save (createSalesImageStory)
- * so it appears as a fresh slide with a new 48h window.
+ * so it appears as a fresh slide with a new 24h window.
  */
 async function syncSalesImageMirrors(
   supabaseClient,
@@ -2552,7 +2662,7 @@ async function syncSalesImageMirrors(
   let postsUpdated = 0;
 
   try {
-    const storyCutoff = new Date(Date.now() - STORY_ACTIVE_MS).toISOString();
+    const storyCutoff = storyActiveCutoffIso();
     const { data: storyRows, error: storyErr } = await supabaseClient
       .from('stories')
       .select('id, media_url')
@@ -2738,6 +2848,12 @@ app.patch('/api/subscription/:id', async (req, res) => {
           oldUrl,
           newUrl,
         );
+      }
+      if (newUrl && newUrl !== oldUrl) {
+        await ensureProfileVideoStory(supabase, updated.id, newUrl);
+      }
+      if (!newUrl && oldUrl) {
+        await removeProfileVideoStories(supabase, updated.id, oldUrl);
       }
       if (newUrl && newUrl !== oldUrl && muxVideo.isVideoUrl(newUrl)) {
         muxVideo.scheduleVideoProcessing(
@@ -3213,7 +3329,7 @@ app.post('/api/chat/groups', async (req, res) => {
         ? String(req.body.creator_subscription_id).trim()
         : '';
 
-    // Rule 1: brokers can open any group; regular users can open regular (customers) groups only.
+    // Rule 1: brokers — any group; companies — customer groups only; regular — regular only.
     let creatorSub = null;
     if (creatorSubIdRaw && LISTING_AD_UUID_RE.test(creatorSubIdRaw)) {
       const byId = await supabase
@@ -3246,15 +3362,19 @@ app.post('/api/chat/groups', async (req, res) => {
     ) {
       return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
     }
-    const creatorIsBroker = isBrokerType(creatorSub?.subscription_type);
+    const creatorType = String(creatorSub?.subscription_type || '')
+      .trim()
+      .toLowerCase();
+    const creatorIsBroker = creatorType === 'broker';
+    const creatorIsCompany = creatorType === 'company';
     const creatorIsRegular = isRegularType(creatorSub?.subscription_type);
-    if (!creatorIsBroker && !creatorIsRegular) {
+    if (!creatorIsBroker && !creatorIsRegular && !creatorIsCompany) {
       return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
     }
     if (!creatorIsBroker && kind === 'brokers') {
       return res.status(403).json({
         success: false,
-        error: 'משתמשים רגילים יכולים לפתוח רק קבוצה רגילה',
+        error: 'רק מתווכים יכולים לפתוח קבוצת מתווכים',
       });
     }
 
@@ -6204,7 +6324,7 @@ function storyMediaTypeFromUrl(url) {
 const SUBSCRIPTION_SELECT_STORY =
   'id, email, name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, video_url, video_hls_url, video_status, status, updated_at';
 
-// GET /api/stories/feed — strip: profile intro video + explicit story slides only.
+// GET /api/stories/feed — strip: profile intro + explicit story slides (all ≤24h).
 // TikTok feed posts (ads.feed_post) are never mirrored here.
 app.get('/api/stories/feed', async (req, res) => {
   try {
@@ -6213,7 +6333,10 @@ app.get('/api/stories/feed', async (req, res) => {
       Math.max(1, parseInt(String(req.query.limit || '80'), 10) || 80),
     );
 
-    const storyCutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    // Drop expired rows so they are removed, not only hidden.
+    await purgeExpiredStories();
+
+    const storyCutoff = storyActiveCutoffIso();
     const storiesBySubId = new Map();
     try {
       let storyRows = null;
@@ -6251,28 +6374,13 @@ app.get('/api/stories/feed', async (req, res) => {
 
     const idsFromStorySlides = [...storiesBySubId.keys()];
 
-    const { data: subsProfileVideo, error: profErr } = await supabase
-      .from('subscriptions')
-      .select(SUBSCRIPTION_SELECT_STORY)
-      .in('status', ['verified', 'active'])
-      .not('video_url', 'is', null)
-      .order('updated_at', { ascending: false })
-      .limit(2000);
-
-    if (profErr) {
-      console.error('GET /api/stories/feed (subscriptions profile video):', profErr);
-      return res.status(500).json({ success: false, error: profErr.message });
-    }
-
+    // Only load subscriptions that still have an active (≤24h) story slide.
+    // Profile intro videos are included only when mirrored as a stories row
+    // (created on upload) so they expire with everything else after 24h.
     const subById = new Map();
-    for (const s of subsProfileVideo || []) {
-      if (s?.id) subById.set(s.id, s);
-    }
-
     const chunkSize = 80;
-    const storyOnlySubIds = idsFromStorySlides.filter((id) => !subById.has(id));
-    for (let i = 0; i < storyOnlySubIds.length; i += chunkSize) {
-      const chunk = storyOnlySubIds.slice(i, i + chunkSize);
+    for (let i = 0; i < idsFromStorySlides.length; i += chunkSize) {
+      const chunk = idsFromStorySlides.slice(i, i + chunkSize);
       const { data: chunkSubs, error: chErr } = await supabase
         .from('subscriptions')
         .select(SUBSCRIPTION_SELECT_STORY)
@@ -6287,37 +6395,40 @@ app.get('/api/stories/feed', async (req, res) => {
       }
     }
 
-    const ringSubIds = [
-      ...new Set([...subById.keys(), ...storiesBySubId.keys()]),
-    ];
-
     const rings = [];
-    for (const sid of ringSubIds) {
+    for (const sid of idsFromStorySlides) {
       const s = subById.get(sid);
       if (!s) continue;
       const slides = [];
       const profileVideoUrl = storyHasVideoUrl(s.video_url)
         ? String(s.video_url).trim()
         : null;
-      if (profileVideoUrl) {
-        const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
-        if (profileMedia) {
-          slides.push({
-            id: `${s.id}-profile-video`,
-            ...profileMedia,
-            media_type: 'video',
-            kind: 'profile',
-          });
-        }
-      }
       const tableStories = storiesBySubId.get(s.id) || [];
+      let profileSlideAdded = false;
+
       for (const st of tableStories) {
         const storyUrl = st.media_url && String(st.media_url).trim();
         if (!storyUrl) continue;
-        // Profile intro already appears as kind:profile — skip duplicate story rows.
-        if (profileVideoUrl && storyUrl === profileVideoUrl) continue;
         const storyMedia = muxVideo.shapeStorySlideFields(st, 'story');
         if (!storyMedia) continue;
+
+        const isProfileMirror =
+          profileVideoUrl && storyUrl === profileVideoUrl && !profileSlideAdded;
+        if (isProfileMirror) {
+          profileSlideAdded = true;
+          const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
+          slides.push({
+            id: `${s.id}-profile-video`,
+            ...(profileMedia || storyMedia),
+            media_type: 'video',
+            kind: 'profile',
+          });
+          continue;
+        }
+
+        // Skip duplicate copies of the same profile video URL.
+        if (profileVideoUrl && storyUrl === profileVideoUrl) continue;
+
         slides.push({
           id: `${s.id}-story-${st.id}`,
           ...storyMedia,
@@ -6370,6 +6481,8 @@ app.get('/api/stories/feed', async (req, res) => {
 // POST /api/stories — body: { subscription_id, media_url, general_details? }
 app.post('/api/stories', async (req, res) => {
   try {
+    await purgeExpiredStories();
+
     const {
       subscription_id: subscriptionId,
       media_url: mediaUrl,
