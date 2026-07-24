@@ -8214,9 +8214,104 @@ app.post('/api/chat/messages', async (req, res) => {
 
     const offerKind = chatOfferKindFromBody(body);
     if (offerKind) {
+      if (!listingIdForMessage) {
+        return res.status(400).json({
+          success: false,
+          error: 'ניתן לשלוח הצעה רק מצ׳אט שנפתח ממודעה',
+        });
+      }
       const blockedMsg = await assertReceiverAllowsOffer(receiverEmail, offerKind);
       if (blockedMsg) {
         return res.status(403).json({ success: false, error: blockedMsg });
+      }
+
+      // Listing owner cannot send exclusivity / collab offers on their own ad.
+      const { data: offerAd } = await supabase
+        .from('ads')
+        .select('id, subscription_id, owner_id, email, creator_email')
+        .eq('id', listingIdForMessage)
+        .maybeSingle();
+      if (offerAd) {
+        const ownerSub = String(
+          offerAd.subscription_id || offerAd.owner_id || '',
+        )
+          .trim()
+          .toLowerCase();
+        const ownerEmail = normEmail(
+          offerAd.creator_email || offerAd.email || '',
+        );
+        const { data: senderSub } = await supabase
+          .from('subscriptions')
+          .select('id, email, subscription_type')
+          .ilike('email', senderEmail)
+          .limit(5);
+        let senderRows = Array.isArray(senderSub) ? senderSub : [];
+        if (senderRows.length === 0) {
+          const { data: byId } = await supabase
+            .from('subscriptions')
+            .select('id, email, subscription_type')
+            .eq('id', senderEmail)
+            .limit(1);
+          senderRows = Array.isArray(byId) ? byId : [];
+        }
+        const senderIsOwner = senderRows.some(s => {
+          const sid = String(s?.id || '')
+            .trim()
+            .toLowerCase();
+          const sem = normEmail(s?.email || '');
+          return (
+            (ownerSub && sid && sid === ownerSub) ||
+            (ownerEmail && sem && sem === ownerEmail)
+          );
+        });
+        if (senderIsOwner || (ownerEmail && senderEmail === ownerEmail)) {
+          return res.status(403).json({
+            success: false,
+            error: 'בעל המודעה לא יכול לשלוח הצעת שת״פ / בלעדיות',
+          });
+        }
+
+        // Company → broker collab is not allowed.
+        if (offerKind === 'collab') {
+          const senderType = String(
+            senderRows.find(s => normEmail(s?.email) === senderEmail)
+              ?.subscription_type ||
+              senderRows[0]?.subscription_type ||
+              '',
+          )
+            .trim()
+            .toLowerCase();
+          const { data: receiverByEmail } = await supabase
+            .from('subscriptions')
+            .select('id, email, subscription_type')
+            .ilike('email', receiverEmail)
+            .limit(5);
+          let receiverRows = Array.isArray(receiverByEmail)
+            ? receiverByEmail
+            : [];
+          if (receiverRows.length === 0) {
+            const { data: byId } = await supabase
+              .from('subscriptions')
+              .select('id, email, subscription_type')
+              .eq('id', receiverEmail)
+              .limit(1);
+            receiverRows = Array.isArray(byId) ? byId : [];
+          }
+          const receiverType = String(
+            receiverRows.find(s => normEmail(s?.email) === receiverEmail)
+              ?.subscription_type ||
+              receiverRows[0]?.subscription_type ||
+              '',
+          )
+            .trim()
+            .toLowerCase();
+          if (senderType === 'company' && receiverType === 'broker') {
+            return res.status(403).json({
+              success: false,
+              error: 'חברה לא יכולה לשלוח הצעת שת״פ למתווך',
+            });
+          }
+        }
       }
     }
 
@@ -10074,7 +10169,8 @@ app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req,
   }
 });
 
-// Signed upload URL — client PUTs the file directly to Supabase (avoids Vercel body-size limits for videos).
+// Signed upload URL — client PUTs the file directly to Supabase
+// (avoids Vercel ~4.5MB body-size limit for photos and videos).
 app.post('/api/upload/signed-url', async (req, res) => {
   try {
     if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
