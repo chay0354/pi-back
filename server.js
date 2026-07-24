@@ -1109,6 +1109,30 @@ async function finalizeSubscriptionVerification(subscription) {
     throw err;
   }
 
+  // Mirror profile intro video into stories (24h) once the account goes live.
+  // Signup only stores video_url; the client no longer creates this row.
+  try {
+    const subType = String(
+      updatedSubscription.subscription_type || fresh.subscription_type || '',
+    ).toLowerCase();
+    const videoUrl = normalizeMediaUrl(updatedSubscription.video_url);
+    if (
+      videoUrl &&
+      (subType === 'broker' || subType === 'professional')
+    ) {
+      await ensureProfileVideoStory(
+        supabase,
+        updatedSubscription.id,
+        videoUrl,
+      );
+    }
+  } catch (storyErr) {
+    console.error(
+      '[finalizeSubscriptionVerification] profile video story:',
+      storyErr?.message || storyErr,
+    );
+  }
+
   return { updatedSubscription, subscriberNumber };
 }
 
@@ -2849,7 +2873,9 @@ app.patch('/api/subscription/:id', async (req, res) => {
           newUrl,
         );
       }
-      if (newUrl && newUrl !== oldUrl) {
+      // Always mirror when a profile video is present — covers first upload,
+      // re-save after a missed create, and expired/missing story rows.
+      if (newUrl) {
         await ensureProfileVideoStory(supabase, updated.id, newUrl);
       }
       if (!newUrl && oldUrl) {
