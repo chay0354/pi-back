@@ -2485,16 +2485,17 @@ function normalizeMediaUrl(url) {
 }
 
 /**
- * Hard-delete story slides older than 24h (all kinds: post, sales image, profile mirror).
- * Safe to call often — feed/create paths invoke it so expiry is not filter-only.
+ * Bound story-table growth. Feed already hides rows older than 24h.
+ * Keep 24h–7d rows so ensureProfileVideoStory can see that a URL already
+ * had a story window and must not resurrect it after expiry.
  */
 async function purgeExpiredStories(supabaseClient = supabase) {
-  const cutoff = storyActiveCutoffIso();
+  const hardCutoff = new Date(Date.now() - 7 * STORY_ACTIVE_MS).toISOString();
   try {
     const { error, count } = await supabaseClient
       .from('stories')
       .delete({ count: 'exact' })
-      .lt('created_at', cutoff);
+      .lt('created_at', hardCutoff);
     if (error) {
       console.error('[purgeExpiredStories]', error.message || error);
       return { deleted: 0, error: error.message };
@@ -2506,7 +2507,10 @@ async function purgeExpiredStories(supabaseClient = supabase) {
   }
 }
 
-/** Create or refresh a 24h story slide for a profile intro video. */
+/** Create a 24h story slide for a newly uploaded profile intro video.
+ * Idempotent while active. Will not open another window for the same media_url
+ * after the previous 24h slide expired (prevents rings from "coming back").
+ */
 async function ensureProfileVideoStory(supabaseClient, subscriptionId, videoUrl) {
   const subId = String(subscriptionId || '').trim();
   const url = normalizeMediaUrl(videoUrl);
@@ -2514,18 +2518,26 @@ async function ensureProfileVideoStory(supabaseClient, subscriptionId, videoUrl)
 
   const cutoff = storyActiveCutoffIso();
   try {
-    const { data: existing } = await supabaseClient
+    // Include recently expired rows (kept until hard purge at 7d) so the same
+    // profile video cannot be mirrored again after its 24h window.
+    const { data: prior } = await supabaseClient
       .from('stories')
       .select('id, media_url, created_at')
       .eq('subscription_id', subId)
-      .gte('created_at', cutoff)
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(50);
 
-    const match = (existing || []).find(
+    const sameUrl = (prior || []).filter(
       (row) => normalizeMediaUrl(row.media_url) === url,
     );
-    if (match) return match;
+    const active = sameUrl.find(
+      (row) => new Date(row.created_at).getTime() >= Date.parse(cutoff),
+    );
+    if (active) return active;
+    if (sameUrl.length > 0) {
+      // Same file already had a story window — do not resurrect after expiry.
+      return null;
+    }
 
     const { data: inserted, error } = await supabaseClient
       .from('stories')
@@ -2873,9 +2885,9 @@ app.patch('/api/subscription/:id', async (req, res) => {
           newUrl,
         );
       }
-      // Always mirror when a profile video is present — covers first upload,
-      // re-save after a missed create, and expired/missing story rows.
-      if (newUrl) {
+      // Only open a new 24h story when the profile video URL actually changes.
+      // Do not recreate after expiry while the same video_url remains on the profile.
+      if (newUrl && newUrl !== oldUrl) {
         await ensureProfileVideoStory(supabase, updated.id, newUrl);
       }
       if (!newUrl && oldUrl) {

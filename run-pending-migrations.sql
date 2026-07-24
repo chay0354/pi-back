@@ -12,10 +12,12 @@ COMMENT ON COLUMN stories.general_details IS
 CREATE INDEX IF NOT EXISTS stories_created_at_idx ON stories (created_at DESC);
 
 COMMENT ON TABLE stories IS
-  'Ephemeral story slides (24h TTL). Feed hides and deletes rows older than 24h.';
+  'Ephemeral story slides (24h TTL). Feed hides rows older than 24h; hard-delete after 7d so profile mirrors are not resurrected.';
 
+-- Soft expiry is enforced in the API feed (24h). Keep a short history so the
+-- same profile video_url cannot open another story window after expiry.
 DELETE FROM stories
-WHERE created_at < NOW() - INTERVAL '24 hours';
+WHERE created_at < NOW() - INTERVAL '7 days';
 
 -- migration-chat-exclusive-offer-kind.sql
 ALTER TABLE chat_exclusive_offers
