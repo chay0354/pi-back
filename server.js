@@ -2374,26 +2374,326 @@ async function verifyGoogleIdToken(idToken) {
   };
 }
 
+function getAppleClientIds() {
+  const fromEnv = String(
+    process.env.APPLE_CLIENT_IDS || process.env.APPLE_BUNDLE_ID || '',
+  )
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+  // Default iOS bundle id for this app.
+  return ['com.pi.frontend'];
+}
+
+let appleJwks = null;
+function getAppleJwks() {
+  if (!appleJwks) {
+    const {createRemoteJWKSet} = require('jose');
+    appleJwks = createRemoteJWKSet(
+      new URL('https://appleid.apple.com/auth/keys'),
+    );
+  }
+  return appleJwks;
+}
+
+async function verifyAppleIdToken(idToken) {
+  const token = String(idToken || '').trim();
+  if (!token) {
+    throw new Error('Missing Apple identity token');
+  }
+  const {jwtVerify} = require('jose');
+  const audiences = getAppleClientIds();
+  let payload;
+  try {
+    ({payload} = await jwtVerify(token, getAppleJwks(), {
+      issuer: 'https://appleid.apple.com',
+      audience: audiences.length === 1 ? audiences[0] : audiences,
+    }));
+  } catch (err) {
+    throw new Error(err?.message || 'Invalid Apple token');
+  }
+  const sub = payload.sub ? String(payload.sub) : '';
+  if (!sub) {
+    throw new Error('Apple token missing subject');
+  }
+  const email = payload.email ? String(payload.email).trim().toLowerCase() : '';
+  const emailVerified =
+    payload.email_verified === true ||
+    payload.email_verified === 'true' ||
+    payload.email_verified === 1 ||
+    payload.email_verified === '1' ||
+    // Apple private-relay emails are treated as verified when present.
+    Boolean(email);
+  if (email && !emailVerified) {
+    throw new Error('Apple email is not verified');
+  }
+  return {
+    email: email || null,
+    sub,
+    emailVerified,
+  };
+}
+
+function isMissingAppleUserIdColumnError(err) {
+  const msg = String((err && err.message) || err || '');
+  return /apple_user_id/i.test(msg) && /does not exist|42703|schema cache|PGRST204/i.test(msg);
+}
+
+/**
+ * Shared create/sign-in path for Google / Apple regular users.
+ * providerExtras may include apple_user_id.
+ */
+async function upsertSocialRegularUser({
+  logTag,
+  emailNorm,
+  appleUserId = null,
+  name = null,
+  phoneFromClient = null,
+  businessAddress = null,
+  profilePictureUrl = null,
+  intent = 'register',
+  providerLabel = 'Google',
+}) {
+  let existing = null;
+  if (appleUserId) {
+    const {data: byApple, error: appleErr} = await supabase
+      .from('subscriptions')
+      .select('*')
+      .eq('apple_user_id', appleUserId)
+      .limit(1)
+      .maybeSingle();
+    if (appleErr && !isMissingAppleUserIdColumnError(appleErr)) {
+      console.error(`[${logTag}] apple lookup error:`, appleErr);
+      return {
+        status: 500,
+        body: {success: false, error: appleErr.message},
+      };
+    }
+    if (!appleErr) existing = byApple || null;
+  }
+
+  if (!existing && emailNorm) {
+    const {data: byEmail, error: emailErr} = await supabase
+      .from('subscriptions')
+      .select('*')
+      .ilike('email', emailNorm)
+      .limit(1)
+      .maybeSingle();
+    if (emailErr) {
+      console.error(`[${logTag}] email lookup error:`, emailErr);
+      return {
+        status: 500,
+        body: {success: false, error: emailErr.message},
+      };
+    }
+    existing = byEmail || null;
+  }
+
+  if (existing) {
+    const existingType = String(existing.subscription_type || '').trim();
+    if (existingType && existingType !== 'user') {
+      return {
+        status: 409,
+        body: {
+          success: false,
+          error: EMAIL_ALREADY_REGISTERED_HE,
+          code: 'EMAIL_ALREADY_EXISTS',
+        },
+      };
+    }
+
+    const extras = {};
+    if (name && !existing.name) extras.name = name;
+    if (phoneFromClient && !existing.phone) extras.phone = phoneFromClient;
+    if (businessAddress && !existing.business_address) {
+      extras.business_address = businessAddress;
+    }
+    if (profilePictureUrl && !existing.profile_picture_url) {
+      extras.profile_picture_url = profilePictureUrl;
+    }
+    if (appleUserId && !existing.apple_user_id) {
+      extras.apple_user_id = appleUserId;
+    }
+    if (emailNorm && !existing.email) extras.email = emailNorm;
+
+    let ready = await ensureRegularUserReady(existing, extras);
+    // If apple_user_id column is missing, the whole update is skipped — retry without it.
+    if (extras.apple_user_id && ready === existing) {
+      const {apple_user_id: _drop, ...withoutApple} = extras;
+      ready = await ensureRegularUserReady(existing, withoutApple);
+    }
+
+    console.log(`[${logTag}] existing regular user signed in`, {
+      id: ready?.id || null,
+    });
+    return {
+      status: 200,
+      body: {
+        success: true,
+        subscription: sanitizeSubscriptionForClient(ready),
+        created: false,
+      },
+    };
+  }
+
+  if (!emailNorm) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error:
+          intent === 'login'
+            ? 'לא נמצא חשבון. אנא הירשם תחילה עם Apple (בפעם הראשונה נדרש מייל).'
+            : 'Apple לא החזיר כתובת מייל. אפשר שיתוף מייל או נסה שוב.',
+      },
+    };
+  }
+
+  if (!phoneFromClient) {
+    if (intent === 'login') {
+      return {
+        status: 404,
+        body: {
+          success: false,
+          error: 'לא נמצא חשבון עם המייל הזה. אנא הירשם תחילה.',
+        },
+      };
+    }
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: `אנא הזן מספר טלפון לפני ההרשמה עם ${providerLabel}`,
+      },
+    };
+  }
+
+  const insertRow = {
+    subscription_type: 'user',
+    email: emailNorm,
+    name,
+    phone: phoneFromClient,
+    business_address: businessAddress,
+    profile_picture_url: profilePictureUrl,
+    status: 'verified',
+    verified_at: new Date().toISOString(),
+    subscriber_number: await generateUniqueSubscriberNumber(),
+    access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
+    max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
+  };
+  if (appleUserId) insertRow.apple_user_id = appleUserId;
+
+  let {data: inserted, error: insertErr} = await supabase
+    .from('subscriptions')
+    .insert(insertRow)
+    .select('*')
+    .single();
+
+  if (insertErr && isMissingAppleUserIdColumnError(insertErr) && insertRow.apple_user_id) {
+    delete insertRow.apple_user_id;
+    ({data: inserted, error: insertErr} = await supabase
+      .from('subscriptions')
+      .insert(insertRow)
+      .select('*')
+      .single());
+  }
+
+  if (insertErr) {
+    console.error(`[${logTag}] insert error:`, insertErr);
+    if (isUniqueEmailViolation(insertErr)) {
+      const {data: raced} = await supabase
+        .from('subscriptions')
+        .select('*')
+        .ilike('email', emailNorm)
+        .limit(1)
+        .maybeSingle();
+      if (raced && String(raced.subscription_type || '') === 'user') {
+        const readyRaced = await ensureRegularUserReady(raced, {
+          phone: phoneFromClient && !raced.phone ? phoneFromClient : undefined,
+          name: name && !raced.name ? name : undefined,
+          business_address:
+            businessAddress && !raced.business_address
+              ? businessAddress
+              : undefined,
+          profile_picture_url:
+            profilePictureUrl && !raced.profile_picture_url
+              ? profilePictureUrl
+              : undefined,
+          apple_user_id:
+            appleUserId && !raced.apple_user_id ? appleUserId : undefined,
+        });
+        return {
+          status: 200,
+          body: {
+            success: true,
+            subscription: sanitizeSubscriptionForClient(readyRaced),
+            created: false,
+          },
+        };
+      }
+      return {
+        status: 409,
+        body: {
+          success: false,
+          error: EMAIL_ALREADY_REGISTERED_HE,
+          code: 'EMAIL_ALREADY_EXISTS',
+        },
+      };
+    }
+    return {
+      status: 500,
+      body: {success: false, error: insertErr.message},
+    };
+  }
+
+  const ready = await ensureRegularUserReady(inserted);
+  console.log(`[${logTag}] created new subscription`, {
+    id: ready?.id || null,
+  });
+  return {
+    status: 200,
+    body: {
+      success: true,
+      subscription: sanitizeSubscriptionForClient(ready),
+      created: true,
+    },
+  };
+}
+
+function parseSocialAuthBody(body = {}) {
+  const phoneFromClient =
+    body.phone != null && String(body.phone).trim()
+      ? String(body.phone).trim()
+      : null;
+  const nameFromClient =
+    body.name != null && String(body.name).trim()
+      ? String(body.name).trim()
+      : null;
+  const businessAddress =
+    body.business_address != null && String(body.business_address).trim()
+      ? String(body.business_address).trim()
+      : body.businessAddress != null && String(body.businessAddress).trim()
+        ? String(body.businessAddress).trim()
+        : null;
+  const intent =
+    String(body.intent || body.mode || 'register').trim().toLowerCase() ===
+    'login'
+      ? 'login'
+      : 'register';
+  return {phoneFromClient, nameFromClient, businessAddress, intent};
+}
+
 // POST /api/auth/google – verify Google ID token; create or sign in regular user
-// Password is intentionally omitted (Google-only accounts). Phone may be sent from the form.
 app.post('/api/auth/google', async (req, res) => {
   try {
     const idToken = req.body?.id_token || req.body?.idToken;
-    const body = req.body || {};
-    const phoneFromClient =
-      body.phone != null && String(body.phone).trim()
-        ? String(body.phone).trim()
-        : null;
-    const nameFromClient =
-      body.name != null && String(body.name).trim()
-        ? String(body.name).trim()
-        : null;
-    const businessAddress =
-      body.business_address != null && String(body.business_address).trim()
-        ? String(body.business_address).trim()
-        : body.businessAddress != null && String(body.businessAddress).trim()
-          ? String(body.businessAddress).trim()
-          : null;
+    const {
+      phoneFromClient,
+      nameFromClient,
+      businessAddress,
+      intent,
+    } = parseSocialAuthBody(req.body || {});
 
     let googleUser;
     try {
@@ -2403,134 +2703,60 @@ app.post('/api/auth/google', async (req, res) => {
       return res.status(401).json({success: false, error: verifyErr.message});
     }
 
-    const emailNorm = googleUser.email;
-    const name = nameFromClient || googleUser.name || null;
-    const profilePictureUrl = googleUser.picture || null;
-
-    const {data: existing, error: existingErr} = await supabase
-      .from('subscriptions')
-      .select('*')
-      .ilike('email', emailNorm)
-      .limit(1)
-      .maybeSingle();
-
-    if (existingErr) {
-      console.error('[auth/google] lookup error:', existingErr);
-      return res.status(500).json({success: false, error: existingErr.message});
-    }
-
-    if (existing) {
-      const existingType = String(existing.subscription_type || '').trim();
-      if (existingType && existingType !== 'user') {
-        return registrationEmailTakenResponse(res);
-      }
-
-      const extras = {};
-      if (name && !existing.name) extras.name = name;
-      if (phoneFromClient && !existing.phone) extras.phone = phoneFromClient;
-      if (businessAddress && !existing.business_address) {
-        extras.business_address = businessAddress;
-      }
-      if (profilePictureUrl && !existing.profile_picture_url) {
-        extras.profile_picture_url = profilePictureUrl;
-      }
-
-      const ready = await ensureRegularUserReady(existing, extras);
-      console.log('[auth/google] existing regular user signed in', {
-        id: ready?.id || null,
-      });
-      return res.json({
-        success: true,
-        subscription: sanitizeSubscriptionForClient(ready),
-        created: false,
-      });
-    }
-
-    const intent =
-      String(body.intent || body.mode || 'register').trim().toLowerCase() ===
-      'login'
-        ? 'login'
-        : 'register';
-
-    if (!phoneFromClient) {
-      if (intent === 'login') {
-        return res.status(404).json({
-          success: false,
-          error: 'לא נמצא חשבון עם המייל הזה. אנא הירשם תחילה.',
-        });
-      }
-      return res.status(400).json({
-        success: false,
-        error: 'אנא הזן מספר טלפון לפני ההרשמה עם Google',
-      });
-    }
-
-    const insertRow = {
-      subscription_type: 'user',
-      email: emailNorm,
-      name,
-      phone: phoneFromClient,
-      business_address: businessAddress,
-      profile_picture_url: profilePictureUrl,
-      // No password_hash — sign-in is via Google ID token only.
-      status: 'verified',
-      verified_at: new Date().toISOString(),
-      subscriber_number: await generateUniqueSubscriberNumber(),
-      access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
-      max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
-    };
-
-    const {data: inserted, error: insertErr} = await supabase
-      .from('subscriptions')
-      .insert(insertRow)
-      .select('*')
-      .single();
-
-    if (insertErr) {
-      console.error('[auth/google] insert error:', insertErr);
-      if (isUniqueEmailViolation(insertErr)) {
-        // Race: another request created the row — treat as login.
-        const {data: raced} = await supabase
-          .from('subscriptions')
-          .select('*')
-          .ilike('email', emailNorm)
-          .limit(1)
-          .maybeSingle();
-        if (raced && String(raced.subscription_type || '') === 'user') {
-          const readyRaced = await ensureRegularUserReady(raced, {
-            phone: phoneFromClient && !raced.phone ? phoneFromClient : undefined,
-            name: name && !raced.name ? name : undefined,
-            business_address:
-              businessAddress && !raced.business_address
-                ? businessAddress
-                : undefined,
-            profile_picture_url:
-              profilePictureUrl && !raced.profile_picture_url
-                ? profilePictureUrl
-                : undefined,
-          });
-          return res.json({
-            success: true,
-            subscription: sanitizeSubscriptionForClient(readyRaced),
-            created: false,
-          });
-        }
-        return registrationEmailTakenResponse(res);
-      }
-      return res.status(500).json({success: false, error: insertErr.message});
-    }
-
-    const ready = await ensureRegularUserReady(inserted);
-    console.log('[auth/google] created new subscription', {
-      id: ready?.id || null,
+    const result = await upsertSocialRegularUser({
+      logTag: 'auth/google',
+      emailNorm: googleUser.email,
+      name: nameFromClient || googleUser.name || null,
+      phoneFromClient,
+      businessAddress,
+      profilePictureUrl: googleUser.picture || null,
+      intent,
+      providerLabel: 'Google',
     });
-    return res.json({
-      success: true,
-      subscription: sanitizeSubscriptionForClient(ready),
-      created: true,
-    });
+    return res.status(result.status).json(result.body);
   } catch (err) {
     console.error('[auth/google] unexpected:', err);
+    return res.status(500).json({success: false, error: err?.message || 'Unexpected error'});
+  }
+});
+
+// POST /api/auth/apple – verify Apple identity token; create or sign in regular user
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const idToken =
+      req.body?.identity_token ||
+      req.body?.identityToken ||
+      req.body?.id_token ||
+      req.body?.idToken;
+    const {
+      phoneFromClient,
+      nameFromClient,
+      businessAddress,
+      intent,
+    } = parseSocialAuthBody(req.body || {});
+
+    let appleUser;
+    try {
+      appleUser = await verifyAppleIdToken(idToken);
+    } catch (verifyErr) {
+      console.warn('[auth/apple] token verify failed:', verifyErr.message);
+      return res.status(401).json({success: false, error: verifyErr.message});
+    }
+
+    const result = await upsertSocialRegularUser({
+      logTag: 'auth/apple',
+      emailNorm: appleUser.email,
+      appleUserId: appleUser.sub,
+      name: nameFromClient || null,
+      phoneFromClient,
+      businessAddress,
+      profilePictureUrl: null,
+      intent,
+      providerLabel: 'Apple',
+    });
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    console.error('[auth/apple] unexpected:', err);
     return res.status(500).json({success: false, error: err?.message || 'Unexpected error'});
   }
 });

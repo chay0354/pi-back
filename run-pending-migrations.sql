@@ -61,5 +61,16 @@ END $$;
 
 ALTER TABLE public.chat_messages REPLICA IDENTITY FULL;
 
+-- migration-subscriptions-apple-user-id.sql
+ALTER TABLE public.subscriptions
+  ADD COLUMN IF NOT EXISTS apple_user_id text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_apple_user_id_uidx
+  ON public.subscriptions (apple_user_id)
+  WHERE apple_user_id IS NOT NULL;
+
+COMMENT ON COLUMN public.subscriptions.apple_user_id IS
+  'Stable Apple Sign In subject (sub) for re-login when email is omitted.';
+
 -- Refresh PostgREST schema cache
 NOTIFY pgrst, 'reload schema';
