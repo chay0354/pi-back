@@ -2183,6 +2183,7 @@ app.post('/api/users/register-regular', async (req, res) => {
           error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
         });
       }
+      let row = existing;
       if (Object.keys(updates).length > 0) {
         const { data: updated, error: updErr } = await supabase
           .from('subscriptions')
@@ -2192,29 +2193,22 @@ app.post('/api/users/register-regular', async (req, res) => {
           .maybeSingle();
         if (updErr) {
           console.warn('[users/register-regular] update warn:', updErr.message);
+        } else if (updated) {
+          row = updated;
         }
         console.log('[users/register-regular] existing user updated', {
           id: existing.id,
           updatedKeys: Object.keys(updates),
         });
-        return res.json({
-          success: true,
-          subscription: sanitizeSubscriptionForClient(updated || existing),
-          created: false,
+      } else {
+        console.log('[users/register-regular] existing user returned (no changes)', {
+          id: existing.id,
         });
       }
-      if (!existing.password_hash) {
-        return res.status(400).json({
-          success: false,
-          error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
-        });
-      }
-      console.log('[users/register-regular] existing user returned (no changes)', {
-        id: existing.id,
-      });
+      row = await ensureRegularUserReady(row);
       return res.json({
         success: true,
-        subscription: sanitizeSubscriptionForClient(existing),
+        subscription: sanitizeSubscriptionForClient(row),
         created: false,
       });
     }
@@ -2236,6 +2230,9 @@ app.post('/api/users/register-regular', async (req, res) => {
       password_hash: hashPassword(password),
       status: 'verified',
       verified_at: new Date().toISOString(),
+      subscriber_number: await generateUniqueSubscriberNumber(),
+      access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
+      max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
     };
 
     const { data: inserted, error: insertErr } = await supabase
@@ -2252,14 +2249,15 @@ app.post('/api/users/register-regular', async (req, res) => {
       return res.status(500).json({ success: false, error: insertErr.message });
     }
 
+    const ready = await ensureRegularUserReady(inserted);
     console.log('[users/register-regular] created new subscription', {
-      id: inserted?.id || null,
-      subscription_type: inserted?.subscription_type || null,
-      status: inserted?.status || null,
+      id: ready?.id || null,
+      subscription_type: ready?.subscription_type || null,
+      status: ready?.status || null,
     });
     return res.json({
       success: true,
-      subscription: sanitizeSubscriptionForClient(inserted),
+      subscription: sanitizeSubscriptionForClient(ready),
       created: true,
     });
   } catch (err) {
@@ -2273,6 +2271,71 @@ function getGoogleClientIds() {
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+async function generateUniqueSubscriberNumber() {
+  let subscriberNumber;
+  let isUnique = false;
+  let attempts = 0;
+  const maxAttempts = 10;
+  while (!isUnique && attempts < maxAttempts) {
+    subscriberNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
+    const { data: existing } = await supabase
+      .from('subscriptions')
+      .select('id')
+      .eq('subscriber_number', subscriberNumber)
+      .maybeSingle();
+    if (!existing) isUnique = true;
+    attempts += 1;
+  }
+  if (!isUnique) {
+    subscriberNumber = (Date.now() % 900000000 + 100000000).toString();
+  }
+  return subscriberNumber;
+}
+
+/** Fill missing regular-user fields (subscriber #, access window, quota, verified). */
+async function ensureRegularUserReady(subscription, extras = {}) {
+  if (!subscription?.id) return subscription;
+  const updates = {};
+  for (const [key, value] of Object.entries(extras || {})) {
+    if (value !== undefined) updates[key] = value;
+  }
+  if (!subscription.subscriber_number && !updates.subscriber_number) {
+    updates.subscriber_number = await generateUniqueSubscriberNumber();
+  }
+  if (!subscription.access_expires_at && !updates.access_expires_at) {
+    updates.access_expires_at = addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString();
+  }
+  if (!subscription.verified_at && !updates.verified_at) {
+    updates.verified_at = new Date().toISOString();
+  }
+  if (subscription.status !== 'verified') {
+    updates.status = 'verified';
+  }
+  if (
+    subscription.max_published_listings == null &&
+    updates.max_published_listings == null
+  ) {
+    updates.max_published_listings = DEFAULT_MONTHLY_LISTING_QUOTA;
+  }
+  if (String(subscription.subscription_type || '') !== 'user') {
+    updates.subscription_type = 'user';
+  }
+  if (Object.keys(updates).length === 0) return subscription;
+
+  updates.updated_at = new Date().toISOString();
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .update(updates)
+    .eq('id', subscription.id)
+    .select('*')
+    .single();
+  if (error) {
+    console.warn('[ensureRegularUserReady]', error.message);
+    return subscription;
+  }
+  return data || subscription;
 }
 
 async function verifyGoogleIdToken(idToken) {
@@ -2311,10 +2374,27 @@ async function verifyGoogleIdToken(idToken) {
   };
 }
 
-// POST /api/auth/google – verify Google ID token, upsert regular user subscription
+// POST /api/auth/google – verify Google ID token; create or sign in regular user
+// Password is intentionally omitted (Google-only accounts). Phone may be sent from the form.
 app.post('/api/auth/google', async (req, res) => {
   try {
     const idToken = req.body?.id_token || req.body?.idToken;
+    const body = req.body || {};
+    const phoneFromClient =
+      body.phone != null && String(body.phone).trim()
+        ? String(body.phone).trim()
+        : null;
+    const nameFromClient =
+      body.name != null && String(body.name).trim()
+        ? String(body.name).trim()
+        : null;
+    const businessAddress =
+      body.business_address != null && String(body.business_address).trim()
+        ? String(body.business_address).trim()
+        : body.businessAddress != null && String(body.businessAddress).trim()
+          ? String(body.businessAddress).trim()
+          : null;
+
     let googleUser;
     try {
       googleUser = await verifyGoogleIdToken(idToken);
@@ -2324,7 +2404,7 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     const emailNorm = googleUser.email;
-    const name = googleUser.name || null;
+    const name = nameFromClient || googleUser.name || null;
     const profilePictureUrl = googleUser.picture || null;
 
     const {data: existing, error: existingErr} = await supabase
@@ -2340,16 +2420,52 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     if (existing) {
-      return registrationEmailTakenResponse(res);
+      const existingType = String(existing.subscription_type || '').trim();
+      if (existingType && existingType !== 'user') {
+        return registrationEmailTakenResponse(res);
+      }
+
+      const extras = {};
+      if (name && !existing.name) extras.name = name;
+      if (phoneFromClient && !existing.phone) extras.phone = phoneFromClient;
+      if (businessAddress && !existing.business_address) {
+        extras.business_address = businessAddress;
+      }
+      if (profilePictureUrl && !existing.profile_picture_url) {
+        extras.profile_picture_url = profilePictureUrl;
+      }
+
+      const ready = await ensureRegularUserReady(existing, extras);
+      console.log('[auth/google] existing regular user signed in', {
+        id: ready?.id || null,
+      });
+      return res.json({
+        success: true,
+        subscription: sanitizeSubscriptionForClient(ready),
+        created: false,
+      });
+    }
+
+    if (!phoneFromClient) {
+      return res.status(400).json({
+        success: false,
+        error: 'אנא הזן מספר טלפון לפני ההרשמה עם Google',
+      });
     }
 
     const insertRow = {
       subscription_type: 'user',
       email: emailNorm,
       name,
+      phone: phoneFromClient,
+      business_address: businessAddress,
       profile_picture_url: profilePictureUrl,
+      // No password_hash — sign-in is via Google ID token only.
       status: 'verified',
       verified_at: new Date().toISOString(),
+      subscriber_number: await generateUniqueSubscriberNumber(),
+      access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
+      max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
     };
 
     const {data: inserted, error: insertErr} = await supabase
@@ -2361,14 +2477,44 @@ app.post('/api/auth/google', async (req, res) => {
     if (insertErr) {
       console.error('[auth/google] insert error:', insertErr);
       if (isUniqueEmailViolation(insertErr)) {
+        // Race: another request created the row — treat as login.
+        const {data: raced} = await supabase
+          .from('subscriptions')
+          .select('*')
+          .ilike('email', emailNorm)
+          .limit(1)
+          .maybeSingle();
+        if (raced && String(raced.subscription_type || '') === 'user') {
+          const readyRaced = await ensureRegularUserReady(raced, {
+            phone: phoneFromClient && !raced.phone ? phoneFromClient : undefined,
+            name: name && !raced.name ? name : undefined,
+            business_address:
+              businessAddress && !raced.business_address
+                ? businessAddress
+                : undefined,
+            profile_picture_url:
+              profilePictureUrl && !raced.profile_picture_url
+                ? profilePictureUrl
+                : undefined,
+          });
+          return res.json({
+            success: true,
+            subscription: sanitizeSubscriptionForClient(readyRaced),
+            created: false,
+          });
+        }
         return registrationEmailTakenResponse(res);
       }
       return res.status(500).json({success: false, error: insertErr.message});
     }
 
+    const ready = await ensureRegularUserReady(inserted);
+    console.log('[auth/google] created new subscription', {
+      id: ready?.id || null,
+    });
     return res.json({
       success: true,
-      subscription: sanitizeSubscriptionForClient(inserted),
+      subscription: sanitizeSubscriptionForClient(ready),
       created: true,
     });
   } catch (err) {
