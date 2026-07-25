@@ -4,3 +4,5 @@ node_modules/
 *.log
 dist/
 build/
+client_secret*.json
+**/client_secret*.json
