@@ -2446,7 +2446,19 @@ app.post('/api/auth/google', async (req, res) => {
       });
     }
 
+    const intent =
+      String(body.intent || body.mode || 'register').trim().toLowerCase() ===
+      'login'
+        ? 'login'
+        : 'register';
+
     if (!phoneFromClient) {
+      if (intent === 'login') {
+        return res.status(404).json({
+          success: false,
+          error: 'לא נמצא חשבון עם המייל הזה. אנא הירשם תחילה.',
+        });
+      }
       return res.status(400).json({
         success: false,
         error: 'אנא הזן מספר טלפון לפני ההרשמה עם Google',
