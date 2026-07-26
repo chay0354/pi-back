@@ -2386,10 +2386,19 @@ function getAppleClientIds() {
   return ['com.pi.frontend'];
 }
 
+let appleJosePromise = null;
+async function loadJose() {
+  if (!appleJosePromise) {
+    // jose v5+ is ESM-only; dynamic import works from CommonJS on Vercel/Node.
+    appleJosePromise = import('jose');
+  }
+  return appleJosePromise;
+}
+
 let appleJwks = null;
-function getAppleJwks() {
+async function getAppleJwks() {
   if (!appleJwks) {
-    const {createRemoteJWKSet} = require('jose');
+    const {createRemoteJWKSet} = await loadJose();
     appleJwks = createRemoteJWKSet(
       new URL('https://appleid.apple.com/auth/keys'),
     );
@@ -2402,11 +2411,11 @@ async function verifyAppleIdToken(idToken) {
   if (!token) {
     throw new Error('Missing Apple identity token');
   }
-  const {jwtVerify} = require('jose');
+  const {jwtVerify} = await loadJose();
   const audiences = getAppleClientIds();
   let payload;
   try {
-    ({payload} = await jwtVerify(token, getAppleJwks(), {
+    ({payload} = await jwtVerify(token, await getAppleJwks(), {
       issuer: 'https://appleid.apple.com',
       audience: audiences.length === 1 ? audiences[0] : audiences,
     }));
