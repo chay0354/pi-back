@@ -10653,13 +10653,24 @@ app.post('/api/upload/signed-url', async (req, res) => {
   }
 });
 
-// Upload file to Supabase Storage
+// Upload file to Supabase Storage (legacy proxy — prefer /api/upload/signed-url).
+// Large bodies are rejected by Vercel (~4.5MB) before this handler runs.
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
         error: 'No file provided. Ensure the form field is named "file".' 
+      });
+    }
+
+    // Soft guard for local/dev; production Vercel already 413s oversized bodies.
+    const maxProxyBytes = 4 * 1024 * 1024;
+    if (req.file.size > maxProxyBytes) {
+      return res.status(413).json({
+        success: false,
+        error:
+          'הקובץ גדול מדי להעלאה דרך השרת. השתמשו בהעלאה ישירה (signed URL).',
       });
     }
 
