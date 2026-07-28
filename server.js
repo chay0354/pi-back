@@ -5403,6 +5403,8 @@ app.get('/api/follows/hub', async (req, res) => {
       if (error) return res.status(500).json({ success: false, error: error.message });
       relationRows = data || [];
     } else if (tab === 'following') {
+      // Accepted follows only — never include pending outgoing requests
+      // (menu "במעקב" / hub "עוקב" should match users who accepted you).
       const { data: followRows, error: fErr } = await supabase
         .from('user_follows')
         .select('following_subscription_id, created_at')
@@ -5416,37 +5418,6 @@ app.get('/api/follows/hub', async (req, res) => {
         created_at: r.created_at,
         pending_request_id: null,
       }));
-      // Only the account owner sees unapproved outgoing requests in "עוקב".
-      if (viewerId === userId) {
-        const { data: pendingRows, error: pErr } = await supabase
-          .from('user_follow_requests')
-          .select('id, target_subscription_id, created_at')
-          .eq('requester_subscription_id', userId)
-          .eq('status', 'pending')
-          .order('created_at', { ascending: false });
-        if (pErr) {
-          return res.status(500).json({ success: false, error: pErr.message });
-        }
-        const byTarget = new Map();
-        relationRows.forEach(r => {
-          const id = String(r.following_subscription_id || '');
-          if (id) byTarget.set(id, r);
-        });
-        (pendingRows || []).forEach(r => {
-          if (!r?.target_subscription_id) return;
-          const id = String(r.target_subscription_id);
-          if (!byTarget.has(id)) {
-            byTarget.set(id, {
-              following_subscription_id: r.target_subscription_id,
-              created_at: r.created_at,
-              pending_request_id: r.id,
-            });
-          }
-        });
-        relationRows = [...byTarget.values()].sort(
-          (a, b) => new Date(b.created_at) - new Date(a.created_at),
-        );
-      }
     } else {
       const { data, error } = await supabase
         .from('user_follow_requests')
@@ -7073,21 +7044,28 @@ app.get('/api/professionals/directory', async (req, res) => {
 
       const { data: reviewRows, error: reviewErr } = await supabase
         .from('profile_reviews')
-        .select('target_subscription_id, rating')
+        .select('target_subscription_id, rating, created_at')
         .in('target_subscription_id', ids);
       if (reviewErr) {
         console.warn('GET /api/professionals/directory ratings:', reviewErr.message);
       } else {
-        const agg = {};
+        const {
+          computeBrokerProfessionalStarRating,
+        } = require('./utils/brokerProfessionalStarRating');
+        const reviewsBySub = {};
         for (const row of reviewRows || []) {
-          const sid = row?.target_subscription_id ? String(row.target_subscription_id) : '';
+          const sid = row?.target_subscription_id
+            ? String(row.target_subscription_id)
+            : '';
           if (!sid) continue;
-          if (!agg[sid]) agg[sid] = {sum: 0, count: 0};
-          agg[sid].sum += Number(row?.rating) || 0;
-          agg[sid].count += 1;
+          if (!reviewsBySub[sid]) reviewsBySub[sid] = [];
+          reviewsBySub[sid].push(row);
         }
-        for (const sid of Object.keys(agg)) {
-          if (agg[sid].count > 0) ratingBySub[sid] = agg[sid].sum / agg[sid].count;
+        for (const sid of Object.keys(reviewsBySub)) {
+          const tier = computeBrokerProfessionalStarRating(reviewsBySub[sid]);
+          if (tier != null) {
+            ratingBySub[sid] = tier;
+          }
         }
       }
     }
