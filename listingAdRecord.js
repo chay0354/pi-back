@@ -82,6 +82,7 @@ async function buildAdRecordFromListingBody(body, supabase) {
   const descTrim = String(description || '').trim();
   const descriptionMarksFeedPost =
     descTrim === 'פוסט' ||
+    descTrim === 'בית פתוח' ||
     descTrim.toLowerCase() === 'post';
 
   const explicitFeedPost =
