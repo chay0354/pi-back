@@ -6296,24 +6296,33 @@ app.get('/api/listings', async (req, res) => {
       ? subscriptionTypeParam.split(',').map(s => s.trim()).filter(s => allowedSubscriptionTypes.includes(s))
       : [];
 
-    // BnB (5) + שותפים (3): public feed is regular-user ads only.
+    // BnB (5): public feed includes regular users + companies.
+    // שותפים (3): regular-user ads only.
     // Exception: שותפים "נותני שירות" may request subscription_type=professional.
     // Owner view (subscription_id) keeps all of that owner's ads unfiltered by type.
-    const REGULAR_USER_ONLY_CATEGORIES = new Set([3, 5]);
+    const PARTNERS_REGULAR_USER_ONLY_CATEGORY = 3;
+    const BNB_CATEGORY = 5;
     const isOwnerViewEarly =
       !favoritesOnly && subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
-    const isRegularUserOnlyCategory =
-      category != null &&
-      !isNaN(category) &&
-      REGULAR_USER_ONLY_CATEGORIES.has(category);
     let effectiveSubscriptionTypes = subscriptionTypes;
-    if (isRegularUserOnlyCategory && !favoritesOnly && !isOwnerViewEarly) {
-      const wantsProfessionalOnly =
-        category === 3 &&
-        subscriptionTypes.length === 1 &&
-        subscriptionTypes[0] === 'professional';
-      if (!wantsProfessionalOnly) {
-        effectiveSubscriptionTypes = ['user'];
+    if (!favoritesOnly && !isOwnerViewEarly && category != null && !isNaN(category)) {
+      if (category === PARTNERS_REGULAR_USER_ONLY_CATEGORY) {
+        const wantsProfessionalOnly =
+          subscriptionTypes.length === 1 &&
+          subscriptionTypes[0] === 'professional';
+        if (!wantsProfessionalOnly) {
+          effectiveSubscriptionTypes = ['user'];
+        }
+      } else if (category === BNB_CATEGORY) {
+        if (subscriptionTypes.length === 0) {
+          effectiveSubscriptionTypes = ['user', 'company'];
+        } else {
+          const allowed = subscriptionTypes.filter(
+            (t) => t === 'user' || t === 'company',
+          );
+          effectiveSubscriptionTypes =
+            allowed.length > 0 ? allowed : ['user', 'company'];
+        }
       }
     }
 
