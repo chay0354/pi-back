@@ -2777,19 +2777,22 @@ const SUBSCRIPTION_SELECT =
   'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
   'profile_picture_url, company_logo_url, video_url, additional_images_urls, ' +
   'specializations, activity_regions, types, description, phone, ' +
-  'block_exclusive_offers, block_collab_offers, ' +
+  'block_exclusive_offers, block_collab_offers, block_relevant_post_updates, ' +
   'created_at, updated_at';
 
 const CHAT_OFFER_PREFERENCE_FIELDS = [
   'block_exclusive_offers',
   'block_collab_offers',
+  'block_relevant_post_updates',
 ];
 
 function isMissingBlockOffersColumnError(err) {
   const msg = String((err && err.message) || (err && err.details) || err || '');
   const code = String((err && err.code) || '');
   return (
-    (/block_exclusive_offers/i.test(msg) || /block_collab_offers/i.test(msg)) &&
+    (/block_exclusive_offers/i.test(msg) ||
+      /block_collab_offers/i.test(msg) ||
+      /block_relevant_post_updates/i.test(msg)) &&
     (/does not exist/i.test(msg) ||
       /42703/i.test(msg) ||
       /undefined column/i.test(msg) ||
@@ -3741,16 +3744,12 @@ app.post('/api/chat/groups', async (req, res) => {
     const rawMembers = Array.isArray(req.body.member_emails) ? req.body.member_emails : [];
     const memberEmails = [...new Set(rawMembers.map(normEmail).filter(Boolean))].filter((e) => e !== creator);
     const titleIn = req.body.title != null ? String(req.body.title).trim().slice(0, 120) : '';
-    const kind = req.body.kind === 'brokers' ? 'brokers' : 'customers';
+    const kind = normalizeChatGroupKind(req.body.kind);
+
     const groupImageUrl =
       req.body.group_image_url != null && String(req.body.group_image_url).trim()
         ? String(req.body.group_image_url).trim().slice(0, 2000)
         : null;
-    const isRegularType = (st) => {
-      const t = st != null ? String(st).trim().toLowerCase() : '';
-      return t !== 'broker' && t !== 'company' && t !== 'professional';
-    };
-    const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
 
     if (!creator) return res.status(400).json({ success: false, error: 'creator_email required' });
     if (memberEmails.length < 1) return res.status(400).json({ success: false, error: 'At least one member required' });
@@ -3760,7 +3759,7 @@ app.post('/api/chat/groups', async (req, res) => {
         ? String(req.body.creator_subscription_id).trim()
         : '';
 
-    // Rule 1: brokers — any group; companies — customer groups only; regular — regular only.
+    // Rule 1: brokers — any group; companies — customer groups only; regular/professional — open groups.
     let creatorSub = null;
     if (creatorSubIdRaw && LISTING_AD_UUID_RE.test(creatorSubIdRaw)) {
       const byId = await supabase
@@ -3798,14 +3797,27 @@ app.post('/api/chat/groups', async (req, res) => {
       .toLowerCase();
     const creatorIsBroker = creatorType === 'broker';
     const creatorIsCompany = creatorType === 'company';
-    const creatorIsRegular = isRegularType(creatorSub?.subscription_type);
-    if (!creatorIsBroker && !creatorIsRegular && !creatorIsCompany) {
+    const creatorIsProfessional = creatorType === 'professional';
+    const creatorIsRegular = isRegularSubscriptionTypeForGroup(creatorSub?.subscription_type);
+    if (!creatorIsBroker && !creatorIsRegular && !creatorIsCompany && !creatorIsProfessional) {
       return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
     }
     if (!creatorIsBroker && kind === 'brokers') {
       return res.status(403).json({
         success: false,
         error: 'רק מתווכים יכולים לפתוח קבוצת מתווכים',
+      });
+    }
+    if (creatorIsCompany && kind === 'open') {
+      return res.status(403).json({
+        success: false,
+        error: 'חברות יכולות לפתוח רק קבוצת לקוחות',
+      });
+    }
+    if ((creatorIsRegular || creatorIsProfessional) && kind !== 'open') {
+      return res.status(403).json({
+        success: false,
+        error: 'ניתן לפתוח רק קבוצה פתוחה לכל סוגי המשתמשים',
       });
     }
 
@@ -3821,16 +3833,12 @@ app.post('/api/chat/groups', async (req, res) => {
     }
     const invalidMembers = memberEmails.filter((em) => {
       const st = memberTypeByEmail.get(em);
-      if (kind === 'brokers') return !isBrokerType(st);
-      return !isRegularType(st);
+      return !memberAllowedForGroupKind(st, kind);
     });
     if (invalidMembers.length > 0) {
       return res.status(400).json({
         success: false,
-        error:
-          kind === 'brokers'
-            ? 'בקבוצת מתווכים ניתן לצרף רק מתווכים'
-            : 'בקבוצה רגילה ניתן לצרף רק משתמשים רגילים',
+        error: groupKindMemberError(kind),
       });
     }
 
@@ -3842,22 +3850,46 @@ app.post('/api/chat/groups', async (req, res) => {
           : 'קבוצה';
     const title = titleIn || defaultTitle;
 
-    const insertRow = { type: 'group', title };
+    const insertRow = { type: 'group', title, group_kind: kind };
     if (groupImageUrl) insertRow.group_image_url = groupImageUrl;
 
     let { data: newConv, error: convErr } = await supabase
       .from('chat_conversations')
       .insert(insertRow)
-      .select('id, type, title, group_image_url')
+      .select('id, type, title, group_image_url, group_kind')
       .single();
-    if (convErr && isMissingGroupImageUrlColumnError(convErr)) {
+    if (convErr && (isMissingGroupImageUrlColumnError(convErr) || isMissingGroupKindColumnError(convErr))) {
       console.warn(
-        '[chat] chat_conversations.group_image_url is missing — run pi-back/migration-chat-group-image.sql in Supabase. Creating group without persisting image URL.',
+        '[chat] chat_conversations missing optional columns — retrying group insert without them.',
       );
+      const retryPayload = { type: 'group', title };
+      if (groupImageUrl && !isMissingGroupImageUrlColumnError(convErr)) {
+        retryPayload.group_image_url = groupImageUrl;
+      }
+      if (!isMissingGroupKindColumnError(convErr)) {
+        retryPayload.group_kind = kind;
+      }
       const retry = await supabase
         .from('chat_conversations')
-        .insert({ type: 'group', title })
-        .select('id, type, title')
+        .insert(retryPayload)
+        .select('id, type, title, group_image_url, group_kind')
+        .single();
+      newConv = retry.data;
+      convErr = retry.error;
+      if (convErr && isMissingGroupKindColumnError(convErr)) {
+        const retry2 = await supabase
+          .from('chat_conversations')
+          .insert({ type: 'group', title, ...(groupImageUrl ? { group_image_url: groupImageUrl } : {}) })
+          .select('id, type, title')
+          .single();
+        newConv = retry2.data;
+        convErr = retry2.error;
+      }
+    } else if (convErr && isMissingGroupKindColumnError(convErr)) {
+      const retry = await supabase
+        .from('chat_conversations')
+        .insert({ type: 'group', title, ...(groupImageUrl ? { group_image_url: groupImageUrl } : {}) })
+        .select('id, type, title, group_image_url')
         .single();
       newConv = retry.data;
       convErr = retry.error;
@@ -3928,11 +3960,6 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     const convId = req.body.conversation_id != null ? String(req.body.conversation_id).trim() : '';
     const rawMembers = Array.isArray(req.body.member_emails) ? req.body.member_emails : [];
     const memberEmails = [...new Set(rawMembers.map(normEmail).filter(Boolean))];
-    const isRegularType = (st) => {
-      const t = st != null ? String(st).trim().toLowerCase() : '';
-      return t !== 'broker' && t !== 'company' && t !== 'professional';
-    };
-    const isBrokerType = (st) => String(st || '').trim().toLowerCase() === 'broker';
 
     if (!actorEmail || !convId) {
       return res.status(400).json({ success: false, error: 'user_email and conversation_id required' });
@@ -3941,8 +3968,26 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
       return res.status(400).json({ success: false, error: 'At least one member required' });
     }
 
-    const { data: conv } = await supabase.from('chat_conversations').select('id, type, title').eq('id', convId).maybeSingle();
-    if (!conv || String(conv.type || '').trim().toLowerCase() !== 'group') {
+    let convSelect = await supabase
+      .from('chat_conversations')
+      .select('id, type, title, group_kind, group_creator_email')
+      .eq('id', convId)
+      .maybeSingle();
+    if (convSelect.error && isMissingGroupKindColumnError(convSelect.error)) {
+      convSelect = await supabase
+        .from('chat_conversations')
+        .select('id, type, title, group_creator_email')
+        .eq('id', convId)
+        .maybeSingle();
+    } else if (convSelect.error && isMissingGroupCreatorEmailColumnError(convSelect.error)) {
+      convSelect = await supabase
+        .from('chat_conversations')
+        .select('id, type, title, group_kind')
+        .eq('id', convId)
+        .maybeSingle();
+    }
+    const conv = convSelect.data;
+    if (convSelect.error || !conv || String(conv.type || '').trim().toLowerCase() !== 'group') {
       return res.status(400).json({ success: false, error: 'Not a group conversation' });
     }
 
@@ -3953,9 +3998,12 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
       .limit(1)
       .maybeSingle();
     if (actorErr) return res.status(500).json({ success: false, error: actorErr.message });
-    const actorIsBroker = isBrokerType(actorSub?.subscription_type);
-    const actorIsRegular = isRegularType(actorSub?.subscription_type);
-    if (!actorIsBroker && !actorIsRegular) {
+    const actorType = String(actorSub?.subscription_type || '').trim().toLowerCase();
+    const actorIsBroker = isBrokerSubscriptionTypeForGroup(actorType);
+    const actorIsRegular = isRegularSubscriptionTypeForGroup(actorType);
+    const actorIsProfessional = actorType === 'professional';
+    const actorIsCompany = actorType === 'company';
+    if (!actorIsBroker && !actorIsRegular && !actorIsProfessional && !actorIsCompany) {
       return res.status(403).json({ success: false, error: 'אין הרשאה להוסיף חברים לקבוצה' });
     }
 
@@ -3971,19 +4019,23 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
 
     const currentEmails = [...new Set(existingMembers)];
     const currentSubs = await fetchSubscriptionsByEmails(currentEmails);
-    const currentTypeByEmail = new Map();
+    const currentTypeByEmail = {};
     (currentSubs || []).forEach((s) => {
       const e = normEmail(s?.email);
-      if (e) currentTypeByEmail.set(e, String(s?.subscription_type || '').trim().toLowerCase());
+      if (e) currentTypeByEmail[e] = String(s?.subscription_type || '').trim().toLowerCase();
     });
-    const currentKind =
-      currentEmails.some((e) => isRegularType(currentTypeByEmail.get(e))) ? 'customers' : 'brokers';
+    const creatorEmailNorm =
+      conv.group_creator_email != null ? normEmail(conv.group_creator_email) : '';
+    let groupKind = conv.group_kind != null ? normalizeChatGroupKind(conv.group_kind) : null;
+    if (!groupKind) {
+      groupKind = inferLegacyChatGroupKind(currentTypeByEmail, creatorEmailNorm);
+    }
 
-    // Regular users may only manage regular (customers) groups.
-    if (!actorIsBroker && currentKind === 'brokers') {
+    // Non-brokers may not add members to broker-only groups.
+    if (!actorIsBroker && groupKind === 'brokers') {
       return res.status(403).json({
         success: false,
-        error: 'משתמשים רגילים יכולים להוסיף חברים רק לקבוצה רגילה',
+        error: 'ניתן להוסיף חברים רק לקבוצה רגילה או קבוצה פתוחה',
       });
     }
 
@@ -4001,16 +4053,12 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
 
     const invalid = targetMembers.filter((e) => {
       const st = addTypeByEmail.get(e);
-      if (currentKind === 'brokers') return !isBrokerType(st);
-      return !isRegularType(st);
+      return !memberAllowedForGroupKind(st, groupKind);
     });
     if (invalid.length > 0) {
       return res.status(400).json({
         success: false,
-        error:
-          currentKind === 'brokers'
-            ? 'בקבוצת מתווכים ניתן לצרף רק מתווכים'
-            : 'בקבוצה רגילה ניתן לצרף רק משתמשים רגילים',
+        error: groupKindMemberError(groupKind),
       });
     }
 
@@ -4365,12 +4413,12 @@ app.get('/api/chat/group-messages', async (req, res) => {
       return res.status(500).json({ success: false, error: loadErr?.message || 'Unable to load group messages' });
     }
 
-    let group = { title: 'קבוצה', profileImageUrl: null, description: null };
+    let group = { title: 'קבוצה', profileImageUrl: null, description: null, groupKind: null };
     let convMeta = null;
     const [rAll, rCreator] = await Promise.all([
       supabase
         .from('chat_conversations')
-        .select('title, group_image_url, group_description')
+        .select('title, group_image_url, group_description, group_kind')
         .eq('id', convId)
         .maybeSingle(),
       supabase
@@ -4381,6 +4429,13 @@ app.get('/api/chat/group-messages', async (req, res) => {
     ]);
     if (!rAll.error && rAll.data) {
       convMeta = rAll.data;
+    } else if (rAll.error && isMissingGroupKindColumnError(rAll.error)) {
+      const rKindFb = await supabase
+        .from('chat_conversations')
+        .select('title, group_image_url, group_description')
+        .eq('id', convId)
+        .maybeSingle();
+      convMeta = rKindFb.error ? null : rKindFb.data;
     } else if (rAll.error && isMissingGroupDescriptionColumnError(rAll.error)) {
       const r2 = await supabase.from('chat_conversations').select('title, group_image_url').eq('id', convId).maybeSingle();
       if (!r2.error && r2.data) convMeta = { ...r2.data, group_description: null };
@@ -4416,6 +4471,10 @@ app.get('/api/chat/group-messages', async (req, res) => {
         profileImageUrl: pic,
         description: desc,
         creatorEmail: creatorEmailForRoles || null,
+        groupKind:
+          convMeta.group_kind != null
+            ? normalizeChatGroupKind(convMeta.group_kind)
+            : null,
       };
     } else if (creatorEmailForRoles) {
       group = { ...group, creatorEmail: creatorEmailForRoles };
@@ -6810,6 +6869,8 @@ app.get('/api/stories/feed', async (req, res) => {
     for (const sid of idsFromStorySlides) {
       const s = subById.get(sid);
       if (!s) continue;
+      const subTypeForRing = String(s.subscription_type || '').toLowerCase();
+      if (!isB2BSubscriptionType(subTypeForRing)) continue;
       const slides = [];
       const profileVideoUrl = storyHasVideoUrl(s.video_url)
         ? String(s.video_url).trim()
@@ -6889,6 +6950,38 @@ app.get('/api/stories/feed', async (req, res) => {
   }
 });
 
+/** Stories are B2B-only (broker / company / professional), not regular users. */
+async function assertStoryPublisherEligible(subscriptionId) {
+  const sid = String(subscriptionId || '').trim();
+  if (!sid) {
+    return { ok: false, status: 400, error: 'subscription_id is required' };
+  }
+  const { data: sub, error } = await supabase
+    .from('subscriptions')
+    .select('id, subscription_type, status')
+    .eq('id', sid)
+    .maybeSingle();
+  if (error || !sub) {
+    return { ok: false, status: 404, error: 'Subscription not found' };
+  }
+  if (!isB2BSubscriptionType(sub.subscription_type)) {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Stories are only available for broker, company, and professional accounts',
+    };
+  }
+  const status = String(sub.status || '').toLowerCase();
+  if (status !== 'verified' && status !== 'active') {
+    return {
+      ok: false,
+      status: 403,
+      error: 'Account must be verified before publishing stories',
+    };
+  }
+  return { ok: true, subscription: sub };
+}
+
 // POST /api/stories — body: { subscription_id, media_url, general_details? }
 app.post('/api/stories', async (req, res) => {
   try {
@@ -6905,6 +6998,14 @@ app.post('/api/stories', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'subscription_id and media_url are required',
+      });
+    }
+
+    const eligibility = await assertStoryPublisherEligible(sid);
+    if (!eligibility.ok) {
+      return res.status(eligibility.status).json({
+        success: false,
+        error: eligibility.error,
       });
     }
 
@@ -7335,6 +7436,64 @@ function isMissingGroupRoleColumnError(err) {
   );
 }
 
+function isMissingGroupKindColumnError(err) {
+  const msg = String((err && err.message) || (err && err.details) || err || '');
+  const code = String((err && err.code) || '');
+  return (
+    /group_kind/i.test(msg) &&
+    (/does not exist/i.test(msg) ||
+      /42703/i.test(msg) ||
+      /undefined column/i.test(msg) ||
+      /schema cache/i.test(msg) ||
+      /PGRST204/i.test(code))
+  );
+}
+
+function normalizeChatGroupKind(raw) {
+  const k = raw != null ? String(raw).trim().toLowerCase() : '';
+  if (k === 'brokers' || k === 'open' || k === 'customers') return k;
+  return 'customers';
+}
+
+function isRegularSubscriptionTypeForGroup(st) {
+  const t = st != null ? String(st).trim().toLowerCase() : '';
+  return t !== 'broker' && t !== 'company' && t !== 'professional';
+}
+
+function isBrokerSubscriptionTypeForGroup(st) {
+  return String(st || '').trim().toLowerCase() === 'broker';
+}
+
+/** Infer group_kind for legacy rows created before migration-chat-group-kind.sql. */
+function inferLegacyChatGroupKind(typeByEmail, creatorEmailNorm) {
+  const emails = Object.keys(typeByEmail || {});
+  const types = emails.map((e) => typeByEmail[e]).filter(Boolean);
+  const hasBroker = types.some(isBrokerSubscriptionTypeForGroup);
+  const hasRegular = types.some(isRegularSubscriptionTypeForGroup);
+  const hasPro = types.some((t) => String(t).trim().toLowerCase() === 'professional');
+  const hasCompany = types.some((t) => String(t).trim().toLowerCase() === 'company');
+  if (hasBroker && !hasRegular && !hasPro && !hasCompany) return 'brokers';
+  if (hasPro || hasCompany || (hasBroker && (hasRegular || hasPro || hasCompany))) return 'open';
+  const creatorType = creatorEmailNorm ? typeByEmail[normEmail(creatorEmailNorm)] : null;
+  const ct = creatorType != null ? String(creatorType).trim().toLowerCase() : '';
+  if (ct === 'professional' || isRegularSubscriptionTypeForGroup(ct)) return 'open';
+  return 'customers';
+}
+
+function memberAllowedForGroupKind(st, groupKind) {
+  const kind = normalizeChatGroupKind(groupKind);
+  if (kind === 'open') return true;
+  if (kind === 'brokers') return isBrokerSubscriptionTypeForGroup(st);
+  return isRegularSubscriptionTypeForGroup(st);
+}
+
+function groupKindMemberError(kind) {
+  const k = normalizeChatGroupKind(kind);
+  if (k === 'brokers') return 'בקבוצת מתווכים ניתן לצרף רק מתווכים';
+  if (k === 'open') return 'לא ניתן לצרף משתמש זה לקבוצה';
+  return 'בקבוצה רגילה ניתן לצרף רק משתמשים רגילים';
+}
+
 /** Normalize participant role; infer owner from conversation creator email when column absent in row. */
 function resolvedGroupRole(partRow, creatorEmailNorm) {
   const raw = partRow?.group_role != null ? String(partRow.group_role).trim().toLowerCase() : '';
@@ -7351,7 +7510,7 @@ const CHAT_LISTING_CATEGORY_LABELS = {
   2: 'משרדים',
   3: 'שותפים',
   4: 'גלובל',
-  5: 'BnB',
+  5: 'BNB',
   6: 'מגזר דתי',
   7: 'קרקעות',
   8: 'מסחרי',
@@ -7363,6 +7522,217 @@ const CHAT_LISTING_CATEGORY_LABELS = {
 /** Accept standard hyphenated UUIDs from clients (any version). */
 const CHAT_LISTING_ID_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * System account that DMs professionals about new posts matching their type.
+ * Not a real login — identified purely by this fixed email as sender_id/chat_participants.user_id
+ * (same TEXT-keyed identity model as regular users), with a fixed display name stored on
+ * chat_participants at conversation-creation time (mirrors receiver_display_name pattern below).
+ */
+const PROFESSIONAL_UPDATES_SENDER_EMAIL = 'updates@pi-professional-alerts.internal';
+const PROFESSIONAL_UPDATES_SENDER_NAME = 'עדכונים על פוסטים רלוונטים';
+
+/** Mirrors pi-front PROFESSIONAL_FILTER_TYPES (utils/constant.js) — validates client-supplied types. */
+const PROFESSIONAL_NOTIFY_TYPES = new Set([
+  'תיווך',
+  'עורך דין',
+  'עיצוב פנים',
+  'יועץ משכנתאות',
+  'שמאות',
+  'אדריכלות',
+  'מלווה משקיעים',
+]);
+
+/** subscriptions.types is JSONB; may already be an array or a JSON/CSV string depending on write path. */
+function parseSubscriptionTypesList(raw) {
+  if (Array.isArray(raw)) return raw.map(t => String(t || '').trim()).filter(Boolean);
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(t => String(t || '').trim()).filter(Boolean);
+    } catch (_) {
+      /* not JSON — fall through to CSV split */
+    }
+    return raw.split(',').map(t => t.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+/** Find (or create) the 1:1 conversation between two identities, tagging participant display info when new. */
+async function findOrCreateDirectConversationByEmail(
+  emailA,
+  emailB,
+  { displayNameA = null, displayNameB = null } = {},
+) {
+  const a = normEmail(emailA);
+  const b = normEmail(emailB);
+  if (!a || !b) return null;
+
+  const { data: aConvs } = await supabase
+    .from('chat_participants')
+    .select('conversation_id')
+    .eq('user_id', a);
+  const aConvIds = (aConvs || []).map(p => p.conversation_id);
+  if (aConvIds.length > 0) {
+    const { data: otherIn } = await supabase
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', b)
+      .in('conversation_id', aConvIds);
+    for (const row of otherIn || []) {
+      const { data: parts } = await supabase
+        .from('chat_participants')
+        .select('user_id')
+        .eq('conversation_id', row.conversation_id);
+      const emails = (parts || []).map(p => normEmail(p.user_id));
+      if (emails.length === 2 && emails.includes(a) && emails.includes(b)) {
+        return row.conversation_id;
+      }
+    }
+  }
+
+  const { data: newConv, error: newConvErr } = await supabase
+    .from('chat_conversations')
+    .insert({ type: 'direct' })
+    .select('id')
+    .single();
+  if (newConvErr || !newConv?.id) {
+    console.error('[professional-notify] failed to create conversation:', newConvErr?.message);
+    return null;
+  }
+  const convId = newConv.id;
+  const { error: insertPartsErr } = await supabase.from('chat_participants').insert([
+    { conversation_id: convId, user_id: a },
+    { conversation_id: convId, user_id: b },
+  ]);
+  if (insertPartsErr) {
+    console.error('[professional-notify] failed to add participants:', insertPartsErr.message);
+    return null;
+  }
+  // Best-effort — older DBs without a display_name column just skip this silently.
+  try {
+    if (displayNameA != null) {
+      const u = await supabase
+        .from('chat_participants')
+        .update({ display_name: displayNameA })
+        .eq('conversation_id', convId)
+        .eq('user_id', a);
+      if (u.error && !isMissingColumnError(u.error)) {
+        console.warn('[professional-notify] set display_name (A):', u.error.message);
+      }
+    }
+    if (displayNameB != null) {
+      const u = await supabase
+        .from('chat_participants')
+        .update({ display_name: displayNameB })
+        .eq('conversation_id', convId)
+        .eq('user_id', b);
+      if (u.error && !isMissingColumnError(u.error)) {
+        console.warn('[professional-notify] set display_name (B):', u.error.message);
+      }
+    }
+  } catch (_) {
+    /* best-effort */
+  }
+  return convId;
+}
+
+/** Tolerant insert — degrades gracefully if migration-chat-professional-notification.sql hasn't run yet. */
+async function insertProfessionalNotificationMessage({ conversationId, receiverEmail, body, listingId }) {
+  const basePayload = {
+    conversation_id: conversationId,
+    sender_id: PROFESSIONAL_UPDATES_SENDER_EMAIL,
+    receiver_id: receiverEmail,
+    body,
+    listing_id: listingId,
+    is_listing_share: true,
+  };
+  let r = await supabase
+    .from('chat_messages')
+    .insert({ ...basePayload, is_professional_notification: true });
+  if (!r.error) return true;
+  if (!isMissingColumnError(r.error)) {
+    console.error('[professional-notify] insert message failed:', r.error.message);
+    return false;
+  }
+  r = await supabase.from('chat_messages').insert(basePayload);
+  if (r.error) {
+    console.error('[professional-notify] insert message (fallback) failed:', r.error.message);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * After a feed post is published, DM every matching `professional` subscription
+ * (never brokers/companies) whose registered types overlap the selected ones,
+ * excluding the poster themselves. Best-effort — publish never fails because of this.
+ */
+async function notifyProfessionalsAboutPost(ad, requestedTypesRaw) {
+  const requestedTypes = (Array.isArray(requestedTypesRaw) ? requestedTypesRaw : [])
+    .map(t => String(t || '').trim())
+    .filter(t => t && PROFESSIONAL_NOTIFY_TYPES.has(t));
+  if (requestedTypes.length === 0) return;
+  const posterEmail = normEmail(ad?.creator_email);
+
+  const { data: candidates, error } = await supabase
+    .from('subscriptions')
+    .select('id, email, types, subscription_type, block_relevant_post_updates')
+    .eq('subscription_type', 'professional');
+  let professionalRows = candidates;
+  if (error && isMissingBlockOffersColumnError(error)) {
+    const fb = await supabase
+      .from('subscriptions')
+      .select('id, email, types, subscription_type')
+      .eq('subscription_type', 'professional');
+    if (fb.error) {
+      console.error('[professional-notify] subscriptions lookup failed:', fb.error.message);
+      return;
+    }
+    professionalRows = fb.data;
+  } else if (error) {
+    console.error('[professional-notify] subscriptions lookup failed:', error.message);
+    return;
+  }
+
+  const matches = (professionalRows || []).filter(row => {
+    const email = normEmail(row.email);
+    if (!email || email === posterEmail) return false;
+    if (row.block_relevant_post_updates === true) return false;
+    const types = parseSubscriptionTypesList(row.types);
+    return types.some(t => requestedTypes.includes(t));
+  });
+  if (matches.length === 0) return;
+
+  const typesLabel = requestedTypes.join(', ');
+  const posterName =
+    (ad?.creator_name && String(ad.creator_name).trim()) || 'משתמש';
+  const body = `${posterName} פרסם/ה פוסט חדש שעשוי לעניין אותך בתחום: ${typesLabel}`;
+
+  for (const row of matches) {
+    const receiverEmail = normEmail(row.email);
+    try {
+      const convId = await findOrCreateDirectConversationByEmail(
+        PROFESSIONAL_UPDATES_SENDER_EMAIL,
+        receiverEmail,
+        { displayNameA: PROFESSIONAL_UPDATES_SENDER_NAME },
+      );
+      if (!convId) continue;
+      await insertProfessionalNotificationMessage({
+        conversationId: convId,
+        receiverEmail,
+        body,
+        listingId: ad.id,
+      });
+    } catch (notifyErr) {
+      console.error(
+        '[professional-notify] failed for',
+        receiverEmail,
+        notifyErr?.message,
+      );
+    }
+  }
+}
 
 /** Matches Pi Chat offer templates — sync with pi-front ChatScreen markers */
 const CHAT_EXCLUSIVE_OFFER_BODY_MARKER = 'להציע בלעדיות על הנכס';
@@ -7444,13 +7814,19 @@ async function markChatConversationRead(userEmail, conversationId, selfRefs = nu
 }
 
 const CHAT_MESSAGE_SELECT_FULL =
+  'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share, is_professional_notification';
+const CHAT_MESSAGE_SELECT_NO_PROFESSIONAL_NOTIFICATION =
   'id, sender_id, body, created_at, media_type, media_url, listing_id, is_listing_share';
 const CHAT_MESSAGE_SELECT_FALLBACK =
   'id, sender_id, body, created_at, media_type, media_url, listing_id';
 /** Cap initial thread payload so opening a chat stays fast on long histories. */
 const CHAT_MESSAGES_INITIAL_LIMIT = 100;
 
-function mapChatMessageRow(m, myEmail, { withMedia = true, withListingShare = true } = {}) {
+function mapChatMessageRow(
+  m,
+  myEmail,
+  { withMedia = true, withListingShare = true, withProfessionalNotification = true } = {},
+) {
   const isMe = normEmail(m.sender_id) === myEmail;
   return {
     id: m.id,
@@ -7465,6 +7841,8 @@ function mapChatMessageRow(m, myEmail, { withMedia = true, withListingShare = tr
         : withListingShare && m.is_listing_share === false
           ? false
           : undefined,
+    isProfessionalNotification:
+      withProfessionalNotification && m.is_professional_notification === true,
     createdAt: m.created_at,
     isMe,
   };
@@ -7477,7 +7855,7 @@ async function loadChatMessagesForConversation(
 ) {
   const cap = Number(limit);
   const useCap = Number.isFinite(cap) && cap > 0;
-  const runSelect = async (selectCols, withListingShare) => {
+  const runSelect = async (selectCols, withListingShare, withProfessionalNotification) => {
     let q = supabase
       .from('chat_messages')
       .select(selectCols)
@@ -7497,15 +7875,19 @@ async function loadChatMessagesForConversation(
         mapChatMessageRow(m, myEmail, {
           withMedia: selectCols.includes('media_type'),
           withListingShare,
+          withProfessionalNotification,
         }),
       ),
     };
   };
 
-  let r = await runSelect(CHAT_MESSAGE_SELECT_FULL, true);
+  let r = await runSelect(CHAT_MESSAGE_SELECT_FULL, true, true);
   if (!r.error) return r.rows;
   if (!isMissingColumnError(r.error)) throw r.error;
-  r = await runSelect(CHAT_MESSAGE_SELECT_FALLBACK, false);
+  r = await runSelect(CHAT_MESSAGE_SELECT_NO_PROFESSIONAL_NOTIFICATION, true, false);
+  if (!r.error) return r.rows;
+  if (!isMissingColumnError(r.error)) throw r.error;
+  r = await runSelect(CHAT_MESSAGE_SELECT_FALLBACK, false, false);
   if (r.error) throw r.error;
   return r.rows;
 }
@@ -9019,11 +9401,11 @@ app.get('/api/listings/:id/preview', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid id' });
     }
     let row = null;
+    const PREVIEW_SELECT_WITH_CREATOR =
+      'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose, creator_email, creator_name, profile_image_url, subscription_id';
     const primary = await supabase
       .from('ads')
-      .select(
-        'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose',
-      )
+      .select(PREVIEW_SELECT_WITH_CREATOR)
       .eq('id', id)
       .maybeSingle();
     if (primary.error && isMissingColumnError(primary.error)) {
@@ -9051,6 +9433,10 @@ app.get('/api/listings/:id/preview', async (req, res) => {
           address: null,
           purpose: null,
           purposeLabel: 'למכירה',
+          creatorEmail: null,
+          creatorName: null,
+          creatorProfileImageUrl: null,
+          subscriptionId: null,
         },
       });
     }
@@ -9073,6 +9459,10 @@ app.get('/api/listings/:id/preview', async (req, res) => {
         address: row.address != null && String(row.address).trim() ? String(row.address).trim() : null,
         purpose: purposeRaw || null,
         purposeLabel,
+        creatorEmail: row.creator_email != null && String(row.creator_email).trim() ? String(row.creator_email).trim() : null,
+        creatorName: row.creator_name != null && String(row.creator_name).trim() ? String(row.creator_name).trim() : null,
+        creatorProfileImageUrl: row.profile_image_url != null && String(row.profile_image_url).trim() ? String(row.profile_image_url).trim() : null,
+        subscriptionId: row.subscription_id != null ? String(row.subscription_id) : null,
       },
     });
   } catch (err) {
@@ -9089,6 +9479,10 @@ app.get('/api/listings/:id/preview', async (req, res) => {
         address: null,
         purpose: null,
         purposeLabel: 'למכירה',
+        creatorEmail: null,
+        creatorName: null,
+        creatorProfileImageUrl: null,
+        subscriptionId: null,
       },
     });
   }
@@ -9844,6 +10238,25 @@ app.post('/api/listings', async (req, res) => {
         // Mux over quota or unavailable — keep the raw video_url so the client
         // can still play the MP4 directly.
         console.error('[mux] ad create processing failed:', muxErr.message);
+      }
+    }
+
+    // Post → professional-type notification: opt-in step in the publish flow.
+    // Best-effort — never blocks or fails the publish response.
+    const adIsFeedPost =
+      ad.feed_post === true || ad.feed_post === 'true' || ad.feed_post === 't';
+    if (adIsFeedPost) {
+      const notifyTypesRaw =
+        req.body.notify_professional_types ?? req.body.notifyProfessionalTypes;
+      const notifyTypes = Array.isArray(notifyTypesRaw)
+        ? notifyTypesRaw.map(t => String(t || '').trim()).filter(Boolean)
+        : [];
+      if (notifyTypes.length > 0) {
+        try {
+          await notifyProfessionalsAboutPost(ad, notifyTypes);
+        } catch (notifyErr) {
+          console.error('[professional-notify] post-publish hook failed:', notifyErr.message);
+        }
       }
     }
 

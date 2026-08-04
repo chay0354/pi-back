@@ -72,5 +72,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_apple_user_id_uidx
 COMMENT ON COLUMN public.subscriptions.apple_user_id IS
   'Stable Apple Sign In subject (sub) for re-login when email is omitted.';
 
+-- migration-chat-professional-notification.sql
+ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_professional_notification BOOLEAN NOT NULL DEFAULT FALSE;
+
+COMMENT ON COLUMN chat_messages.is_professional_notification IS
+  'True for system-sent "עדכונים על פוסטים רלוונטים" post notifications to matching professionals; enables the in-bubble contact-poster button. False for normal shares/messages.';
+
+-- migration-subscription-block-relevant-post-updates.sql
+ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS block_relevant_post_updates BOOLEAN NOT NULL DEFAULT FALSE;
+
+COMMENT ON COLUMN subscriptions.block_relevant_post_updates IS
+  'When true, the professional will not receive system chat notifications about new posts tagged for their profession type.';
+
+-- migration-chat-group-kind.sql
+ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS group_kind TEXT NULL;
+
+COMMENT ON COLUMN chat_conversations.group_kind IS
+  'Group member policy: brokers (broker-only), customers (regular users only), open (any subscription type).';
+
 -- Refresh PostgREST schema cache
 NOTIFY pgrst, 'reload schema';
