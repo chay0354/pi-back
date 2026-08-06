@@ -114,8 +114,13 @@ async function buildAdRecordFromListingBody(body, supabase) {
         const type = (sub.subscription_type || '').toLowerCase();
         if (type === 'company') {
           creatorName = sub.business_name || sub.name || sub.contact_person_name || null;
-        } else if (type === 'broker') {
-          creatorName = sub.broker_office_name || sub.name || sub.contact_person_name || null;
+        } else if (type === 'broker' || type === 'project_marketer') {
+          creatorName =
+            sub.broker_office_name ||
+            sub.business_name ||
+            sub.name ||
+            sub.contact_person_name ||
+            null;
         } else {
           creatorName = sub.name || sub.business_name || sub.contact_person_name || null;
         }

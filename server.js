@@ -163,10 +163,46 @@ function isB2BSubscriptionType(type) {
   return B2B_SUBSCRIPTION_TYPES.has(String(type || '').trim().toLowerCase());
 }
 
-/** Company-style accounts: business_name is the display name and the logo is the avatar. */
+/** Developer-company accounts: business_name is the display name and the logo is the avatar. */
 function isCompanyLikeSubscriptionType(type) {
   const t = String(type || '').trim().toLowerCase();
-  return t === 'company' || t === 'project_marketer';
+  return t === 'company';
+}
+
+/** Broker + משווק פרויקטים — same listing/profile display rules as brokers. */
+function isBrokerLikeSubscriptionType(type) {
+  const t = String(type || '').trim().toLowerCase();
+  return t === 'broker' || t === 'project_marketer';
+}
+
+function subscriptionDisplayNameFromRow(sub) {
+  if (!sub) return null;
+  const type = String(sub.subscription_type || '').toLowerCase();
+  if (isCompanyLikeSubscriptionType(type)) {
+    return sub.business_name || sub.name || sub.contact_person_name || null;
+  }
+  if (isBrokerLikeSubscriptionType(type)) {
+    return (
+      sub.broker_office_name ||
+      sub.business_name ||
+      sub.name ||
+      sub.contact_person_name ||
+      null
+    );
+  }
+  return sub.name || sub.business_name || sub.contact_person_name || null;
+}
+
+function subscriptionAvatarUrlFromRow(sub) {
+  if (!sub) return null;
+  const type = String(sub.subscription_type || '').toLowerCase();
+  if (isCompanyLikeSubscriptionType(type)) {
+    return sub.company_logo_url || sub.profile_picture_url || null;
+  }
+  if (isBrokerLikeSubscriptionType(type)) {
+    return sub.profile_picture_url || sub.company_logo_url || null;
+  }
+  return sub.profile_picture_url || sub.company_logo_url || null;
 }
 
 function hashPassword(password) {
@@ -2301,7 +2337,7 @@ const AGENCY_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const AGENCY_MEMBER_SELECT =
-  'id, email, name, business_name, contact_person_name, subscription_type, ' +
+  'id, email, name, business_name, contact_person_name, broker_office_name, subscription_type, ' +
   'profile_picture_url, company_logo_url, subscriber_number, marketer_plan, ' +
   'marketer_seat_limit, parent_subscription_id, created_at';
 
@@ -5977,15 +6013,8 @@ app.get('/api/reviews', async (req, res) => {
 function getSubscriptionDisplayNameAndImage(sub) {
   if (!sub) return { name: null, imageUrl: null };
   const type = (sub.subscription_type || '').toLowerCase();
-  let name = null;
-  if (isCompanyLikeSubscriptionType(type)) name = sub.business_name || sub.name || sub.contact_person_name || null;
-  else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
-  else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
-  else name = sub.name || sub.contact_person_name || sub.business_name || sub.broker_office_name || null;
-  const imageUrl =
-    sub.profile_picture_url ||
-    ((isCompanyLikeSubscriptionType(type) || type === 'broker') ? sub.company_logo_url : null) ||
-    null;
+  const name = subscriptionDisplayNameFromRow(sub);
+  const imageUrl = subscriptionAvatarUrlFromRow(sub);
   return {
     name: name && String(name).trim() ? String(name).trim() : null,
     imageUrl: imageUrl && String(imageUrl).trim() ? String(imageUrl).trim() : null,
@@ -6638,6 +6667,12 @@ app.get('/api/listings', async (req, res) => {
     const isOwnerViewEarly =
       !favoritesOnly && subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
     let effectiveSubscriptionTypes = subscriptionTypes;
+    if (
+      effectiveSubscriptionTypes.includes('broker') &&
+      !effectiveSubscriptionTypes.includes('project_marketer')
+    ) {
+      effectiveSubscriptionTypes = [...effectiveSubscriptionTypes, 'project_marketer'];
+    }
     if (!favoritesOnly && !isOwnerViewEarly && category != null && !isNaN(category)) {
       if (category === PARTNERS_REGULAR_USER_ONLY_CATEGORY) {
         const wantsProfessionalOnly =
@@ -6823,15 +6858,8 @@ app.get('/api/listings', async (req, res) => {
         if (subs && subs.length) {
           subs.forEach(s => {
             // Display name by registration type (subscriptions has no agent_name column; broker agent is in "name")
-            let displayName = null;
+            let displayName = subscriptionDisplayNameFromRow(s);
             const type = (s.subscription_type || '').toLowerCase();
-            if (isCompanyLikeSubscriptionType(type)) {
-              displayName = s.business_name || s.name || s.contact_person_name || null;
-            } else if (type === 'broker') {
-              displayName = s.broker_office_name || s.name || s.contact_person_name || null;
-            } else {
-              displayName = s.name || s.business_name || s.contact_person_name || null;
-            }
             let creatorSpecialties = null;
             if (s.specializations != null) {
               if (Array.isArray(s.specializations)) creatorSpecialties = s.specializations;
@@ -6871,10 +6899,7 @@ app.get('/api/listings', async (req, res) => {
             creatorBySubId[s.id] = {
               creator_email: s.email || null,
               creator_name: displayName || null,
-              creator_profile_image_url:
-                s.profile_picture_url ||
-                (isCompanyLikeSubscriptionType(type) ? s.company_logo_url : null) ||
-                null,
+              creator_profile_image_url: subscriptionAvatarUrlFromRow(s),
               creator_subscription_type:
                 s.subscription_type != null && String(s.subscription_type).trim() !== ''
                   ? String(s.subscription_type).trim()
@@ -7042,15 +7067,7 @@ app.get('/api/listings', async (req, res) => {
 // ==================== STORIES (separate from ads) ====================
 
 function subscriptionDisplayNameForStory(sub) {
-  if (!sub) return 'משתמש';
-  const type = String(sub.subscription_type || '').toLowerCase();
-  if (isCompanyLikeSubscriptionType(type)) {
-    return sub.business_name || sub.name || sub.contact_person_name || 'משתמש';
-  }
-  if (type === 'broker') {
-    return sub.broker_office_name || sub.name || sub.contact_person_name || 'משתמש';
-  }
-  return sub.name || sub.business_name || sub.contact_person_name || 'משתמש';
+  return subscriptionDisplayNameFromRow(sub) || 'משתמש';
 }
 
 function storyHasVideoUrl(u) {
@@ -7639,21 +7656,9 @@ async function resolveExistingImageUrl(value, cache = null) {
   }
 }
 
-function subscriptionDisplayNameFromRow(sub) {
-  if (!sub) return null;
-  const type = (sub.subscription_type || '').toLowerCase();
-  if (isCompanyLikeSubscriptionType(type)) return sub.business_name || sub.name || sub.contact_person_name || null;
-  if (type === 'broker') return sub.broker_office_name || sub.name || sub.contact_person_name || null;
-  if (type === 'professional') return sub.name || sub.business_name || sub.contact_person_name || null;
-  return sub.name || sub.contact_person_name || sub.business_name || null;
-}
-
 function subscriptionProfilePicFromRow(sub) {
   if (!sub) return null;
-  const type = (sub.subscription_type || '').toLowerCase();
-  return asPublicImageUrl(
-    sub.profile_picture_url || (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) || null,
-  );
+  return asPublicImageUrl(subscriptionAvatarUrlFromRow(sub));
 }
 
 /** PostgREST/Postgres when `group_image_url` migration was not applied yet */
