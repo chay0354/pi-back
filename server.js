@@ -7,7 +7,14 @@ const { Pool } = require('pg');
 const { Resend } = require('resend');
 const muxVideo = require('./muxVideo');
 
-const B2B_SUBSCRIPTION_TYPES = new Set(['broker', 'company', 'professional']);
+const B2B_SUBSCRIPTION_TYPES = new Set([
+  'broker',
+  'company',
+  'professional',
+  'project_marketer',
+]);
+/** משווק פרויקטים plans — team plans may issue agency join codes. */
+const MARKETER_SEAT_LIMIT_BY_PLAN = {single: null, team5: 5, team10: 10};
 const MIN_PASSWORD_LENGTH = 8;
 const DEFAULT_MONTHLY_LISTING_QUOTA = 65;
 // Every account starts with 3 months of usage; coupons extend by 3/6/12 months.
@@ -154,6 +161,12 @@ async function applyPromoCodeToSubscription(subscriptionId, codeRaw) {
 
 function isB2BSubscriptionType(type) {
   return B2B_SUBSCRIPTION_TYPES.has(String(type || '').trim().toLowerCase());
+}
+
+/** Company-style accounts: business_name is the display name and the logo is the avatar. */
+function isCompanyLikeSubscriptionType(type) {
+  const t = String(type || '').trim().toLowerCase();
+  return t === 'company' || t === 'project_marketer';
 }
 
 function hashPassword(password) {
@@ -1189,6 +1202,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       specializations, // Array of selected specializations (for professional)
       activityRegions, // Array of selected regions (for broker)
       agreedToTerms,
+      marketerPlan, // project_marketer: 'single' | 'team5' | 'team10'
       profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
       company_logo_url, // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
       video_url, // Optional: pre-uploaded intro video URL (Android JSON submit)
@@ -1196,11 +1210,11 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
     } = req.body;
 
     // Validate required fields based on subscription type
-    if (subscriptionType === 'company') {
+    if (subscriptionType === 'project_marketer' || subscriptionType === 'company') {
       if (!businessName || !contactPersonName || !email || !officePhone) {
         return res.status(400).json({ 
           success: false, 
-          error: 'Missing required fields for company subscription (businessName, contactPersonName, email, officePhone)' 
+          error: 'Missing required fields (businessName, contactPersonName, email, officePhone)' 
         });
       }
     } else if (subscriptionType === 'broker') {
@@ -1368,9 +1382,9 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
     // Save subscription data to database
-    // Ensure subscription_type is preserved correctly for all 3 flows: broker, company, professional
+    // Ensure subscription_type is preserved for every B2B flow
     const subscriptionData = {
-      subscription_type: subscriptionType, // 'broker', 'company', or 'professional' - PRESERVED
+      subscription_type: subscriptionType, // broker | company | professional | project_marketer
       email: emailNorm,
       phone: phone || officePhone,
       name: name || agentName || businessName || contactPersonName, // Use name, agentName, businessName, or contactPersonName
@@ -1399,6 +1413,19 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
       created_at: new Date().toISOString()
     };
+
+    if (subscriptionType === 'project_marketer') {
+      const plan = String(marketerPlan || 'single').trim();
+      const normalizedPlan = Object.prototype.hasOwnProperty.call(
+        MARKETER_SEAT_LIMIT_BY_PLAN,
+        plan,
+      )
+        ? plan
+        : 'single';
+      subscriptionData.marketer_plan = normalizedPlan;
+      subscriptionData.marketer_seat_limit =
+        MARKETER_SEAT_LIMIT_BY_PLAN[normalizedPlan];
+    }
 
     const { data: subscription, error: dbError } = await supabase
       .from('subscriptions')
@@ -2266,6 +2293,253 @@ app.post('/api/users/register-regular', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// משווקי פרויקטים — agency teams (manager issues a join code, marketers join it)
+// ---------------------------------------------------------------------------
+
+const AGENCY_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const AGENCY_MEMBER_SELECT =
+  'id, email, name, business_name, contact_person_name, subscription_type, ' +
+  'profile_picture_url, company_logo_url, subscriber_number, marketer_plan, ' +
+  'marketer_seat_limit, parent_subscription_id, created_at';
+
+/** Manager row by subscription id or email. Only team plans may run an agency. */
+async function findMarketingManager({subscriptionId, email}) {
+  const id = subscriptionId != null ? String(subscriptionId).trim() : '';
+  const mail = normalizeSubscriptionEmail(email);
+  let query = supabase.from('subscriptions').select(AGENCY_MEMBER_SELECT);
+  if (id && AGENCY_UUID_RE.test(id)) {
+    query = query.eq('id', id);
+  } else if (isValidSubscriptionEmail(mail)) {
+    query = query.ilike('email', mail);
+  } else {
+    return null;
+  }
+  const {data, error} = await query.limit(1).maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+function managerCanRunAgency(row) {
+  if (!row) return false;
+  if (String(row.subscription_type || '') !== 'project_marketer') return false;
+  return Number(row.marketer_seat_limit) > 0;
+}
+
+function generateAgencyCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(8);
+  let out = '';
+  for (let i = 0; i < 8; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
+
+async function countAgencyMembers(managerId) {
+  const {count, error} = await supabase
+    .from('subscriptions')
+    .select('id', {count: 'exact', head: true})
+    .eq('parent_subscription_id', managerId);
+  if (error) throw error;
+  return count || 0;
+}
+
+// GET /api/agency/join-code?manager_subscription_id=...  (or manager_email)
+app.get('/api/agency/join-code', async (req, res) => {
+  try {
+    const manager = await findMarketingManager({
+      subscriptionId: req.query.manager_subscription_id,
+      email: req.query.manager_email,
+    });
+    if (!managerCanRunAgency(manager)) {
+      return res.status(403).json({success: false, error: 'אין הרשאה לנהל סוכנות'});
+    }
+    const {data, error} = await supabase
+      .from('agency_join_codes')
+      .select('code, created_at, expires_at, is_active')
+      .eq('manager_subscription_id', manager.id)
+      .eq('is_active', true)
+      .order('created_at', {ascending: false})
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return res.json({
+      success: true,
+      code: data?.code || null,
+      seatLimit: manager.marketer_seat_limit,
+      memberCount: await countAgencyMembers(manager.id),
+    });
+  } catch (err) {
+    console.error('GET /api/agency/join-code:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+// POST /api/agency/join-code — issue a fresh code (deactivates previous ones).
+app.post('/api/agency/join-code', async (req, res) => {
+  try {
+    const manager = await findMarketingManager({
+      subscriptionId: req.body?.manager_subscription_id,
+      email: req.body?.manager_email,
+    });
+    if (!managerCanRunAgency(manager)) {
+      return res.status(403).json({success: false, error: 'אין הרשאה לנהל סוכנות'});
+    }
+    await supabase
+      .from('agency_join_codes')
+      .update({is_active: false})
+      .eq('manager_subscription_id', manager.id)
+      .eq('is_active', true);
+
+    let inserted = null;
+    for (let attempt = 0; attempt < 5 && !inserted; attempt += 1) {
+      const {data, error} = await supabase
+        .from('agency_join_codes')
+        .insert({code: generateAgencyCode(), manager_subscription_id: manager.id})
+        .select('code, created_at')
+        .single();
+      if (!error) {
+        inserted = data;
+      } else if (error.code !== '23505') {
+        throw error;
+      }
+    }
+    if (!inserted) {
+      return res.status(500).json({success: false, error: 'יצירת קוד נכשלה, נסה שוב'});
+    }
+    return res.json({
+      success: true,
+      code: inserted.code,
+      seatLimit: manager.marketer_seat_limit,
+      memberCount: await countAgencyMembers(manager.id),
+    });
+  } catch (err) {
+    console.error('POST /api/agency/join-code:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+// POST /api/agency/join — marketer signs up under an existing agency using a code.
+app.post('/api/agency/join', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const code = String(body.code || '').trim().toUpperCase();
+    const emailNorm = normalizeSubscriptionEmail(body.email);
+    const password = String(body.password || '');
+    const name = body.name != null && String(body.name).trim() ? String(body.name).trim() : null;
+
+    if (!code) return res.status(400).json({success: false, error: 'נדרש קוד הצטרפות'});
+    if (!isValidSubscriptionEmail(emailNorm)) {
+      return res.status(400).json({success: false, error: 'כתובת מייל לא תקינה'});
+    }
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({
+        success: false,
+        error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+      });
+    }
+
+    const {data: codeRow, error: codeErr} = await supabase
+      .from('agency_join_codes')
+      .select('id, manager_subscription_id, is_active, expires_at')
+      .eq('code', code)
+      .eq('is_active', true)
+      .maybeSingle();
+    if (codeErr) throw codeErr;
+    if (!codeRow) {
+      return res.status(404).json({success: false, error: 'קוד ההצטרפות לא נמצא או שאינו פעיל'});
+    }
+    if (codeRow.expires_at && new Date(codeRow.expires_at) < new Date()) {
+      return res.status(410).json({success: false, error: 'תוקף קוד ההצטרפות פג'});
+    }
+
+    const {data: manager, error: mgrErr} = await supabase
+      .from('subscriptions')
+      .select(AGENCY_MEMBER_SELECT)
+      .eq('id', codeRow.manager_subscription_id)
+      .maybeSingle();
+    if (mgrErr) throw mgrErr;
+    if (!managerCanRunAgency(manager)) {
+      return res.status(403).json({success: false, error: 'הסוכנות אינה פעילה'});
+    }
+
+    const memberCount = await countAgencyMembers(manager.id);
+    if (memberCount >= Number(manager.marketer_seat_limit)) {
+      return res.status(409).json({success: false, error: 'הסוכנות הגיעה למספר המשתמשים המרבי'});
+    }
+
+    try {
+      await assertEmailAvailableForRegistration(emailNorm);
+    } catch (emailErr) {
+      if (emailErr.statusCode === 409) return registrationEmailTakenResponse(res);
+      throw emailErr;
+    }
+
+    const {data: inserted, error: insertErr} = await supabase
+      .from('subscriptions')
+      .insert({
+        subscription_type: 'project_marketer',
+        email: emailNorm,
+        name: name || emailNorm.split('@')[0],
+        business_name: manager.business_name || null,
+        parent_subscription_id: manager.id,
+        marketer_plan: 'single',
+        password_hash: hashPassword(password),
+        status: 'verified',
+        verified_at: new Date().toISOString(),
+        subscriber_number: await generateUniqueSubscriberNumber(),
+        access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
+        max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
+      })
+      .select('*')
+      .single();
+    if (insertErr) {
+      if (isUniqueEmailViolation(insertErr)) return registrationEmailTakenResponse(res);
+      throw insertErr;
+    }
+
+    return res.json({
+      success: true,
+      subscription: sanitizeSubscriptionForClient(inserted),
+      agency: {
+        id: manager.id,
+        name: manager.business_name || manager.name || null,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/agency/join:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
+// GET /api/agency/members?manager_subscription_id=...  (or manager_email)
+app.get('/api/agency/members', async (req, res) => {
+  try {
+    const manager = await findMarketingManager({
+      subscriptionId: req.query.manager_subscription_id,
+      email: req.query.manager_email,
+    });
+    if (!managerCanRunAgency(manager)) {
+      return res.status(403).json({success: false, error: 'אין הרשאה לנהל סוכנות'});
+    }
+    const {data, error} = await supabase
+      .from('subscriptions')
+      .select(AGENCY_MEMBER_SELECT)
+      .eq('parent_subscription_id', manager.id)
+      .order('created_at', {ascending: true});
+    if (error) throw error;
+    return res.json({
+      success: true,
+      members: (data || []).map(sanitizeSubscriptionForClient),
+      seatLimit: manager.marketer_seat_limit,
+    });
+  } catch (err) {
+    console.error('GET /api/agency/members:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
 function getGoogleClientIds() {
   return String(process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || '')
     .split(',')
@@ -2778,6 +3052,7 @@ const SUBSCRIPTION_SELECT =
   'profile_picture_url, company_logo_url, video_url, additional_images_urls, ' +
   'specializations, activity_regions, types, description, phone, ' +
   'block_exclusive_offers, block_collab_offers, block_relevant_post_updates, ' +
+  'marketer_plan, marketer_seat_limit, parent_subscription_id, ' +
   'created_at, updated_at';
 
 const CHAT_OFFER_PREFERENCE_FIELDS = [
@@ -3504,15 +3779,13 @@ app.get('/api/users/group-picker', async (req, res) => {
         : 'all';
     const limit = 120;
 
-    const isRegularType = (st) => {
-      const t = st != null ? String(st).trim().toLowerCase() : '';
-      return t !== 'broker' && t !== 'company' && t !== 'professional';
-    };
+    const isRegularType = (st) => !isB2BSubscriptionType(st);
     const isNonRegularType = (st) => !isRegularType(st);
     const typeLabel = (st) => {
       const t = st != null ? String(st).trim().toLowerCase() : '';
       if (t === 'broker') return 'מתווך';
       if (t === 'company') return 'חברה';
+      if (t === 'project_marketer') return 'משווק פרויקטים';
       if (t === 'professional') return 'בעל מקצוע';
       return 'לקוח';
     };
@@ -3796,7 +4069,7 @@ app.post('/api/chat/groups', async (req, res) => {
       .trim()
       .toLowerCase();
     const creatorIsBroker = creatorType === 'broker';
-    const creatorIsCompany = creatorType === 'company';
+    const creatorIsCompany = isCompanyLikeSubscriptionType(creatorType);
     const creatorIsProfessional = creatorType === 'professional';
     const creatorIsRegular = isRegularSubscriptionTypeForGroup(creatorSub?.subscription_type);
     if (!creatorIsBroker && !creatorIsRegular && !creatorIsCompany && !creatorIsProfessional) {
@@ -4002,7 +4275,7 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     const actorIsBroker = isBrokerSubscriptionTypeForGroup(actorType);
     const actorIsRegular = isRegularSubscriptionTypeForGroup(actorType);
     const actorIsProfessional = actorType === 'professional';
-    const actorIsCompany = actorType === 'company';
+    const actorIsCompany = isCompanyLikeSubscriptionType(actorType);
     if (!actorIsBroker && !actorIsRegular && !actorIsProfessional && !actorIsCompany) {
       return res.status(403).json({ success: false, error: 'אין הרשאה להוסיף חברים לקבוצה' });
     }
@@ -4953,6 +5226,7 @@ const followTypeLabel = type => {
     .toLowerCase();
   if (t === 'broker') return 'תיווך';
   if (t === 'company') return 'חברה';
+  if (t === 'project_marketer') return 'משווק פרויקטים';
   if (t === 'professional') return 'מקצועי';
   return 'משתמש';
 };
@@ -5704,13 +5978,13 @@ function getSubscriptionDisplayNameAndImage(sub) {
   if (!sub) return { name: null, imageUrl: null };
   const type = (sub.subscription_type || '').toLowerCase();
   let name = null;
-  if (type === 'company') name = sub.business_name || sub.name || sub.contact_person_name || null;
+  if (isCompanyLikeSubscriptionType(type)) name = sub.business_name || sub.name || sub.contact_person_name || null;
   else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
   else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
   else name = sub.name || sub.contact_person_name || sub.business_name || sub.broker_office_name || null;
   const imageUrl =
     sub.profile_picture_url ||
-    ((type === 'company' || type === 'broker') ? sub.company_logo_url : null) ||
+    ((isCompanyLikeSubscriptionType(type) || type === 'broker') ? sub.company_logo_url : null) ||
     null;
   return {
     name: name && String(name).trim() ? String(name).trim() : null,
@@ -6350,7 +6624,7 @@ app.get('/api/listings', async (req, res) => {
       }
     }
 
-    const allowedSubscriptionTypes = ['user', 'broker', 'company', 'professional'];
+    const allowedSubscriptionTypes = ['user', 'broker', 'company', 'professional', 'project_marketer'];
     const subscriptionTypes = subscriptionTypeParam
       ? subscriptionTypeParam.split(',').map(s => s.trim()).filter(s => allowedSubscriptionTypes.includes(s))
       : [];
@@ -6551,7 +6825,7 @@ app.get('/api/listings', async (req, res) => {
             // Display name by registration type (subscriptions has no agent_name column; broker agent is in "name")
             let displayName = null;
             const type = (s.subscription_type || '').toLowerCase();
-            if (type === 'company') {
+            if (isCompanyLikeSubscriptionType(type)) {
               displayName = s.business_name || s.name || s.contact_person_name || null;
             } else if (type === 'broker') {
               displayName = s.broker_office_name || s.name || s.contact_person_name || null;
@@ -6599,7 +6873,7 @@ app.get('/api/listings', async (req, res) => {
               creator_name: displayName || null,
               creator_profile_image_url:
                 s.profile_picture_url ||
-                (type === 'company' ? s.company_logo_url : null) ||
+                (isCompanyLikeSubscriptionType(type) ? s.company_logo_url : null) ||
                 null,
               creator_subscription_type:
                 s.subscription_type != null && String(s.subscription_type).trim() !== ''
@@ -6770,7 +7044,7 @@ app.get('/api/listings', async (req, res) => {
 function subscriptionDisplayNameForStory(sub) {
   if (!sub) return 'משתמש';
   const type = String(sub.subscription_type || '').toLowerCase();
-  if (type === 'company') {
+  if (isCompanyLikeSubscriptionType(type)) {
     return sub.business_name || sub.name || sub.contact_person_name || 'משתמש';
   }
   if (type === 'broker') {
@@ -6914,7 +7188,7 @@ app.get('/api/stories/feed', async (req, res) => {
       const st = (s.subscription_type || '').toLowerCase();
       const pic =
         s.profile_picture_url ||
-        (st === 'company' ? s.company_logo_url : null) ||
+        (isCompanyLikeSubscriptionType(st) ? s.company_logo_url : null) ||
         null;
 
       let ringUpdatedAt = s.updated_at;
@@ -7368,7 +7642,7 @@ async function resolveExistingImageUrl(value, cache = null) {
 function subscriptionDisplayNameFromRow(sub) {
   if (!sub) return null;
   const type = (sub.subscription_type || '').toLowerCase();
-  if (type === 'company') return sub.business_name || sub.name || sub.contact_person_name || null;
+  if (isCompanyLikeSubscriptionType(type)) return sub.business_name || sub.name || sub.contact_person_name || null;
   if (type === 'broker') return sub.broker_office_name || sub.name || sub.contact_person_name || null;
   if (type === 'professional') return sub.name || sub.business_name || sub.contact_person_name || null;
   return sub.name || sub.contact_person_name || sub.business_name || null;
@@ -7378,7 +7652,7 @@ function subscriptionProfilePicFromRow(sub) {
   if (!sub) return null;
   const type = (sub.subscription_type || '').toLowerCase();
   return asPublicImageUrl(
-    sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null,
+    sub.profile_picture_url || (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) || null,
   );
 }
 
@@ -7456,8 +7730,7 @@ function normalizeChatGroupKind(raw) {
 }
 
 function isRegularSubscriptionTypeForGroup(st) {
-  const t = st != null ? String(st).trim().toLowerCase() : '';
-  return t !== 'broker' && t !== 'company' && t !== 'professional';
+  return !isB2BSubscriptionType(st);
 }
 
 function isBrokerSubscriptionTypeForGroup(st) {
@@ -7471,7 +7744,7 @@ function inferLegacyChatGroupKind(typeByEmail, creatorEmailNorm) {
   const hasBroker = types.some(isBrokerSubscriptionTypeForGroup);
   const hasRegular = types.some(isRegularSubscriptionTypeForGroup);
   const hasPro = types.some((t) => String(t).trim().toLowerCase() === 'professional');
-  const hasCompany = types.some((t) => String(t).trim().toLowerCase() === 'company');
+  const hasCompany = types.some(isCompanyLikeSubscriptionType);
   if (hasBroker && !hasRegular && !hasPro && !hasCompany) return 'brokers';
   if (hasPro || hasCompany || (hasBroker && (hasRegular || hasPro || hasCompany))) return 'open';
   const creatorType = creatorEmailNorm ? typeByEmail[normEmail(creatorEmailNorm)] : null;
@@ -8250,14 +8523,14 @@ app.get('/api/chat/conversations', async (req, res) => {
         const e = normEmail(s.email);
         const type = (s.subscription_type || '').toLowerCase();
         let name = null;
-        if (type === 'company') name = s.business_name || s.name || s.contact_person_name || null;
+        if (isCompanyLikeSubscriptionType(type)) name = s.business_name || s.name || s.contact_person_name || null;
         else if (type === 'broker') name = s.broker_office_name || s.name || s.contact_person_name || null;
         else if (type === 'professional') name = s.name || s.business_name || s.contact_person_name || null;
         else name = s.name || s.contact_person_name || s.business_name || null;
         const pic =
           asPublicImageUrl(
             s.profile_picture_url ||
-            (type === 'company' ? s.company_logo_url : null) ||
+            (isCompanyLikeSubscriptionType(type) ? s.company_logo_url : null) ||
             null,
           ) ||
           null;
@@ -8673,11 +8946,11 @@ app.get('/api/chat/participant-display', async (req, res) => {
     if (sub) {
       const type = (sub.subscription_type || '').toLowerCase();
       let displayName = null;
-      if (type === 'company') displayName = sub.business_name || sub.name || sub.contact_person_name || null;
+      if (isCompanyLikeSubscriptionType(type)) displayName = sub.business_name || sub.name || sub.contact_person_name || null;
       else if (type === 'broker') displayName = sub.broker_office_name || sub.name || sub.contact_person_name || null;
       else if (type === 'professional') displayName = sub.name || sub.business_name || sub.contact_person_name || null;
       else displayName = sub.name || sub.contact_person_name || sub.business_name || null;
-      const profilePic = sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null;
+      const profilePic = sub.profile_picture_url || (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) || null;
       const profileImageUrl = asPublicImageUrl(profilePic);
       const phone = pickSubscriptionPhone(sub);
       return res.json({
@@ -9105,7 +9378,7 @@ app.post('/api/chat/messages', async (req, res) => {
           )
             .trim()
             .toLowerCase();
-          if (senderType === 'company' && receiverType === 'broker') {
+          if (isCompanyLikeSubscriptionType(senderType) && receiverType === 'broker') {
             return res.status(403).json({
               success: false,
               error: 'חברה לא יכולה לשלוח הצעת שת״פ למתווך',
@@ -9402,7 +9675,7 @@ app.get('/api/listings/:id/preview', async (req, res) => {
     }
     let row = null;
     const PREVIEW_SELECT_WITH_CREATOR =
-      'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose, creator_email, creator_name, profile_image_url, subscription_id';
+      'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose, creator_email, creator_name, profile_image_url, subscription_id, general_details, category';
     const primary = await supabase
       .from('ads')
       .select(PREVIEW_SELECT_WITH_CREATOR)
@@ -9443,6 +9716,7 @@ app.get('/api/listings/:id/preview', async (req, res) => {
     const additional = Array.isArray(row.additional_image_urls) ? row.additional_image_urls : [];
     const mediaUrl =
       (row.main_image_url && String(row.main_image_url).trim()) ||
+      (row.video_url && String(row.video_url).trim()) ||
       (additional.find(u => u && String(u).trim()) || null);
     const purposeRaw = row.purpose != null ? String(row.purpose).trim().toLowerCase() : '';
     const purposeLabel = purposeRaw === 'rent' ? 'להשכרה' : 'למכירה';
@@ -9463,6 +9737,8 @@ app.get('/api/listings/:id/preview', async (req, res) => {
         creatorName: row.creator_name != null && String(row.creator_name).trim() ? String(row.creator_name).trim() : null,
         creatorProfileImageUrl: row.profile_image_url != null && String(row.profile_image_url).trim() ? String(row.profile_image_url).trim() : null,
         subscriptionId: row.subscription_id != null ? String(row.subscription_id) : null,
+        generalDetails: row.general_details ?? null,
+        category: row.category != null ? row.category : null,
       },
     });
   } catch (err) {
@@ -10003,7 +10279,7 @@ app.post('/api/posts/:id/comments', async (req, res) => {
       if (sub) {
         const subType = String(sub.subscription_type || '').toLowerCase();
         commenterName =
-          subType === 'company'
+          isCompanyLikeSubscriptionType(subType)
             ? (sub.business_name || sub.name || sub.contact_person_name || commenterName)
             : (sub.name || sub.contact_person_name || sub.business_name || commenterName);
         commenterImageUrl = sub.profile_picture_url || sub.company_logo_url || null;
@@ -10596,12 +10872,12 @@ app.get('/api/search/users/recent', async (req, res) => {
         if (!sub) return null;
         const type = (sub.subscription_type || '').toLowerCase();
         let name = null;
-        if (type === 'company') name = sub.business_name || sub.name || sub.contact_person_name || null;
+        if (isCompanyLikeSubscriptionType(type)) name = sub.business_name || sub.name || sub.contact_person_name || null;
         else if (type === 'broker') name = sub.broker_office_name || sub.name || sub.contact_person_name || null;
         else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
         else name = sub.name || sub.contact_person_name || sub.business_name || null;
         const pic = asPublicImageUrl(
-          sub.profile_picture_url || (type === 'company' ? sub.company_logo_url : null) || null,
+          sub.profile_picture_url || (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) || null,
         );
         return {
           id: row.id,
