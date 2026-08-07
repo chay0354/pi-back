@@ -2,7 +2,7 @@
 const BROKER_PRO_STAR_THRESHOLDS = [5, 15, 35, 75, 155];
 const BROKER_PRO_LOW_RATING_WINDOW = 50;
 const BROKER_PRO_LOW_RATING_DROP_AT = 10;
-const BROKER_PRO_MIN_RATINGS_FOR_TIER = BROKER_PRO_STAR_THRESHOLDS[0];
+const BROKER_PRO_STARTING_STARS = 1;
 
 const reviewTimestamp = review => {
   const t = new Date(review?.created_at || 0).getTime();
@@ -21,18 +21,15 @@ const brokerProfessionalStarsFromCount = totalCount => {
   return stars;
 };
 
-/** @returns {number|null} 1–5 when tier applies; null when fewer than 5 reviews */
+/** @returns {number} 1–5 */
 function computeBrokerProfessionalStarRating(reviews) {
   if (!Array.isArray(reviews) || reviews.length === 0) {
-    return null;
-  }
-  if (reviews.length < BROKER_PRO_MIN_RATINGS_FOR_TIER) {
-    return null;
+    return BROKER_PRO_STARTING_STARS;
   }
 
   let stars = brokerProfessionalStarsFromCount(reviews.length);
   if (stars <= 0) {
-    return null;
+    return BROKER_PRO_STARTING_STARS;
   }
 
   const sorted = [...reviews].sort(

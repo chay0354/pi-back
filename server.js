@@ -688,7 +688,8 @@ ${JSON.stringify(pool)}
 
 Task: pick the listings that genuinely match the query and order them best-match first.
 Rules:
-- Understand Hebrew synonyms and morphology (דירה/דירות, להשכרה/שכירות/לשכור, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע, שותף/שותפים, פנטהאוז, דירת גן...).
+- Understand Hebrew synonyms and morphology (דירה/דירות, להשכרה/שכירות/לשכור, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע, פנטהאוז, דירת גן...).
+- category "3" = שותפים (roommates). EXCLUDE these unless the query explicitly asks for a roommate / join intent: "מחפש להיכנס", "להיכנס לדירה", "מצא לי שותף", "שותף דייר", "מחפש להכניס". Regular apartment/rent/sale/office searches must NOT include category 3.
 - purpose "rent" = להשכרה, "sale" = למכירה. If the query clearly implies one, exclude the other.
 - Location: if the query names a city/neighborhood/street, prefer matching addresses and exclude clearly different cities. Recognize spelling variants (תל אביב/ת"א).
 - Numeric constraints: price/budget within roughly ±20% of what the query asks, rooms/area/floor respected when specified ("עד 2 מיליון" means a maximum).
@@ -7529,7 +7530,7 @@ app.get('/api/professionals/directory', async (req, res) => {
         activity_regions: activityRegions,
         types,
         listing_count: listingCountBySub[row.id] || 0,
-        average_rating: ratingBySub[row.id] != null ? Number(ratingBySub[row.id]) : 5,
+        average_rating: ratingBySub[row.id] != null ? Number(ratingBySub[row.id]) : 1,
         updated_at: row.updated_at || null,
       };
     });
