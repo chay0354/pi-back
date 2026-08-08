@@ -605,7 +605,7 @@ app.post('/api/ai/smart-info', async (req, res) => {
       });
       if (response.ok) break;
       lastError = await response.text();
-      if (response.status === 429) break; // quota - don't hammer other models
+      if (response.status === 429) continue; // per-model quota — try next model
       if (response.status === 404) continue; // try next model
       break;
     }
@@ -724,7 +724,7 @@ Output strict JSON only, exactly in this format: {"ids": ["id1", "id2"]}`;
       });
       if (response.ok) break;
       lastError = await response.text();
-      if (response.status === 429) break; // quota - don't hammer other models
+      if (response.status === 429) continue; // per-model quota — try next model
       if (response.status === 404) continue; // try next model
       break;
     }
@@ -796,7 +796,7 @@ async function callGeminiJsonPrompt(prompt, maxOutputTokens = 512) {
     });
     if (response.ok) break;
     lastError = await response.text();
-    if (response.status === 429) break;
+    if (response.status === 429) continue;
     if (response.status === 404) continue;
     break;
   }
