@@ -6669,6 +6669,9 @@ app.get('/api/listings', async (req, res) => {
     const isOwnerViewEarly =
       !favoritesOnly && subscriptionIdParam != null && subscriptionIdParam.trim() !== '';
     let effectiveSubscriptionTypes = subscriptionTypes;
+    // Category defaults narrow *listing ads* by publisher; feed posts stay visible
+    // for every account type that may publish them in that category.
+    let keepFeedPostsFromAnyPublisher = false;
     if (
       effectiveSubscriptionTypes.includes('broker') &&
       !effectiveSubscriptionTypes.includes('project_marketer')
@@ -6690,10 +6693,12 @@ app.get('/api/listings', async (req, res) => {
           // נותני שירות chip — professional graphic posts only.
         } else if (!wantsProfessionalOnly) {
           effectiveSubscriptionTypes = ['user'];
+          keepFeedPostsFromAnyPublisher = subscriptionTypes.length === 0;
         }
       } else if (category === BNB_CATEGORY) {
         if (subscriptionTypes.length === 0) {
           effectiveSubscriptionTypes = ['user', 'company'];
+          keepFeedPostsFromAnyPublisher = true;
         } else {
           const allowed = subscriptionTypes.filter(
             (t) => t === 'user' || t === 'company',
@@ -6720,7 +6725,11 @@ app.get('/api/listings', async (req, res) => {
     }
     // Other feed-only filters never apply to favorites_only (avoid hiding cross-category likes).
     if (!favoritesOnly) {
-      if (effectiveSubscriptionTypes.length === 1) {
+      if (effectiveSubscriptionTypes.length > 0 && keepFeedPostsFromAnyPublisher) {
+        query = query.or(
+          `subscription_type.in.(${effectiveSubscriptionTypes.join(',')}),feed_post.eq.true,description.eq.פוסט,description.eq.post,property_type.ilike.*post*`,
+        );
+      } else if (effectiveSubscriptionTypes.length === 1) {
         query = query.eq('subscription_type', effectiveSubscriptionTypes[0]);
       } else if (effectiveSubscriptionTypes.length > 1) {
         query = query.in('subscription_type', effectiveSubscriptionTypes);
