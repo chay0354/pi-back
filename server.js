@@ -589,7 +589,7 @@ app.post('/api/ai/smart-info', async (req, res) => {
     }
     const prompt = buildSmartInfoPrompt(topic, topicLabel, address);
     // Use 2.5-flash-lite for better free-tier quota (15 RPM, 1000 RPD); fallback to 2.5-flash
-    const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+    const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite'];
     let lastError = null;
     let response = null;
     let triedUrl = '';
@@ -705,7 +705,7 @@ Rules:
 
 Output strict JSON only, exactly in this format: {"ids": ["id1", "id2"]}`;
 
-    const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+    const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite'];
     let lastError = null;
     let response = null;
     for (const model of modelsToTry) {
