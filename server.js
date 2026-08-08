@@ -6659,9 +6659,10 @@ app.get('/api/listings', async (req, res) => {
       ? subscriptionTypeParam.split(',').map(s => s.trim()).filter(s => allowedSubscriptionTypes.includes(s))
       : [];
 
-    // BnB (5): public feed includes regular users + companies.
-    // שותפים (3): regular-user ads only.
-    // Exception: שותפים "נותני שירות" may request subscription_type=professional.
+    // BnB (5): public listing feed = regular users + companies (not posts).
+    // שותפים (3): roommate listing ads = regular users only (not posts).
+    // feed_post=פוסטים: no publisher-type gate — any account that may publish posts in-app.
+    // Explicit subscription_type (e.g. נותני שירות = professional) still applies.
     // Owner view (subscription_id) keeps all of that owner's ads unfiltered by type.
     const PARTNERS_REGULAR_USER_ONLY_CATEGORY = 3;
     const BNB_CATEGORY = 5;
@@ -6675,11 +6676,19 @@ app.get('/api/listings', async (req, res) => {
       effectiveSubscriptionTypes = [...effectiveSubscriptionTypes, 'project_marketer'];
     }
     if (!favoritesOnly && !isOwnerViewEarly && category != null && !isNaN(category)) {
-      if (category === PARTNERS_REGULAR_USER_ONLY_CATEGORY) {
+      const feedPostsOpenPublishers =
+        feedPostOnly &&
+        subscriptionTypes.length === 0 &&
+        (!searchPurposeParam || !allowedSearchPurposes.has(searchPurposeParam));
+      if (feedPostsOpenPublishers) {
+        effectiveSubscriptionTypes = [];
+      } else if (category === PARTNERS_REGULAR_USER_ONLY_CATEGORY) {
         const wantsProfessionalOnly =
           subscriptionTypes.length === 1 &&
           subscriptionTypes[0] === 'professional';
-        if (!wantsProfessionalOnly) {
+        if (wantsProfessionalOnly) {
+          // נותני שירות chip — professional graphic posts only.
+        } else if (!wantsProfessionalOnly) {
           effectiveSubscriptionTypes = ['user'];
         }
       } else if (category === BNB_CATEGORY) {
