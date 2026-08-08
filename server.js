@@ -652,10 +652,13 @@ app.post('/api/ai/pi-search', async (req, res) => {
     }
     const clip = (v, n) => (v == null ? '' : String(v).slice(0, n));
     // Whitelist + clip fields server-side so the prompt stays small and safe.
-    const pool = (Array.isArray(listings) ? listings : [])
-      .filter(l => l && l.id != null)
-      .slice(0, 150)
-      .map(l => {
+    const raw = (Array.isArray(listings) ? listings : []).filter(
+      l => l && l.id != null,
+    );
+    // Keep every שותפים candidate in the pool — Gemini decides relevance.
+    const partners = raw.filter(l => String(l.category) === '3');
+    const rest = raw.filter(l => String(l.category) !== '3');
+    const pool = [...partners, ...rest].slice(0, 150).map(l => {
         const item = { id: clip(l.id, 48) };
         const put = (key, max) => {
           const s = clip(l[key], max).trim();
@@ -672,6 +675,7 @@ app.post('/api/ai/pi-search', async (req, res) => {
         put('rooms', 10);
         put('area', 12);
         put('floor', 10);
+        put('search_purpose', l.search_purpose || l.searchPurposeKey, 20);
         put('description', 240);
         return item;
       });
@@ -688,8 +692,11 @@ ${JSON.stringify(pool)}
 
 Task: pick the listings that genuinely match the query and order them best-match first.
 Rules:
-- Understand Hebrew synonyms and morphology (דירה/דירות, להשכרה/שכירות/לשכור, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע, פנטהאוז, דירת גן...).
-- category "3" = שותפים (roommates). EXCLUDE these unless the query explicitly asks for a roommate / join intent: "מחפש להיכנס", "להיכנס לדירה", "מצא לי שותף", "שותף דייר", "מחפש להכניס". Regular apartment/rent/sale/office searches must NOT include category 3.
+- Understand Hebrew synonyms, morphology, and typos (דירה/דירות, שותפים/שותים/דירת שותים, להשכרה/שכירות, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע...). Infer user intent even when spelling is imperfect.
+- category "3" = שותפים (roommates / shared apartment). You decide from the query meaning — not keyword lists.
+  • Roommate-related (מחפש שותף, דירת שותפים, דירת שותים, מחפש להיכנס, להכניס שותף, חדר בדירה, רומייט, שותפים…): return ONLY category "3" ids. Never mix apartments, offices, land, BNB or other categories.
+  • Regular rent/sale/office/land searches with NO roommate intent: EXCLUDE category "3".
+  • For category "3", use search_purpose when present: "enter" = מחפש להיכנס לדירה, "bring_in"/"partner" = מחפש להכניס / מחפש שותף.
 - purpose "rent" = להשכרה, "sale" = למכירה. If the query clearly implies one, exclude the other.
 - Location: if the query names a city/neighborhood/street, prefer matching addresses and exclude clearly different cities. Recognize spelling variants (תל אביב/ת"א).
 - Numeric constraints: price/budget within roughly ±20% of what the query asks, rooms/area/floor respected when specified ("עד 2 מיליון" means a maximum).
