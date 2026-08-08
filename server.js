@@ -7188,35 +7188,46 @@ app.get('/api/stories/feed', async (req, res) => {
       if (!s) continue;
       const subTypeForRing = String(s.subscription_type || '').toLowerCase();
       if (!isB2BSubscriptionType(subTypeForRing)) continue;
+      const tableStoriesChrono = [...(storiesBySubId.get(s.id) || [])].sort(
+        (a, b) =>
+          new Date(a.created_at || 0).getTime() -
+          new Date(b.created_at || 0).getTime(),
+      );
       const slides = [];
       const profileVideoUrl = storyHasVideoUrl(s.video_url)
         ? String(s.video_url).trim()
         : null;
-      const tableStories = storiesBySubId.get(s.id) || [];
-      let profileSlideAdded = false;
 
-      for (const st of tableStories) {
+      // Profile intro first, then remaining slides oldest → newest (story viewer starts at index 0).
+      if (profileVideoUrl) {
+        const profileMirrorRow = tableStoriesChrono.find((row) => {
+          const url = row.media_url && String(row.media_url).trim();
+          return url && url === profileVideoUrl;
+        });
+        if (profileMirrorRow) {
+          const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
+          const storyMedia = muxVideo.shapeStorySlideFields(
+            profileMirrorRow,
+            'story',
+          );
+          if (profileMedia || storyMedia) {
+            slides.push({
+              id: `${s.id}-profile-video`,
+              ...(profileMedia || storyMedia),
+              media_type: 'video',
+              kind: 'profile',
+            });
+          }
+        }
+      }
+
+      for (const st of tableStoriesChrono) {
         const storyUrl = st.media_url && String(st.media_url).trim();
         if (!storyUrl) continue;
+        if (profileVideoUrl && storyUrl === profileVideoUrl) continue;
+
         const storyMedia = muxVideo.shapeStorySlideFields(st, 'story');
         if (!storyMedia) continue;
-
-        const isProfileMirror =
-          profileVideoUrl && storyUrl === profileVideoUrl && !profileSlideAdded;
-        if (isProfileMirror) {
-          profileSlideAdded = true;
-          const profileMedia = muxVideo.shapeStorySlideFields(s, 'profile');
-          slides.push({
-            id: `${s.id}-profile-video`,
-            ...(profileMedia || storyMedia),
-            media_type: 'video',
-            kind: 'profile',
-          });
-          continue;
-        }
-
-        // Skip duplicate copies of the same profile video URL.
-        if (profileVideoUrl && storyUrl === profileVideoUrl) continue;
 
         slides.push({
           id: `${s.id}-story-${st.id}`,
@@ -7235,8 +7246,10 @@ app.get('/api/stories/feed', async (req, res) => {
         null;
 
       let ringUpdatedAt = s.updated_at;
-      if (tableStories[0]?.created_at) {
-        ringUpdatedAt = tableStories[0].created_at;
+      const newestStoryAt =
+        tableStoriesChrono[tableStoriesChrono.length - 1]?.created_at;
+      if (newestStoryAt) {
+        ringUpdatedAt = newestStoryAt;
       }
 
       rings.push({
