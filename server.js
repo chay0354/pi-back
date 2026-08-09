@@ -6,6 +6,22 @@ const multer = require('multer');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
 const muxVideo = require('./muxVideo');
+const {
+  buildPiAiListingSummary,
+  sanitizePiAiPoolItem,
+  PI_AI_CATEGORY_LEGEND,
+  PI_AI_POOL_MAX,
+} = require('./utils/piAiListingSummary');
+
+/** New Google AI keys (AQ… format) cannot use legacy model ids — try *-latest first. */
+const GEMINI_MODELS_TO_TRY = [
+  'gemini-flash-lite-latest',
+  'gemini-flash-latest',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
 
 const B2B_SUBSCRIPTION_TYPES = new Set([
   'broker',
@@ -589,7 +605,7 @@ app.post('/api/ai/smart-info', async (req, res) => {
     }
     const prompt = buildSmartInfoPrompt(topic, topicLabel, address);
     // Use 2.5-flash-lite for better free-tier quota (15 RPM, 1000 RPD); fallback to 2.5-flash
-    const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite'];
+    const modelsToTry = GEMINI_MODELS_TO_TRY;
     let lastError = null;
     let response = null;
     let triedUrl = '';
@@ -651,61 +667,51 @@ app.post('/api/ai/pi-search', async (req, res) => {
       return res.status(400).json({ success: false, error: 'missing query' });
     }
     const clip = (v, n) => (v == null ? '' : String(v).slice(0, n));
-    // Whitelist + clip fields server-side so the prompt stays small and safe.
     const raw = (Array.isArray(listings) ? listings : []).filter(
       l => l && l.id != null,
     );
-    // Keep every שותפים candidate in the pool — Gemini decides relevance.
     const partners = raw.filter(l => String(l.category) === '3');
     const rest = raw.filter(l => String(l.category) !== '3');
-    const pool = [...partners, ...rest].slice(0, 150).map(l => {
-        const item = { id: clip(l.id, 48) };
-        const put = (key, max) => {
-          const s = clip(l[key], max).trim();
-          if (s) item[key] = s;
-        };
-        put('purpose', 30);
-        put('category', 10);
-        put('property_type', 40);
-        put('apartment_type', 40);
-        put('address', 120);
-        put('project_name', 80);
-        put('price', 20);
-        put('budget', 20);
-        put('rooms', 10);
-        put('area', 12);
-        put('floor', 10);
-        put('search_purpose', l.search_purpose || l.searchPurposeKey, 20);
-        put('description', 240);
-        return item;
-      });
+    const pool = [...partners, ...rest]
+      .slice(0, PI_AI_POOL_MAX)
+      .map(l => {
+        const built = buildPiAiListingSummary(l);
+        return built ? sanitizePiAiPoolItem(built) : null;
+      })
+      .filter(Boolean);
     if (!pool.length) {
       return res.json({ success: true, ids: [] });
     }
 
     const prompt = `You are Pi AI, the search engine of an Israeli real-estate listings app. User queries are usually in Hebrew.
 
+${PI_AI_CATEGORY_LEGEND}
+
 USER QUERY: "${q.slice(0, 300)}"
 
-CANDIDATE LISTINGS (JSON array, each object has an "id" plus property fields; prices in ILS):
+CANDIDATE LISTINGS (JSON array; prices/budget in ILS):
 ${JSON.stringify(pool)}
 
-Task: pick the listings that genuinely match the query and order them best-match first.
+Task: pick listings that genuinely match the query and order them best-match first.
 Rules:
-- Understand Hebrew synonyms, morphology, and typos (דירה/דירות, שותפים/שותים/דירת שותים, להשכרה/שכירות, למכירה/לקנות, צימר/לינה, משרד, מגרש/קרקע...). Infer user intent even when spelling is imperfect.
-- category "3" = שותפים (roommates / shared apartment). You decide from the query meaning — not keyword lists.
-  • Roommate-related (מחפש שותף, דירת שותפים, דירת שותים, מחפש להיכנס, להכניס שותף, חדר בדירה, רומייט, שותפים…): return ONLY category "3" ids. Never mix apartments, offices, land, BNB or other categories.
-  • Regular rent/sale/office/land searches with NO roommate intent: EXCLUDE category "3".
-  • For category "3", use search_purpose when present: "enter" = מחפש להיכנס לדירה, "bring_in"/"partner" = מחפש להכניס / מחפש שותף.
-- purpose "rent" = להשכרה, "sale" = למכירה. If the query clearly implies one, exclude the other.
-- Location: if the query names a city/neighborhood/street, prefer matching addresses and exclude clearly different cities. Recognize spelling variants (תל אביב/ת"א).
-- Numeric constraints: price/budget within roughly ±20% of what the query asks, rooms/area/floor respected when specified ("עד 2 מיליון" means a maximum).
-- Prefer strong matches; include weaker partial matches only when fewer than 3 strong ones exist. Never include clearly irrelevant listings.
+- Understand Hebrew synonyms, morphology, and typos (דירה/דירות, שותפים/שותים/דירת שותים, להשכרה/שכירות, למכירה/לקנות, צימר/לינה/BNB, משרד, מגרש/קרקע/גוש/חלקה...). Infer intent even when spelling is imperfect.
+- Use category_label and category together. Match the asset type the user asks for (apartment vs office vs land vs BNB vs roommates).
+- category "3" = שותפים (roommates). Only when the query is about finding/bringing a roommate:
+  • Return ONLY category "3" ids — never mix with regular apartments/offices/land/BNB.
+  • search_purpose: "enter" = wants to join an apartment; "bring_in"/"partner" = wants to add a roommate.
+  • Use preferred_gender, preferred_age_min/max, preferred_apartment_type, preferences, budget when relevant.
+- Regular rent/sale/office/land/BNB searches with NO roommate intent: EXCLUDE category "3".
+- purpose_kind "rent" = להשכרה; "sale" = למכירה. If the query clearly implies one, exclude the other. Also read Hebrew purpose field.
+- Location is critical: when the query names a city (or common alias like ת"א), return ONLY listings whose address, land_address, or project_name clearly belong to that city or its neighborhoods. Exclude listings from other cities (e.g. query ירושלים → exclude נס ציונה, בית שמש, מודיעין unless the query mentions them).
+- Numeric constraints: price/budget/price_per_night within roughly ±20% when specified; rooms/area/floor when specified ("עד 2 מיליון" = maximum).
+- Land (category 7): use land_parcel, land_block, permit, land_address.
+- BNB (category 5): use price_per_night, hospitality_nature, service_facility, amenities.
+- Prefer strong matches; weaker partial matches only if fewer than 3 strong ones. Never include clearly irrelevant listings.
 - Return at most 20 ids. If nothing reasonably matches, return an empty array.
 
-Output strict JSON only, exactly in this format: {"ids": ["id1", "id2"]}`;
+Output strict JSON only: {"ids": ["id1", "id2"]}`;
 
-    const modelsToTry = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite'];
+    const modelsToTry = GEMINI_MODELS_TO_TRY;
     let lastError = null;
     let response = null;
     for (const model of modelsToTry) {
@@ -777,7 +783,7 @@ async function callGeminiJsonPrompt(prompt, maxOutputTokens = 512) {
   if (!apiKey) {
     return { ok: false, status: 503, error: 'AI not configured' };
   }
-  const modelsToTry = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+  const modelsToTry = GEMINI_MODELS_TO_TRY;
   let lastError = null;
   let response = null;
   for (const model of modelsToTry) {
