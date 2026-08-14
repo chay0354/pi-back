@@ -3,8 +3,5 @@ node_modules/
 .DS_Store
 *.log
 dist/
-build/
-branch_structure.json
-temp_auto_push.bat
-temp_interactive_push.bat
+build
 .gitignore
