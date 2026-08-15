@@ -4411,7 +4411,13 @@ app.post('/api/chat/groups', async (req, res) => {
     }
     const convId = newConv.id;
 
-    const rows = [{ conversation_id: convId, user_id: creator }, ...memberEmails.map((e) => ({ conversation_id: convId, user_id: e }))];
+    const uniqueMembers = [
+      ...new Set(memberEmails.filter((e) => e && e !== creator)),
+    ];
+    const rows = [
+      { conversation_id: convId, user_id: creator },
+      ...uniqueMembers.map((e) => ({ conversation_id: convId, user_id: e })),
+    ];
     const { error: partErr } = await supabase.from('chat_participants').insert(rows);
     if (partErr) {
       await supabase.from('chat_conversations').delete().eq('id', convId);
@@ -4992,9 +4998,12 @@ app.get('/api/chat/group-messages', async (req, res) => {
     }
 
     const memberList = [];
+    const seenMemberKeys = new Set();
     for (const p of parts || []) {
       const em = normEmail(p.user_id);
       if (!em) continue;
+      if (seenMemberKeys.has(em)) continue;
+      seenMemberKeys.add(em);
       memberList.push({
         userRef: p.user_id != null ? String(p.user_id).trim() : null,
         email: em,
@@ -5047,6 +5056,9 @@ app.get('/api/chat/group-messages', async (req, res) => {
         subsByRef.get(m.email) ||
         (m.userRef ? subsByRef.get(String(m.userRef).trim().toLowerCase()) : null);
       if (sub) {
+        const subEmail = normEmail(sub.email);
+        if (subEmail) m.email = subEmail;
+        m.subscriptionId = sub.id != null ? String(sub.id).trim() : null;
         if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
         m.subscriptionType =
           sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
@@ -5057,9 +5069,21 @@ app.get('/api/chat/group-messages', async (req, res) => {
       }
       if (!m.name) m.name = m.email.includes('@') ? m.email.split('@')[0] : m.email || m.email;
     }
-    memberList.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
+    const uniqueMembers = [];
+    const seenCanonical = new Set();
+    for (const m of memberList) {
+      const canon =
+        (m.subscriptionId && String(m.subscriptionId).trim().toLowerCase()) ||
+        (m.email && m.email.includes('@') ? m.email : '') ||
+        (m.userRef ? String(m.userRef).trim().toLowerCase() : '');
+      if (!canon || seenCanonical.has(canon)) continue;
+      seenCanonical.add(canon);
+      if (m.email && m.email.includes('@')) seenCanonical.add(m.email);
+      uniqueMembers.push(m);
+    }
+    uniqueMembers.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
 
-    res.json({ success: true, messages: list, conversation_id: convId, group, members: memberList });
+    res.json({ success: true, messages: list, conversation_id: convId, group, members: uniqueMembers });
   } catch (err) {
     console.error('GET /api/chat/group-messages:', err);
     res.status(500).json({ success: false, error: err.message });
