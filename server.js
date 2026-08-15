@@ -3897,7 +3897,15 @@ async function syncFeedPostStoryOnListingUpdate(
     let storyUpdated = 0;
     for (const row of matching) {
       const updates = {};
-      if (nextGeneralDetails) updates.general_details = nextGeneralDetails;
+      if (nextGeneralDetails) {
+        // Merge so story-only markers (post_kind, open-house place/date) survive
+        // while the post's overlay layout wins for the keys it owns.
+        const existing =
+          row.general_details && typeof row.general_details === 'object'
+            ? row.general_details
+            : {};
+        updates.general_details = { ...existing, ...nextGeneralDetails };
+      }
       if (Object.keys(updates).length === 0) continue;
 
       const { error: upErr } = await supabaseClient
