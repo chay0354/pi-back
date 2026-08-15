@@ -584,6 +584,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     message: 'Server is running',
     authRoutes: true,
+    agencyReplacementRoutes: true,
   });
 });
 
@@ -2505,6 +2506,86 @@ app.post('/api/agency/join-code', async (req, res) => {
   }
 });
 
+// POST /api/agency/replacement-code — issue a single-use 24-hour code for one member.
+app.post('/api/agency/replacement-code', async (req, res) => {
+  try {
+    const manager = await findMarketingManager({
+      subscriptionId: req.body?.manager_subscription_id,
+      email: req.body?.manager_email,
+    });
+    if (!managerCanRunAgency(manager)) {
+      return res.status(403).json({success: false, error: 'אין הרשאה לנהל סוכנות'});
+    }
+
+    const targetId = String(req.body?.target_subscription_id || '').trim();
+    if (!AGENCY_UUID_RE.test(targetId)) {
+      return res.status(400).json({success: false, error: 'מזהה המשווק אינו תקין'});
+    }
+    const {data: target, error: targetErr} = await supabase
+      .from('subscriptions')
+      .select(AGENCY_MEMBER_SELECT)
+      .eq('id', targetId)
+      .eq('parent_subscription_id', manager.id)
+      .eq('subscription_type', 'project_marketer')
+      .maybeSingle();
+    if (targetErr) throw targetErr;
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        error: 'המשווק לא נמצא תחת מנהל זה',
+      });
+    }
+
+    await supabase
+      .from('agency_marketer_replacement_codes')
+      .update({is_active: false})
+      .eq('target_subscription_id', target.id)
+      .eq('is_active', true);
+
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    let inserted = null;
+    for (let attempt = 0; attempt < 8 && !inserted; attempt += 1) {
+      const code = generateAgencyCode();
+      const {data: joinCollision, error: collisionErr} = await supabase
+        .from('agency_join_codes')
+        .select('id')
+        .eq('code', code)
+        .limit(1)
+        .maybeSingle();
+      if (collisionErr) throw collisionErr;
+      if (joinCollision) continue;
+
+      const {data, error} = await supabase
+        .from('agency_marketer_replacement_codes')
+        .insert({
+          code,
+          manager_subscription_id: manager.id,
+          target_subscription_id: target.id,
+          expires_at: expiresAt,
+        })
+        .select('code, created_at, expires_at')
+        .single();
+      if (!error) inserted = data;
+      else if (error.code !== '23505') throw error;
+    }
+    if (!inserted) {
+      return res.status(500).json({
+        success: false,
+        error: 'יצירת קוד ההחלפה נכשלה, נסה שוב',
+      });
+    }
+    return res.json({
+      success: true,
+      code: inserted.code,
+      expires_at: inserted.expires_at,
+      member: sanitizeSubscriptionForClient(target),
+    });
+  } catch (err) {
+    console.error('POST /api/agency/replacement-code:', err);
+    return res.status(500).json({success: false, error: err.message});
+  }
+});
+
 // POST /api/agency/join — marketer signs up under an existing agency using a code.
 app.post('/api/agency/join', async (req, res) => {
   try {
@@ -2522,6 +2603,76 @@ app.post('/api/agency/join', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: `הסיסמה חייבת להכיל לפחות ${MIN_PASSWORD_LENGTH} תווים`,
+      });
+    }
+
+    // Replacement codes preserve the existing subscription UUID, so ads, posts,
+    // stories, follows and all UUID-owned records stay attached. The RPC also
+    // atomically moves legacy email-keyed chat rows to the new login.
+    const {data: replacementCode, error: replacementLookupErr} = await supabase
+      .from('agency_marketer_replacement_codes')
+      .select('id')
+      .eq('code', code)
+      .limit(1)
+      .maybeSingle();
+    if (replacementLookupErr) throw replacementLookupErr;
+    if (replacementCode) {
+      const {data: redeemed, error: redeemErr} = await supabase.rpc(
+        'redeem_agency_marketer_replacement',
+        {
+          p_code: code,
+          p_new_email: emailNorm,
+          p_new_name: name,
+          p_new_password_hash: hashPassword(password),
+          p_new_phone:
+            body.phone != null && String(body.phone).trim()
+              ? String(body.phone).trim()
+              : null,
+        },
+      );
+      if (redeemErr) {
+        const message = String(redeemErr.message || '');
+        if (message.includes('REPLACEMENT_CODE_EXPIRED')) {
+          return res.status(410).json({success: false, error: 'תוקף קוד ההחלפה פג'});
+        }
+        if (message.includes('REPLACEMENT_CODE_INVALID')) {
+          return res.status(404).json({
+            success: false,
+            error: 'קוד ההחלפה אינו פעיל או שכבר נעשה בו שימוש',
+          });
+        }
+        if (message.includes('REPLACEMENT_EMAIL_IN_USE') || redeemErr.code === '23505') {
+          return registrationEmailTakenResponse(res);
+        }
+        console.error('Replacement redemption RPC:', redeemErr);
+        return res.status(409).json({
+          success: false,
+          error: 'לא ניתן להשלים את החלפת המשווק',
+        });
+      }
+
+      const replacement = Array.isArray(redeemed) ? redeemed[0] : redeemed;
+      const targetId = replacement?.target_subscription_id;
+      const managerId = replacement?.manager_subscription_id;
+      const [{data: updated, error: updatedErr}, {data: manager, error: managerErr}] =
+        await Promise.all([
+          supabase.from('subscriptions').select('*').eq('id', targetId).single(),
+          supabase
+            .from('subscriptions')
+            .select(AGENCY_MEMBER_SELECT)
+            .eq('id', managerId)
+            .single(),
+        ]);
+      if (updatedErr) throw updatedErr;
+      if (managerErr) throw managerErr;
+      return res.json({
+        success: true,
+        replaced: true,
+        subscription: sanitizeSubscriptionForClient(updated),
+        agency: {
+          id: manager.id,
+          name: manager.business_name || manager.name || null,
+        },
       });
     }
 
@@ -2567,6 +2718,14 @@ app.post('/api/agency/join', async (req, res) => {
         subscription_type: 'project_marketer',
         email: emailNorm,
         name: name || emailNorm.split('@')[0],
+        phone:
+          body.phone != null && String(body.phone).trim()
+            ? String(body.phone).trim()
+            : null,
+        mobile_phone:
+          body.phone != null && String(body.phone).trim()
+            ? String(body.phone).trim()
+            : null,
         business_name: manager.business_name || null,
         parent_subscription_id: manager.id,
         marketer_plan: 'single',
