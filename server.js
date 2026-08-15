@@ -3674,6 +3674,264 @@ async function syncSalesImageMirrors(
   return { storiesRemoved, postsUpdated };
 }
 
+function storyGeneralDetailsFeedListingId(generalDetails) {
+  if (!generalDetails || typeof generalDetails !== 'object') return '';
+  return String(generalDetails.feed_listing_id || '').trim();
+}
+
+/** Active companion stories for a feed post — by listing id, else legacy media URL. */
+async function findActiveCompanionStoriesForListing(
+  supabaseClient,
+  subscriptionId,
+  listingId,
+  fallbackMediaUrl,
+) {
+  const subId = String(subscriptionId || '').trim();
+  const lid = String(listingId || '').trim();
+  const fallbackUrl = normalizeMediaUrl(fallbackMediaUrl);
+  if (!subId || (!lid && !fallbackUrl)) {
+    return { rows: [], error: null };
+  }
+
+  const storyCutoff = storyActiveCutoffIso();
+  const { data: rows, error } = await supabaseClient
+    .from('stories')
+    .select('id, media_url, general_details')
+    .eq('subscription_id', subId)
+    .gte('created_at', storyCutoff);
+
+  if (error) {
+    return { rows: [], error };
+  }
+
+  if (lid) {
+    const byListing = (rows || []).filter(
+      (row) => storyGeneralDetailsFeedListingId(row.general_details) === lid,
+    );
+    if (byListing.length > 0) {
+      return { rows: byListing, error: null };
+    }
+  }
+
+  if (!fallbackUrl) {
+    return { rows: [], error: null };
+  }
+
+  return {
+    rows: (rows || []).filter(
+      (row) => normalizeMediaUrl(row.media_url) === fallbackUrl,
+    ),
+    error: null,
+  };
+}
+
+async function deleteStoryRows(supabaseClient, rows) {
+  let deleted = 0;
+  for (const row of rows || []) {
+    const { error: delErr } = await supabaseClient
+      .from('stories')
+      .delete()
+      .eq('id', row.id);
+    if (!delErr) deleted += 1;
+    else console.error('[deleteStoryRows] delete', row.id, delErr);
+  }
+  return deleted;
+}
+
+/** Remove active (≤24h) story slides linked to a feed-post listing. */
+async function deleteActiveStoriesByFeedListingId(
+  supabaseClient,
+  subscriptionId,
+  listingId,
+  fallbackMediaUrl,
+) {
+  const subId = String(subscriptionId || '').trim();
+  const lid = String(listingId || '').trim();
+  if (!subId || !lid) return { deleted: 0 };
+
+  try {
+    const { rows, error } = await findActiveCompanionStoriesForListing(
+      supabaseClient,
+      subId,
+      lid,
+      fallbackMediaUrl,
+    );
+    if (error) {
+      console.error('[deleteActiveStoriesByFeedListingId] query:', error);
+      return { deleted: 0, error: error.message };
+    }
+    const deleted = await deleteStoryRows(supabaseClient, rows);
+    return { deleted };
+  } catch (err) {
+    console.error('[deleteActiveStoriesByFeedListingId]', err);
+    return { deleted: 0, error: err?.message };
+  }
+}
+
+/** Remove active (≤24h) story slides that mirror a specific media URL. */
+async function deleteActiveStoriesByMediaUrl(
+  supabaseClient,
+  subscriptionId,
+  mediaUrl,
+) {
+  const targetUrl = normalizeMediaUrl(mediaUrl);
+  const subId = String(subscriptionId || '').trim();
+  if (!targetUrl || !subId) return { deleted: 0 };
+
+  const storyCutoff = storyActiveCutoffIso();
+  try {
+    const { data: storyRows, error: storyErr } = await supabaseClient
+      .from('stories')
+      .select('id, media_url')
+      .eq('subscription_id', subId)
+      .gte('created_at', storyCutoff);
+
+    if (storyErr) {
+      console.error('[deleteActiveStoriesByMediaUrl] query:', storyErr);
+      return { deleted: 0, error: storyErr.message };
+    }
+
+    const matching = (storyRows || []).filter(
+      (row) => normalizeMediaUrl(row.media_url) === targetUrl,
+    );
+    let deleted = 0;
+    for (const row of matching) {
+      const { error: delErr } = await supabaseClient
+        .from('stories')
+        .delete()
+        .eq('id', row.id);
+      if (!delErr) deleted += 1;
+      else {
+        console.error('[deleteActiveStoriesByMediaUrl] delete', row.id, delErr);
+      }
+    }
+    return { deleted };
+  } catch (err) {
+    console.error('[deleteActiveStoriesByMediaUrl]', err);
+    return { deleted: 0, error: err?.message };
+  }
+}
+
+/** Sync homepage story slides when a feed post listing is edited. */
+async function syncFeedPostStoryOnListingUpdate(
+  supabaseClient,
+  previousAd,
+  nextAd,
+) {
+  if (!nextAd?.feed_post || !nextAd?.subscription_id) {
+    return {
+      storyUpdated: 0,
+      storyRemoved: 0,
+      mediaChanged: false,
+      storyMatched: false,
+    };
+  }
+
+  const subId = String(nextAd.subscription_id).trim();
+  const listingId = String(nextAd.id || '').trim();
+  const prevMedia =
+    normalizeMediaUrl(previousAd?.video_url) ||
+    normalizeMediaUrl(previousAd?.main_image_url);
+  const nextMedia =
+    normalizeMediaUrl(nextAd.video_url) ||
+    normalizeMediaUrl(nextAd.main_image_url);
+  if (!nextMedia) {
+    return {
+      storyUpdated: 0,
+      storyRemoved: 0,
+      mediaChanged: false,
+      storyMatched: false,
+    };
+  }
+
+  const mediaChanged = Boolean(prevMedia && prevMedia !== nextMedia);
+
+  try {
+    const { rows: matching, error } =
+      await findActiveCompanionStoriesForListing(
+        supabaseClient,
+        subId,
+        listingId,
+        prevMedia,
+      );
+
+    if (error) {
+      console.error('[syncFeedPostStoryOnListingUpdate] query:', error);
+      return {
+        storyUpdated: 0,
+        storyRemoved: 0,
+        mediaChanged,
+        storyMatched: false,
+      };
+    }
+
+    if (matching.length === 0) {
+      return {
+        storyUpdated: 0,
+        storyRemoved: 0,
+        mediaChanged,
+        storyMatched: false,
+      };
+    }
+
+    if (mediaChanged) {
+      const storyRemoved = await deleteStoryRows(supabaseClient, matching);
+      return {
+        storyUpdated: 0,
+        storyRemoved,
+        mediaChanged: true,
+        storyMatched: true,
+      };
+    }
+
+    const nextGeneralDetails =
+      nextAd.general_details && typeof nextAd.general_details === 'object'
+        ? {
+            ...nextAd.general_details,
+            feed_listing_id: listingId || nextAd.general_details.feed_listing_id,
+          }
+        : listingId
+          ? { feed_listing_id: listingId }
+          : null;
+
+    let storyUpdated = 0;
+    for (const row of matching) {
+      const updates = {};
+      if (nextGeneralDetails) updates.general_details = nextGeneralDetails;
+      if (Object.keys(updates).length === 0) continue;
+
+      const { error: upErr } = await supabaseClient
+        .from('stories')
+        .update(updates)
+        .eq('id', row.id);
+      if (upErr) {
+        console.error(
+          '[syncFeedPostStoryOnListingUpdate] update',
+          row.id,
+          upErr,
+        );
+        continue;
+      }
+      storyUpdated += 1;
+    }
+
+    return {
+      storyUpdated,
+      storyRemoved: 0,
+      mediaChanged: false,
+      storyMatched: true,
+    };
+  } catch (err) {
+    console.error('[syncFeedPostStoryOnListingUpdate]', err);
+    return {
+      storyUpdated: 0,
+      storyRemoved: 0,
+      mediaChanged,
+      storyMatched: false,
+    };
+  }
+}
+
 /** Profile fields a user may edit from the "edit profile" screen (all account types). */
 const EDITABLE_SUBSCRIPTION_FIELDS = [
   'name',
@@ -7613,6 +7871,80 @@ app.post('/api/stories', async (req, res) => {
   }
 });
 
+// POST /api/stories/remove-by-media — drop active slides for one media URL (post edit resync)
+app.post('/api/stories/remove-by-media', async (req, res) => {
+  try {
+    await purgeExpiredStories();
+
+    const {
+      subscription_id: subscriptionId,
+      media_url: mediaUrl,
+    } = req.body || {};
+    const sid = subscriptionId && String(subscriptionId).trim();
+    const url = mediaUrl && String(mediaUrl).trim();
+    if (!sid || !url) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscription_id and media_url are required',
+      });
+    }
+
+    const eligibility = await assertStoryPublisherEligible(sid);
+    if (!eligibility.ok) {
+      return res.status(eligibility.status).json({
+        success: false,
+        error: eligibility.error,
+      });
+    }
+
+    const result = await deleteActiveStoriesByMediaUrl(supabase, sid, url);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('POST /api/stories/remove-by-media:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/stories/remove-by-listing — drop active companion slides for a feed post
+app.post('/api/stories/remove-by-listing', async (req, res) => {
+  try {
+    await purgeExpiredStories();
+
+    const {
+      subscription_id: subscriptionId,
+      listing_id: listingId,
+      media_url: mediaUrl,
+    } = req.body || {};
+    const sid = subscriptionId && String(subscriptionId).trim();
+    const lid = listingId && String(listingId).trim();
+    if (!sid || !lid) {
+      return res.status(400).json({
+        success: false,
+        error: 'subscription_id and listing_id are required',
+      });
+    }
+
+    const eligibility = await assertStoryPublisherEligible(sid);
+    if (!eligibility.ok) {
+      return res.status(eligibility.status).json({
+        success: false,
+        error: eligibility.error,
+      });
+    }
+
+    const result = await deleteActiveStoriesByFeedListingId(
+      supabase,
+      sid,
+      lid,
+      mediaUrl,
+    );
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('POST /api/stories/remove-by-listing:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET /api/companies/directory — company subscriptions + listing counts (home "חפשו עוד")
 app.get('/api/companies/directory', async (req, res) => {
   try {
@@ -10828,7 +11160,9 @@ app.put('/api/listings/:id', async (req, res) => {
     const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
     const { data: existingAd } = await supabase
       .from('ads')
-      .select('video_url, sales_image_url, subscription_id')
+      .select(
+        'video_url, main_image_url, sales_image_url, subscription_id, feed_post, general_details',
+      )
       .eq('id', id)
       .maybeSingle();
     const { data: ad, error: updateError } = await supabase
@@ -10914,6 +11248,15 @@ app.put('/api/listings/:id', async (req, res) => {
       }
     }
 
+    let feedPostStorySync = null;
+    if (ad.feed_post && ad.subscription_id && existingAd) {
+      feedPostStorySync = await syncFeedPostStoryOnListingUpdate(
+        supabase,
+        existingAd,
+        ad,
+      );
+    }
+
     res.status(200).json({
       success: true,
       id: ad.id,
@@ -10921,6 +11264,7 @@ app.put('/api/listings/:id', async (req, res) => {
         ...ad,
         ...muxVideo.shapeListingVideoFields(ad),
       },
+      feedPostStorySync,
     });
   } catch (error) {
     console.error('Error in PUT /api/listings/:id:', error);
