@@ -4325,13 +4325,7 @@ app.post('/api/chat/groups', async (req, res) => {
         error: 'רק מתווכים יכולים לפתוח קבוצת מתווכים',
       });
     }
-    if (creatorIsCompany && kind === 'open') {
-      return res.status(403).json({
-        success: false,
-        error: 'חברות יכולות לפתוח רק קבוצת לקוחות',
-      });
-    }
-    if ((creatorIsRegular || creatorIsProfessional) && kind !== 'open') {
+    if ((creatorIsRegular || creatorIsProfessional || creatorIsCompany) && kind !== 'open') {
       return res.status(403).json({
         success: false,
         error: 'ניתן לפתוח רק קבוצה פתוחה לכל סוגי המשתמשים',
