@@ -578,9 +578,13 @@ const sendPasswordRecoveryEmail = async (email, passwordPlain, subscriptionType)
   return false;
 };
 
-// Health check endpoint
+// Health check endpoint (includes auth route flag for deploy verification)
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Server is running' });
+  res.json({
+    status: 'ok',
+    message: 'Server is running',
+    authRoutes: true,
+  });
 });
 
 // ==================== AI SMART INFO (Gemini) ====================
