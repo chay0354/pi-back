@@ -3954,6 +3954,9 @@ const EDITABLE_SUBSCRIPTION_FIELDS = [
   'company_id',
   'brokerage_license_number',
   'dealer_number',
+  'activity_regions',
+  'types',
+  'specializations',
   'description',
   'profile_picture_url',
   'company_logo_url',
@@ -4000,6 +4003,22 @@ app.patch('/api/subscription/:id', async (req, res) => {
     for (const key of EDITABLE_SUBSCRIPTION_FIELDS) {
       if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
       let value = body[key];
+      if (
+        key === 'activity_regions' ||
+        key === 'types' ||
+        key === 'specializations'
+      ) {
+        if (Array.isArray(value)) {
+          const items = value.map(v => String(v).trim()).filter(Boolean);
+          updates[key] = items.length > 0 ? JSON.stringify(items) : null;
+        } else if (typeof value === 'string') {
+          const trimmed = value.trim();
+          updates[key] = trimmed || null;
+        } else {
+          updates[key] = null;
+        }
+        continue;
+      }
       if (typeof value === 'string') {
         value = value.trim();
         if (value === '') value = null;
@@ -5013,13 +5032,6 @@ app.post('/api/chat/groups/remove-member', async (req, res) => {
 
     const isSelf = actorEmail === targetEmail;
     if (!isSelf) {
-      const { data: actorSub } = await supabase
-        .from('subscriptions')
-        .select('subscription_type')
-        .ilike('email', actorEmail)
-        .maybeSingle();
-      const actorBroker = String(actorSub?.subscription_type || '').trim().toLowerCase() === 'broker';
-      if (!actorBroker) return res.status(403).json({ success: false, error: 'רק מתווכים יכולים להסיר משתתפים אחרים' });
       if (targetRole === 'owner') {
         return res.status(403).json({ success: false, error: 'לא ניתן להסיר את יוצר הקבוצה' });
       }
