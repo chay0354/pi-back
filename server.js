@@ -2644,6 +2644,12 @@ app.post('/api/agency/join', async (req, res) => {
         if (message.includes('REPLACEMENT_EMAIL_IN_USE') || redeemErr.code === '23505') {
           return registrationEmailTakenResponse(res);
         }
+        if (message.includes('REPLACEMENT_TARGET_INVALID')) {
+          return res.status(409).json({
+            success: false,
+            error: 'המשווק אינו זמין להחלפה. צור קוד חדש מניהול משווקים',
+          });
+        }
         console.error('Replacement redemption RPC:', redeemErr);
         return res.status(409).json({
           success: false,
