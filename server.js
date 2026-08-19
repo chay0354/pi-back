@@ -4654,7 +4654,7 @@ app.post('/api/chat/groups', async (req, res) => {
         ? String(req.body.creator_subscription_id).trim()
         : '';
 
-    // Rule 1: brokers — any group; companies — customer groups only; regular/professional — open groups.
+    // Rule 1: brokers — customer/broker groups; regular/professional/company/marketer — open groups.
     let creatorSub = null;
     if (creatorSubIdRaw && LISTING_AD_UUID_RE.test(creatorSubIdRaw)) {
       const byId = await supabase
@@ -4691,10 +4691,8 @@ app.post('/api/chat/groups', async (req, res) => {
       .trim()
       .toLowerCase();
     const creatorIsBroker = creatorType === 'broker';
-    const creatorIsCompany = isCompanyLikeSubscriptionType(creatorType);
-    const creatorIsProfessional = creatorType === 'professional';
-    const creatorIsRegular = isRegularSubscriptionTypeForGroup(creatorSub?.subscription_type);
-    if (!creatorIsBroker && !creatorIsRegular && !creatorIsCompany && !creatorIsProfessional) {
+    const creatorIsOpenGroup = isOpenChatGroupCreatorType(creatorType);
+    if (!creatorIsBroker && !creatorIsOpenGroup) {
       return res.status(403).json({ success: false, error: 'אין הרשאה לפתוח קבוצות' });
     }
     if (!creatorIsBroker && kind === 'brokers') {
@@ -4703,7 +4701,7 @@ app.post('/api/chat/groups', async (req, res) => {
         error: 'רק מתווכים יכולים לפתוח קבוצת מתווכים',
       });
     }
-    if ((creatorIsRegular || creatorIsProfessional || creatorIsCompany) && kind !== 'open') {
+    if (creatorIsOpenGroup && kind !== 'open') {
       return res.status(403).json({
         success: false,
         error: 'ניתן לפתוח רק קבוצה פתוחה לכל סוגי המשתמשים',
@@ -4895,10 +4893,8 @@ app.post('/api/chat/groups/add-members', async (req, res) => {
     if (actorErr) return res.status(500).json({ success: false, error: actorErr.message });
     const actorType = String(actorSub?.subscription_type || '').trim().toLowerCase();
     const actorIsBroker = isBrokerSubscriptionTypeForGroup(actorType);
-    const actorIsRegular = isRegularSubscriptionTypeForGroup(actorType);
-    const actorIsProfessional = actorType === 'professional';
-    const actorIsCompany = isCompanyLikeSubscriptionType(actorType);
-    if (!actorIsBroker && !actorIsRegular && !actorIsProfessional && !actorIsCompany) {
+    const actorIsOpenGroup = isOpenChatGroupCreatorType(actorType);
+    if (!actorIsBroker && !actorIsOpenGroup) {
       return res.status(403).json({ success: false, error: 'אין הרשאה להוסיף חברים לקבוצה' });
     }
 
@@ -8440,6 +8436,16 @@ function isRegularSubscriptionTypeForGroup(st) {
   return !isB2BSubscriptionType(st);
 }
 
+function isOpenChatGroupCreatorType(st) {
+  const t = String(st || '').trim().toLowerCase();
+  return (
+    isRegularSubscriptionTypeForGroup(t) ||
+    t === 'professional' ||
+    t === 'company' ||
+    t === 'project_marketer'
+  );
+}
+
 function isBrokerSubscriptionTypeForGroup(st) {
   return String(st || '').trim().toLowerCase() === 'broker';
 }
@@ -8452,11 +8458,23 @@ function inferLegacyChatGroupKind(typeByEmail, creatorEmailNorm) {
   const hasRegular = types.some(isRegularSubscriptionTypeForGroup);
   const hasPro = types.some((t) => String(t).trim().toLowerCase() === 'professional');
   const hasCompany = types.some(isCompanyLikeSubscriptionType);
-  if (hasBroker && !hasRegular && !hasPro && !hasCompany) return 'brokers';
-  if (hasPro || hasCompany || (hasBroker && (hasRegular || hasPro || hasCompany))) return 'open';
+  const hasMarketer = types.some(
+    (t) => String(t).trim().toLowerCase() === 'project_marketer',
+  );
+  if (hasBroker && !hasRegular && !hasPro && !hasCompany && !hasMarketer) return 'brokers';
+  if (
+    hasPro ||
+    hasCompany ||
+    hasMarketer ||
+    (hasBroker && (hasRegular || hasPro || hasCompany || hasMarketer))
+  ) {
+    return 'open';
+  }
   const creatorType = creatorEmailNorm ? typeByEmail[normEmail(creatorEmailNorm)] : null;
   const ct = creatorType != null ? String(creatorType).trim().toLowerCase() : '';
-  if (ct === 'professional' || isRegularSubscriptionTypeForGroup(ct)) return 'open';
+  if (ct === 'professional' || ct === 'project_marketer' || isRegularSubscriptionTypeForGroup(ct)) {
+    return 'open';
+  }
   return 'customers';
 }
 
