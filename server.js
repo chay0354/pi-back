@@ -3593,77 +3593,164 @@ async function syncActiveStoriesWithOldProfileVideo(
 }
 
 /**
- * When תמונה מכירתית changes:
- * - remove previous active story slide(s) that used the old image
- * - update companion feed posts that still point at the old image URL
- *
- * The new story is created by the client on ad save (createSalesImageStory)
- * so it appears as a fresh slide with a new 24h window.
+ * When תמונה מכירתית is edited, update the existing companion story and
+ * companion feed post in place. Do not delete/recreate — that duplicated
+ * slides and posts on every edit.
  */
+function parseAdGeneralDetails(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object') return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (_) {
+      return null;
+    }
+  }
+  return null;
+}
+
+function salesImageCompanionDetails(adRecord) {
+  const gd = parseAdGeneralDetails(adRecord?.general_details);
+  const editor = gd?.sales_image_editor;
+  const baked =
+    editor?.post_text_baked === true ||
+    editor?.post_text_baked === 'true' ||
+    editor?.post_text_baked === 't' ||
+    editor?.post_text_baked === 1;
+  const sourceAdId = adRecord?.id ? String(adRecord.id).trim() : '';
+  const ids = {
+    post_kind: 'sales_image',
+    ...(sourceAdId
+      ? { source_ad_id: sourceAdId, feed_listing_id: sourceAdId }
+      : {}),
+  };
+  const postGd = {
+    ...(editor && typeof editor === 'object' ? editor : {}),
+    ...ids,
+  };
+  const storyGd =
+    baked || !editor
+      ? { ...ids }
+      : { ...editor, ...ids };
+  return { postGd, storyGd };
+}
+
+function rowLinkedToSalesAd(row, adId) {
+  const adIdStr = String(adId || '').trim();
+  if (!adIdStr) return false;
+  const gd = parseAdGeneralDetails(row?.general_details);
+  return (
+    String(gd?.source_ad_id || '').trim() === adIdStr ||
+    String(gd?.feed_listing_id || '').trim() === adIdStr
+  );
+}
+
+function rowMatchesSalesImageUrl(row, matchUrls, urlKeys) {
+  const gd = parseAdGeneralDetails(row?.general_details);
+  const kind = String(gd?.post_kind || '').trim();
+  if (kind && kind !== 'sales_image') return false;
+  return (urlKeys || []).some((key) => {
+    const u = normalizeMediaUrl(row?.[key]);
+    return u && matchUrls.has(u);
+  });
+}
+
 async function syncSalesImageMirrors(
   supabaseClient,
   subscriptionId,
   oldSalesUrl,
   newSalesUrl,
+  adRecord,
 ) {
   const oldUrl = normalizeMediaUrl(oldSalesUrl);
   const newUrl = normalizeMediaUrl(newSalesUrl);
-  if (!oldUrl || !newUrl || oldUrl === newUrl) {
-    return { storiesRemoved: 0, postsUpdated: 0 };
+  if (!newUrl) {
+    return {storiesUpdated: 0, postsUpdated: 0};
   }
 
   const subId = String(subscriptionId || '').trim();
-  if (!subId) return { storiesRemoved: 0, postsUpdated: 0 };
+  if (!subId) return {storiesUpdated: 0, postsUpdated: 0};
 
-  let storiesRemoved = 0;
+  const matchUrls = new Set([newUrl]);
+  if (oldUrl) matchUrls.add(oldUrl);
+  const {postGd, storyGd} = salesImageCompanionDetails(adRecord);
+
+  let storiesUpdated = 0;
   let postsUpdated = 0;
 
   try {
-    const storyCutoff = storyActiveCutoffIso();
-    const { data: storyRows, error: storyErr } = await supabaseClient
+    let {data: storyRows, error: storyErr} = await supabaseClient
       .from('stories')
-      .select('id, media_url')
-      .eq('subscription_id', subId)
-      .gte('created_at', storyCutoff);
+      .select('id, media_url, general_details')
+      .eq('subscription_id', subId);
+    if (storyErr && /general_details/i.test(String(storyErr.message || ''))) {
+      ({data: storyRows, error: storyErr} = await supabaseClient
+        .from('stories')
+        .select('id, media_url')
+        .eq('subscription_id', subId));
+    }
 
     if (storyErr) {
       console.error('[syncSalesImageMirrors] stories query:', storyErr);
     } else {
-      const matchingOld = (storyRows || []).filter(
-        (row) => normalizeMediaUrl(row.media_url) === oldUrl,
+      const byAd = (storyRows || []).filter((row) =>
+        rowLinkedToSalesAd(row, adRecord?.id),
       );
-      for (const row of matchingOld) {
-        const { error: delErr } = await supabaseClient
+      const matching =
+        byAd.length > 0
+          ? byAd
+          : (storyRows || []).filter((row) =>
+              rowMatchesSalesImageUrl(row, matchUrls, ['media_url']),
+            );
+      for (const row of matching) {
+        let {error: upErr} = await supabaseClient
           .from('stories')
-          .delete()
+          .update({media_url: newUrl, general_details: storyGd})
           .eq('id', row.id);
-        if (!delErr) storiesRemoved += 1;
+        if (upErr && /general_details/i.test(String(upErr.message || ''))) {
+          ({error: upErr} = await supabaseClient
+            .from('stories')
+            .update({media_url: newUrl})
+            .eq('id', row.id));
+        }
+        if (!upErr) storiesUpdated += 1;
         else {
-          console.error('[syncSalesImageMirrors] story delete', row.id, delErr);
+          console.error('[syncSalesImageMirrors] story update', row.id, upErr);
         }
       }
     }
 
-    const { data: postRows, error: postErr } = await supabaseClient
+    const {data: postRows, error: postErr} = await supabaseClient
       .from('ads')
-      .select('id, main_image_url, video_url')
+      .select('id, main_image_url, video_url, general_details')
       .eq('subscription_id', subId)
       .eq('feed_post', true);
 
     if (postErr) {
       console.error('[syncSalesImageMirrors] posts query:', postErr);
     } else {
-      const matchingPosts = (postRows || []).filter(
-        (row) =>
-          normalizeMediaUrl(row.main_image_url) === oldUrl ||
-          normalizeMediaUrl(row.video_url) === oldUrl,
+      const postsByAd = (postRows || []).filter((row) =>
+        rowLinkedToSalesAd(row, adRecord?.id),
       );
+      const matchingPosts =
+        postsByAd.length > 0
+          ? postsByAd
+          : (postRows || []).filter((row) =>
+              rowMatchesSalesImageUrl(row, matchUrls, [
+                'main_image_url',
+                'video_url',
+              ]),
+            );
       for (const row of matchingPosts) {
-        const matchedImage = normalizeMediaUrl(row.main_image_url) === oldUrl;
+        const matchedImage = matchUrls.has(
+          normalizeMediaUrl(row.main_image_url),
+        );
         const updates = matchedImage
-          ? { main_image_url: newUrl }
-          : { video_url: newUrl };
-        const { error: upErr } = await supabaseClient
+          ? {main_image_url: newUrl, general_details: postGd}
+          : {video_url: newUrl, general_details: postGd};
+        const {error: upErr} = await supabaseClient
           .from('ads')
           .update(updates)
           .eq('id', row.id);
@@ -3677,7 +3764,7 @@ async function syncSalesImageMirrors(
     console.error('[syncSalesImageMirrors]', err);
   }
 
-  return { storiesRemoved, postsUpdated };
+  return {storiesUpdated, postsUpdated};
 }
 
 function storyGeneralDetailsFeedListingId(generalDetails) {
@@ -11235,17 +11322,13 @@ app.put('/api/listings/:id', async (req, res) => {
 
     const prevSales = normalizeMediaUrl(existingAd?.sales_image_url);
     const nextSales = normalizeMediaUrl(ad.sales_image_url);
-    if (
-      prevSales &&
-      nextSales &&
-      prevSales !== nextSales &&
-      ad.subscription_id
-    ) {
+    if (nextSales && ad.subscription_id && prevSales) {
       await syncSalesImageMirrors(
         supabase,
         ad.subscription_id,
         prevSales,
         nextSales,
+        ad,
       );
     }
     // Older companion posts were created with the ad's description, which the
