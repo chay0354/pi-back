@@ -173,23 +173,72 @@ function sanitizePiAiPoolItem(raw) {
   return item;
 }
 
-const PI_AI_CATEGORY_LEGEND = `Listing categories (category / category_label):
-1 = חדש מקבלן (new developer apartments)
-2 = משרדים (offices)
-3 = שותפים (roommates / shared apartment — NOT regular rent)
-4 = גלובל
-5 = BNB / צימר / lodging (price_per_night, hospitality_nature)
-6 = מגזר דתי
-7 = קרקעות / land (land_address, land_parcel, land_block, permit)
-8 = מסחרי / commercial
-10 = דירות (regular apartments — default)
-12 = יוקרה / luxury
+const PI_AI_CATEGORY_LEGEND = `1 חדש מקבלן, 2 משרד, 3 שותפים, 4 גלובל, 5 צימר/BNB, 6 מגזר דתי, 7 קרקע, 8 מסחרי, 10 דירה, 12 יוקרה. purpose_kind: rent=להשכרה, sale=למכירה.`;
 
-purpose_kind: rent = להשכרה, sale = למכירה (Hebrew purpose field may also appear).`;
+const HOME_CATS = ['1', '6', '10', '12'];
+
+/** Hard query constraints so Gemini cannot pad with unrelated types. */
+function inferPiAiQueryConstraints(query) {
+  const q = String(query || '')
+    .trim()
+    .toLowerCase();
+  let cats = null;
+  if (/שותפ/.test(q)) cats = ['3'];
+  else if (/(?:צימר|\bbnb\b|לינה)/i.test(q)) cats = ['5'];
+  else if (/משרד/.test(q)) cats = ['2'];
+  else if (/(?:מגרש|קרקע|גוש|חלקה)/.test(q)) cats = ['7'];
+  else if (/מסחר/.test(q)) cats = ['8'];
+  else if (/(?:דיר|בית|יוקר|פנטהאוז)/.test(q)) cats = HOME_CATS;
+
+  let purpose = null;
+  const rent = /להשכרה|לשכור|שכירות|השכרה/.test(q);
+  const sale = /למכירה|לקנות|קנייה|קניה/.test(q);
+  if (rent && !sale) purpose = 'rent';
+  else if (sale && !rent) purpose = 'sale';
+
+  return {cats, purpose};
+}
+
+function listingFitsPiAiConstraints(item, constraints) {
+  if (!item || !constraints) return true;
+  if (constraints.cats && constraints.cats.length) {
+    const c = String(item.category != null ? item.category : '');
+    if (!constraints.cats.includes(c)) return false;
+  }
+  if (constraints.purpose) {
+    const pk = String(item.purpose_kind || '').trim().toLowerCase();
+    if (pk && pk !== constraints.purpose) return false;
+  }
+  return true;
+}
+
+function buildPiAiSearchPrompt(query, pool) {
+  const q = String(query || '').trim().slice(0, 300);
+  return `You rank Israeli real-estate ads. The query is Hebrew (typos OK). Use only the listings below.
+
+QUERY: ${q}
+
+CATEGORIES: ${PI_AI_CATEGORY_LEGEND}
+
+LISTINGS (JSON):
+${JSON.stringify(pool)}
+
+Pick ads that actually match the query. Best first.
+- If a city or neighborhood is named, keep only ads in that place.
+- דירה/בית → 1,6,10,12. משרד → 2. קרקע/מגרש → 7. צימר/BNB → 5. שותפים → 3 only. Do not mix types.
+- להשכרה → rent only. למכירה → sale only.
+- If nothing fits, return an empty list. Do not fill with unrelated ads.
+- Max 20 ids.
+
+Reply JSON only: {"ids":["id1","id2"]}`;
+}
 
 module.exports = {
   buildPiAiListingSummary,
   sanitizePiAiPoolItem,
+  inferPiAiQueryConstraints,
+  listingFitsPiAiConstraints,
+  buildPiAiSearchPrompt,
   PI_AI_CATEGORY_LEGEND,
   PI_AI_POOL_MAX: 250,
 };

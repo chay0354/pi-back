@@ -9,8 +9,10 @@ const muxVideo = require('./muxVideo');
 const {
   buildPiAiListingSummary,
   sanitizePiAiPoolItem,
-  PI_AI_CATEGORY_LEGEND,
   PI_AI_POOL_MAX,
+  buildPiAiSearchPrompt,
+  inferPiAiQueryConstraints,
+  listingFitsPiAiConstraints,
 } = require('./utils/piAiListingSummary');
 
 /** New Google AI keys (AQ… format) cannot use legacy model ids — try *-latest first. */
@@ -23,14 +25,13 @@ const GEMINI_MODELS_TO_TRY = [
   'gemini-2.0-flash',
 ];
 
-/** Pi AI search needs geographic reasoning — prefer the full flash model over lite. */
+/** Pi AI search — Gemini Flash (instruction-following), then fallbacks. */
 const GEMINI_SEARCH_MODELS_TO_TRY = [
-  'gemini-flash-latest',
-  'gemini-3-flash-preview',
-  'gemini-flash-lite-latest',
   'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
+  'gemini-flash-latest',
   'gemini-2.0-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-flash-lite-latest',
 ];
 
 const B2B_SUBSCRIPTION_TYPES = new Set([
@@ -698,51 +699,13 @@ app.post('/api/ai/pi-search', async (req, res) => {
       return res.json({ success: true, ids: [] });
     }
 
-    const prompt = `You are Pi AI, the search engine of an Israeli real-estate listings app. Queries are usually in Hebrew, written casually, often with typos. You are an expert on Israeli geography: cities, neighborhoods, streets, regions, and which places are on the coast, in the mountains, near lakes, near parks, near business districts or near transit. Use that knowledge — never rely on literal keyword overlap.
-
-${PI_AI_CATEGORY_LEGEND}
-
-USER QUERY: "${q.slice(0, 300)}"
-
-CANDIDATE LISTINGS (JSON array; prices/budget in ILS):
-${JSON.stringify(pool)}
-
-Task: pick the listings that genuinely satisfy the query and order them best-match first.
-
-How to think:
-1. Read the query and decide what the user really wants: asset type, rent vs sale, and any lifestyle/location intent.
-2. For each candidate, work out where it actually is from its address, land_address, project_name and description — resolve it to a real place using your own knowledge of the country. If the street name is generic, unfamiliar or clearly a placeholder, fall back to the city or neighborhood in the address and judge by that.
-3. Judge whether that real-world location satisfies the user's intent, then rank by how well it fits.
-
-Rules:
-- Hebrew understanding: handle synonyms, morphology and typos (דירה/דירות, שותפים/שותים/דירת שותים, להשכרה/שכירות, למכירה/לקנות, צימר/לינה/BNB, משרד, מגרש/קרקע/גוש/חלקה...). Infer intent even when spelling is imperfect.
-- Asset type is a hard filter, checked before anything else: use category and category_label. "דירה"/"דירות"/"בית" means a residential home for living in — categories 1, 10, 12, and 6 when relevant. For such a query NEVER return offices (2), commercial (8), land (7), BNB/צימר (5) or roommates (3), no matter how well the listing matches the location or the rest of the query. Return BNB (5) only for short-term lodging intent, offices (2) / commercial (8) only for business space, land (7) only for מגרש/קרקע. If no listing of the requested type matches, return an empty array rather than a different type.
-- category "3" = שותפים (roommates). Only when the query is about finding or bringing a roommate:
-  • Return ONLY category "3" ids — never mix with regular apartments/offices/land/BNB.
-  • search_purpose "enter" = wants to join an apartment; "bring_in"/"partner" = wants to add a roommate.
-  • Use preferred_gender, preferred_age_min/max, preferred_apartment_type, preferences, budget when relevant.
-- Regular rent/sale/office/land/BNB searches with NO roommate intent: EXCLUDE category "3".
-- purpose_kind "rent" = להשכרה; "sale" = למכירה. If the query clearly implies one, exclude the other. The Hebrew purpose field says the same thing.
-- Skip listings that carry no usable information (empty or gibberish description with no address, price or other fields) — they can never be a real match.
-- Location intelligence (most important):
-  • Explicit city or neighborhood → return only listings that are really in that city/neighborhood, judged from the address, not just from the string appearing somewhere.
-  • Implicit / lifestyle location intent (e.g. "קרוב לים", "נוף לים", "ליד הטיילת", "מרכז העיר", "ליד פארק", "אזור שקט", "קרוב לתחנת רכבת", "בשרון", "בצפון") → decide from your own knowledge of geography which listings actually satisfy it, working from the real city, neighborhood and street of each listing.
-  • Judge proximity at the finest level the address supports. When the street pins down a specific spot, use it. When it does not, judge by the city, and do not discard the listing for lacking a precise street.
-  • Sea queries ("קרוב לים", "ליד הים", "על הים", "נוף לים", "ליד החוף"): resolve each listing to its city, then keep every listing whose city lies on the coast — a home anywhere in a coastal city counts as close to the sea. Rank the most sea-adjacent cities, neighborhoods and streets first. Drop listings in inland cities entirely. This applies even when the query names no city at all: in that case scan all the coastal cities present among the candidates rather than returning nothing.
-  • Never count a listing just because the word ים or חוף appears in its text.
-  • Unless the user asks for property abroad, prefer listings in Israel over foreign ones.
-  • When no city is named, consider every candidate fairly — the answer is wherever the intent is genuinely satisfied.
-- Numeric constraints: price/budget/price_per_night within roughly ±20% when specified; respect rooms/area/floor when specified ("עד 2 מיליון" = maximum).
-- Land (category 7): use land_parcel, land_block, permit, land_address.
-- BNB (category 5): use price_per_night, hospitality_nature, service_facility, amenities.
-- Prefer strong matches; include weaker partial matches only if there are fewer than 3 strong ones, and rank them below. Never include clearly irrelevant listings just to fill the list.
-- Return at most 20 ids. If nothing reasonably matches, return an empty array.
-
-Output strict JSON only: {"ids": ["id1", "id2"]}`;
+    const prompt = buildPiAiSearchPrompt(q, pool);
+    const constraints = inferPiAiQueryConstraints(q);
 
     const modelsToTry = GEMINI_SEARCH_MODELS_TO_TRY;
     let lastError = null;
     let response = null;
+    let usedModel = null;
     for (const model of modelsToTry) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
       response = await fetch(url, {
@@ -751,10 +714,8 @@ Output strict JSON only: {"ids": ["id1", "id2"]}`;
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
-            // Reasoning models spend part of this budget thinking before they
-            // answer — too low truncates the id list mid-way.
-            maxOutputTokens: 8192,
-            temperature: 0.1,
+            maxOutputTokens: 4096,
+            temperature: 0,
             responseMimeType: 'application/json',
             responseSchema: {
               type: 'OBJECT',
@@ -764,18 +725,30 @@ Output strict JSON only: {"ids": ["id1", "id2"]}`;
           }
         })
       });
-      if (response.ok) break;
+      if (response.ok) {
+        usedModel = model;
+        break;
+      }
       lastError = await response.text();
-      if (response.status === 429) continue; // per-model quota — try next model
-      if (response.status === 404) continue; // try next model
+      if (
+        response.status === 429 ||
+        response.status === 503 ||
+        response.status === 404
+      ) {
+        continue;
+      }
       break;
     }
     if (!response.ok) {
       console.error('Gemini pi-search error:', response.status, lastError);
-      const status = response.status === 429 ? 429 : 502;
+      const status =
+        response.status === 429 || response.status === 503 ? 429 : 502;
       return res.status(status).json({
         success: false,
-        error: response.status === 429 ? 'quota_exceeded' : 'AI request failed'
+        error:
+          response.status === 429 || response.status === 503
+            ? 'quota_exceeded'
+            : 'AI request failed'
       });
     }
     const data = await response.json();
@@ -797,16 +770,18 @@ Output strict JSON only: {"ids": ["id1", "id2"]}`;
       return res.status(502).json({ success: false, error: 'AI returned invalid response' });
     }
     const validIds = new Set(pool.map(l => String(l.id)));
+    const byId = new Map(pool.map(l => [String(l.id), l]));
     const seen = new Set();
     const ranked = [];
     for (const id of ids) {
       const key = String(id);
       if (!validIds.has(key) || seen.has(key)) continue;
+      if (!listingFitsPiAiConstraints(byId.get(key), constraints)) continue;
       seen.add(key);
       ranked.push(key);
       if (ranked.length >= 20) break;
     }
-    return res.json({ success: true, ids: ranked });
+    return res.json({ success: true, ids: ranked, source: 'gemini', model: usedModel });
   } catch (err) {
     console.error('POST /api/ai/pi-search:', err);
     return res.status(500).json({ success: false, error: err.message });
