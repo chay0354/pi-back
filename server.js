@@ -25,13 +25,14 @@ const GEMINI_MODELS_TO_TRY = [
   'gemini-2.0-flash',
 ];
 
-/** Pi AI search — Gemini Flash (instruction-following), then fallbacks. */
+/** Pi AI search — same order as other Gemini calls so a working model is tried first.
+ *  Starting with 2.5-flash 404s for ~8s each and the app times out as "Network request failed". */
 const GEMINI_SEARCH_MODELS_TO_TRY = [
-  'gemini-2.5-flash',
-  'gemini-flash-latest',
-  'gemini-2.0-flash',
-  'gemini-2.5-flash-lite',
   'gemini-flash-lite-latest',
+  'gemini-flash-latest',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
 ];
 
 const B2B_SUBSCRIPTION_TYPES = new Set([
@@ -6340,8 +6341,6 @@ app.get('/api/follows/hub', async (req, res) => {
       if (error) return res.status(500).json({ success: false, error: error.message });
       relationRows = data || [];
     } else if (tab === 'following') {
-      // Accepted follows only — never include pending outgoing requests
-      // (menu "במעקב" / hub "עוקב" should match users who accepted you).
       const { data: followRows, error: fErr } = await supabase
         .from('user_follows')
         .select('following_subscription_id, created_at')
@@ -6350,11 +6349,40 @@ app.get('/api/follows/hub', async (req, res) => {
       if (fErr) {
         return res.status(500).json({ success: false, error: fErr.message });
       }
-      relationRows = (followRows || []).map(r => ({
+      const acceptedRows = (followRows || []).map(r => ({
         following_subscription_id: r.following_subscription_id,
         created_at: r.created_at,
         pending_request_id: null,
       }));
+      const acceptedIds = new Set(
+        acceptedRows
+          .map(r => String(r.following_subscription_id || ''))
+          .filter(Boolean),
+      );
+      // Own hub: also list pending outgoing requests so "עקוב" is visible in עוקב.
+      let pendingRows = [];
+      if (viewerId && viewerId === userId) {
+        const { data: pendingOut, error: pErr } = await supabase
+          .from('user_follow_requests')
+          .select('id, target_subscription_id, created_at')
+          .eq('requester_subscription_id', userId)
+          .eq('status', 'pending')
+          .order('created_at', { ascending: false });
+        if (pErr) {
+          return res.status(500).json({ success: false, error: pErr.message });
+        }
+        pendingRows = (pendingOut || [])
+          .filter(r => {
+            const tid = String(r?.target_subscription_id || '');
+            return tid && !acceptedIds.has(tid);
+          })
+          .map(r => ({
+            following_subscription_id: r.target_subscription_id,
+            created_at: r.created_at,
+            pending_request_id: r.id,
+          }));
+      }
+      relationRows = [...pendingRows, ...acceptedRows];
     } else {
       const { data, error } = await supabase
         .from('user_follow_requests')
@@ -6374,23 +6402,60 @@ app.get('/api/follows/hub', async (req, res) => {
           : tab === 'likes'
             ? 'user_id'
             : 'requester_subscription_id';
-    const idsInOrder = relationRows.map(r => String(r[idField]));
+    const idsInOrder = relationRows.map(r => String(r[idField] || '').trim()).filter(Boolean);
     const uniqueIds = [...new Set(idsInOrder)];
     if (uniqueIds.length === 0) {
       return res.json({ success: true, tab, rows: [] });
     }
 
-    const { data: subs, error: subsErr } = await supabase
-      .from('subscriptions')
-      .select(
-        'id, email, subscription_type, name, contact_person_name, business_name, broker_office_name, profile_picture_url, company_logo_url',
-      )
-      .in('id', uniqueIds);
-    if (subsErr) return res.status(500).json({ success: false, error: subsErr.message });
+    const uuidIds = uniqueIds.filter(id => FOLLOW_UUID_REGEX.test(id));
+    const emailIds = uniqueIds
+      .filter(id => !FOLLOW_UUID_REGEX.test(id) && id.includes('@'))
+      .map(id => normalizeSubscriptionEmail(id))
+      .filter(Boolean);
+
+    const hubSubSelect =
+      'id, email, subscription_type, name, contact_person_name, business_name, broker_office_name, profile_picture_url, company_logo_url';
+    const [subsByIdRes, subsByEmailRes] = await Promise.all([
+      uuidIds.length
+        ? supabase.from('subscriptions').select(hubSubSelect).in('id', uuidIds)
+        : Promise.resolve({ data: [], error: null }),
+      emailIds.length
+        ? supabase.from('subscriptions').select(hubSubSelect).in('email', emailIds)
+        : Promise.resolve({ data: [], error: null }),
+    ]);
+    if (subsByIdRes.error) {
+      return res.status(500).json({ success: false, error: subsByIdRes.error.message });
+    }
+    if (subsByEmailRes.error) {
+      return res.status(500).json({ success: false, error: subsByEmailRes.error.message });
+    }
     const byId = {};
-    (subs || []).forEach(s => {
+    const byEmail = {};
+    [...(subsByIdRes.data || []), ...(subsByEmailRes.data || [])].forEach(s => {
+      if (!s?.id) return;
       byId[String(s.id)] = s;
+      if (s.email) byEmail[normalizeSubscriptionEmail(s.email)] = s;
     });
+    const resolveHubSub = rawId => {
+      const id = String(rawId || '').trim();
+      if (!id) return null;
+      if (byId[id]) return byId[id];
+      return byEmail[normalizeSubscriptionEmail(id)] || null;
+    };
+    const canonicalIds = [
+      ...new Set(
+        uniqueIds
+          .map(rawId => {
+            const sub = resolveHubSub(rawId);
+            return sub?.id ? String(sub.id) : null;
+          })
+          .filter(Boolean),
+      ),
+    ];
+    if (canonicalIds.length === 0) {
+      return res.json({ success: true, tab, rows: [] });
+    }
 
     /** Subset of uniqueIds who follow `userId` (the profile) — for mutual on the "following" tab. */
     const theyFollowUserIdSet = new Set();
@@ -6399,7 +6464,7 @@ app.get('/api/follows/hub', async (req, res) => {
         .from('user_follows')
         .select('follower_subscription_id')
         .eq('following_subscription_id', userId)
-        .in('follower_subscription_id', uniqueIds);
+        .in('follower_subscription_id', canonicalIds);
       (theyFollowMe || []).forEach(r => {
         const sid = String(r?.follower_subscription_id || '');
         if (sid) {
@@ -6416,7 +6481,7 @@ app.get('/api/follows/hub', async (req, res) => {
         .from('user_follows')
         .select('following_subscription_id')
         .eq('follower_subscription_id', viewerId)
-        .in('following_subscription_id', uniqueIds);
+        .in('following_subscription_id', canonicalIds);
       (viewerFollowing || []).forEach(r =>
         viewerFollowingSet.add(String(r.following_subscription_id)),
       );
@@ -6426,7 +6491,7 @@ app.get('/api/follows/hub', async (req, res) => {
         .select('target_subscription_id')
         .eq('requester_subscription_id', viewerId)
         .eq('status', 'pending')
-        .in('target_subscription_id', uniqueIds);
+        .in('target_subscription_id', canonicalIds);
       (viewerPending || []).forEach(r => {
         const tid = String(r.target_subscription_id || '');
         // If already following, ignore a leftover pending request so the hub still lists them.
@@ -6439,7 +6504,7 @@ app.get('/api/follows/hub', async (req, res) => {
         .from('profile_reviews')
         .select('target_subscription_id, rating')
         .eq('reviewer_subscription_id', viewerId)
-        .in('target_subscription_id', uniqueIds);
+        .in('target_subscription_id', canonicalIds);
       const agg = {};
       (viewerRatings || []).forEach(r => {
         const target = String(r?.target_subscription_id || '');
@@ -6454,12 +6519,46 @@ app.get('/api/follows/hub', async (req, res) => {
       });
     }
 
+    const seenCanonical = new Set();
+    const looksLikeEmail = value =>
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+    const isPlaceholderEmail = value => {
+      const e = String(value || '').trim().toLowerCase();
+      return (
+        !e ||
+        e === 'broker-placeholder@example.com' ||
+        e.includes('placeholder') ||
+        e.endsWith('@placeholder.local')
+      );
+    };
     const rows = idsInOrder
-      .map(id => {
-        const sub = byId[id];
+      .map(rawId => {
+        const sub = resolveHubSub(rawId);
         if (!sub) return null;
-        const relation = relationRows.find(r => String(r[idField]) === id);
-        const { name, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+        const id = String(sub.id);
+        if (seenCanonical.has(id)) return null;
+        seenCanonical.add(id);
+        const relation = relationRows.find(
+          r =>
+            String(r[idField]) === String(rawId) ||
+            String(r[idField]) === id,
+        );
+        const { name: rawName, imageUrl } = getSubscriptionDisplayNameAndImage(sub);
+        const cleanName =
+          rawName && !looksLikeEmail(rawName) && !isPlaceholderEmail(rawName)
+            ? rawName
+            : sub.contact_person_name ||
+              sub.business_name ||
+              sub.broker_office_name ||
+              null;
+        const name =
+          cleanName && !looksLikeEmail(cleanName) && !isPlaceholderEmail(cleanName)
+            ? String(cleanName).trim()
+            : 'משתמש';
+        const email =
+          sub.email && !isPlaceholderEmail(sub.email)
+            ? String(sub.email).trim()
+            : null;
         const subtitle = followTypeLabel(sub?.subscription_type);
         const isSelf = viewerId && viewerId === id;
         const isMutualFollow =
@@ -6481,7 +6580,8 @@ app.get('/api/follows/hub', async (req, res) => {
            * "following" — this account also follows you. Not pending-only.
            */
           is_mutual_follow: isMutualFollow,
-          name: name || 'משתמש',
+          name,
+          email,
           subtitle,
           subscription_type:
             sub?.subscription_type != null
@@ -6501,7 +6601,7 @@ app.get('/api/follows/hub', async (req, res) => {
       .filter(Boolean)
       .filter(row => {
         if (!q) return true;
-        const hay = `${row.name} ${row.subtitle}`.toLowerCase();
+        const hay = `${row.name} ${row.subtitle} ${row.email || ''}`.toLowerCase();
         return hay.includes(q);
       });
 
