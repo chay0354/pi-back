@@ -782,6 +782,18 @@ app.post('/api/ai/pi-search', async (req, res) => {
       ranked.push(key);
       if (ranked.length >= 20) break;
     }
+    // Client already narrowed by rooms/type. If Gemini returns nothing, keep
+    // those constraint-matching ads instead of an empty result.
+    if (!ranked.length && constraints && constraints.rooms != null) {
+      for (const item of pool) {
+        const key = String(item.id);
+        if (seen.has(key)) continue;
+        if (!listingFitsPiAiConstraints(item, constraints)) continue;
+        seen.add(key);
+        ranked.push(key);
+        if (ranked.length >= 20) break;
+      }
+    }
     return res.json({ success: true, ids: ranked, source: 'gemini', model: usedModel });
   } catch (err) {
     console.error('POST /api/ai/pi-search:', err);
@@ -5264,11 +5276,13 @@ app.get('/api/chat/group-messages', async (req, res) => {
     const members = (parts || []).map((p) => normEmail(p.user_id)).filter(Boolean);
     if (!members.includes(userEmail)) return res.status(403).json({ success: false, error: 'Not a participant' });
 
-    markChatConversationRead(userEmail, convId);
+    const selfRefs = await chatSelfRefsForEmail(userEmail);
+    markChatConversationRead(userEmail, convId, selfRefs);
+    const peerLastReadAt = await loadPeerLastReadAt(convId, selfRefs);
 
     let list;
     try {
-      list = await loadChatMessagesForConversation(convId, userEmail);
+      list = await loadChatMessagesForConversation(convId, userEmail, { peerLastReadAt });
     } catch (loadErr) {
       return res.status(500).json({ success: false, error: loadErr?.message || 'Unable to load group messages' });
     }
@@ -5426,7 +5440,7 @@ app.get('/api/chat/group-messages', async (req, res) => {
     }
     uniqueMembers.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'he'));
 
-    res.json({ success: true, messages: list, conversation_id: convId, group, members: uniqueMembers });
+    res.json({ success: true, messages: list, conversation_id: convId, group, members: uniqueMembers, peerLastReadAt });
   } catch (err) {
     console.error('GET /api/chat/group-messages:', err);
     res.status(500).json({ success: false, error: err.message });
@@ -6727,11 +6741,22 @@ app.post('/api/reviews', async (req, res) => {
         }
       }
     }
-    const numRating = rating != null ? parseInt(rating, 10) : null;
-    if (numRating == null || isNaN(numRating) || numRating < 1 || numRating > 5) {
-      return res.status(400).json({ success: false, error: 'rating must be 1–5' });
-    }
     const commentStr = comment != null ? String(comment).trim() : '';
+    const parsedRating =
+      rating != null && rating !== '' ? parseInt(rating, 10) : null;
+    // 0 / empty = no stars (BnB private comments). Only 1–5 count as a rating.
+    const hasStarRating =
+      parsedRating != null &&
+      !isNaN(parsedRating) &&
+      parsedRating >= 1 &&
+      parsedRating <= 5;
+    if (!hasStarRating && !commentStr) {
+      return res.status(400).json({
+        success: false,
+        error: 'rating must be 1–5 or a comment is required',
+      });
+    }
+    const numRating = hasStarRating ? parsedRating : null;
     const rawReviewerSubId = reviewer_subscription_id && String(reviewer_subscription_id).trim() ? String(reviewer_subscription_id).trim() : null;
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const reviewerSubId = rawReviewerSubId && uuidRegex.test(rawReviewerSubId) ? rawReviewerSubId : null;
@@ -7229,6 +7254,7 @@ app.get('/api/listings', async (req, res) => {
       'special',
       'rural',
       'desert',
+      'urban',
     ]);
     const applyHospitalityNature = (q) => {
       if (!hospitalityNatureParam || !allowedHospitalityNatures.has(hospitalityNatureParam)) {
@@ -7585,6 +7611,14 @@ app.get('/api/listings', async (req, res) => {
             creatorBySubId[s.id] = {
               creator_email: s.email || null,
               creator_name: displayName || null,
+              creator_subscriber_number:
+                s.subscriber_number != null && String(s.subscriber_number).trim() !== ''
+                  ? String(s.subscriber_number).trim()
+                  : null,
+              creator_business_name:
+                s.business_name != null && String(s.business_name).trim() !== ''
+                  ? String(s.business_name).trim()
+                  : null,
               creator_profile_image_url: subscriptionAvatarUrlFromRow(s),
               creator_subscription_type:
                 s.subscription_type != null && String(s.subscription_type).trim() !== ''
@@ -7704,6 +7738,8 @@ app.get('/api/listings', async (req, res) => {
         listing_videos,
         is_frozen: row.is_frozen === true || row.is_frozen === 't',
         creator_name: row.creator_name ?? creator.creator_name ?? null,
+        creator_subscriber_number: creator.creator_subscriber_number ?? null,
+        creator_business_name: creator.creator_business_name ?? null,
         creator_email: row.creator_email ?? creator.creator_email ?? null,
         creator_profile_image_url: row.profile_image_url ?? creator.creator_profile_image_url ?? null,
         creator_subscription_type: creator.creator_subscription_type ?? null,
@@ -8868,14 +8904,80 @@ async function upsertExclusiveOfferPending(supabase, { convId, body, listingId, 
   }
 }
 
+async function chatSelfRefsForEmail(userEmail) {
+  const email = normEmail(userEmail);
+  const selfRefs = new Set();
+  if (email) selfRefs.add(email);
+  try {
+    const { data: meSub } = await supabase
+      .from('subscriptions')
+      .select('id, email')
+      .ilike('email', email)
+      .maybeSingle();
+    if (meSub?.id) selfRefs.add(String(meSub.id).trim().toLowerCase());
+    if (meSub?.email) selfRefs.add(normEmail(meSub.email));
+  } catch (_) {
+    /* ignore */
+  }
+  return selfRefs;
+}
+
+function isChatSelfRef(ref, selfRefs) {
+  const v = ref != null ? String(ref).trim().toLowerCase() : '';
+  if (!v || !selfRefs) return false;
+  if (selfRefs.has(v)) return true;
+  const em = normEmail(v);
+  return em ? selfRefs.has(em) : false;
+}
+
+function peerLastReadAtFromParticipants(parts, selfRefs) {
+  const others = (parts || []).filter((p) => !isChatSelfRef(p.user_id, selfRefs));
+  if (others.length === 0) return null;
+  let minTs = null;
+  for (const p of others) {
+    if (!p.last_read_at) return null;
+    const t = new Date(p.last_read_at).getTime();
+    if (!Number.isFinite(t)) return null;
+    if (minTs == null || t < minTs) minTs = t;
+  }
+  return minTs != null ? new Date(minTs).toISOString() : null;
+}
+
+async function loadPeerLastReadAt(conversationId, selfRefs) {
+  if (!conversationId) return null;
+  const { data: parts, error } = await supabase
+    .from('chat_participants')
+    .select('user_id, last_read_at')
+    .eq('conversation_id', conversationId);
+  if (error) {
+    if (!isMissingColumnError(error)) {
+      console.warn('[chat] loadPeerLastReadAt:', error.message);
+    }
+    return null;
+  }
+  return peerLastReadAtFromParticipants(parts, selfRefs);
+}
+
+function messageIsReadByPeer(createdAt, peerLastReadAt) {
+  if (!createdAt || !peerLastReadAt) return false;
+  const createdMs = new Date(createdAt).getTime();
+  const readMs = new Date(peerLastReadAt).getTime();
+  return Number.isFinite(createdMs) && Number.isFinite(readMs) && createdMs <= readMs;
+}
+
 // GET /api/chat/unread-count?user_email=...&after=:iso_timestamp
 async function markChatConversationRead(userEmail, conversationId, selfRefs = null) {
   if (!userEmail || !conversationId) return;
   const now = new Date().toISOString();
-  const refs =
+  let refs =
     selfRefs && typeof selfRefs.size === 'number' && selfRefs.size > 0
       ? [...selfRefs]
-      : [userEmail];
+      : null;
+  if (!refs) {
+    const resolved = await chatSelfRefsForEmail(userEmail);
+    refs = [...resolved];
+  }
+  if (!refs.includes(userEmail)) refs.push(userEmail);
   const upd = await supabase
     .from('chat_participants')
     .update({ last_read_at: now })
@@ -8898,7 +9000,12 @@ const CHAT_MESSAGES_INITIAL_LIMIT = 100;
 function mapChatMessageRow(
   m,
   myEmail,
-  { withMedia = true, withListingShare = true, withProfessionalNotification = true } = {},
+  {
+    withMedia = true,
+    withListingShare = true,
+    withProfessionalNotification = true,
+    peerLastReadAt = null,
+  } = {},
 ) {
   const isMe = normEmail(m.sender_id) === myEmail;
   return {
@@ -8918,13 +9025,14 @@ function mapChatMessageRow(
       withProfessionalNotification && m.is_professional_notification === true,
     createdAt: m.created_at,
     isMe,
+    isRead: isMe && messageIsReadByPeer(m.created_at, peerLastReadAt),
   };
 }
 
 async function loadChatMessagesForConversation(
   conversationId,
   myEmail,
-  { limit = CHAT_MESSAGES_INITIAL_LIMIT } = {},
+  { limit = CHAT_MESSAGES_INITIAL_LIMIT, peerLastReadAt = null } = {},
 ) {
   const cap = Number(limit);
   const useCap = Number.isFinite(cap) && cap > 0;
@@ -8949,6 +9057,7 @@ async function loadChatMessagesForConversation(
           withMedia: selectCols.includes('media_type'),
           withListingShare,
           withProfessionalNotification,
+          peerLastReadAt,
         }),
       ),
     };
@@ -9102,7 +9211,7 @@ app.get('/api/chat/conversations', async (req, res) => {
 
     const { data: allParticipants } = await supabase
       .from('chat_participants')
-      .select('conversation_id, user_id, display_name, profile_picture_url')
+      .select('conversation_id, user_id, display_name, profile_picture_url, last_read_at')
       .in('conversation_id', convIds);
     const participantsByConv = {};
     (allParticipants || []).forEach(p => {
@@ -9428,6 +9537,10 @@ app.get('/api/chat/conversations', async (req, res) => {
         const groupProfileImageUrl = asPublicImageUrl(
           gPic || participantGroupPic,
         );
+        const lastFromMe = last ? isSelfRef(last.sender_id) : false;
+        const peerReadAt = peerLastReadAtFromParticipants(participants, selfRefs);
+        const lastMessageRead =
+          lastFromMe && messageIsReadByPeer(last?.created_at, peerReadAt);
         return {
           id: c.id,
           isGroup: true,
@@ -9437,6 +9550,8 @@ app.get('/api/chat/conversations', async (req, res) => {
           preview,
           time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
           lastMessageAt: last?.created_at || c.last_message_at || null,
+          lastMessageFromMe: lastFromMe,
+          lastMessageRead,
           listingId,
           listingDisplayNumber,
           listingCategoryLabel,
@@ -9476,6 +9591,10 @@ app.get('/api/chat/conversations', async (req, res) => {
       const listingCategoryLabel = !Number.isNaN(catNum) ? (CHAT_LISTING_CATEGORY_LABELS[catNum] || null) : null;
       const listingDisplayNumber =
         listingId != null ? listingUploadOrderById[String(listingId)] ?? null : null;
+      const lastFromMe = last ? isSelfRef(last.sender_id) : false;
+      const peerReadAt = peerLastReadAtFromParticipants(participants, selfRefs);
+      const lastMessageRead =
+        lastFromMe && messageIsReadByPeer(last?.created_at, peerReadAt);
       return {
         id: c.id,
         isGroup: false,
@@ -9487,6 +9606,8 @@ app.get('/api/chat/conversations', async (req, res) => {
         preview,
         time: last ? new Date(last.created_at).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }) : '',
         lastMessageAt: last?.created_at || c.last_message_at || null,
+        lastMessageFromMe: lastFromMe,
+        lastMessageRead,
         listingId,
         listingDisplayNumber,
         listingCategoryLabel,
@@ -9867,7 +9988,9 @@ app.get('/api/chat/messages', async (req, res) => {
 
     if (!sharedConvId) return res.json({ success: true, messages: [] });
 
-    markChatConversationRead(myEmail, sharedConvId);
+    const selfRefs = await chatSelfRefsForEmail(myEmail);
+    markChatConversationRead(myEmail, sharedConvId, selfRefs);
+    const peerLastReadAt = await loadPeerLastReadAt(sharedConvId, selfRefs);
 
     let peerOfferBlocks = null;
     if (otherRefRaw) {
@@ -9882,7 +10005,7 @@ app.get('/api/chat/messages', async (req, res) => {
     let exclusiveOfferOut = null;
     try {
       const [messages, eoRes] = await Promise.all([
-        loadChatMessagesForConversation(sharedConvId, myEmail),
+        loadChatMessagesForConversation(sharedConvId, myEmail, { peerLastReadAt }),
         supabase
           .from('chat_exclusive_offers')
           .select('*')
@@ -9924,6 +10047,7 @@ app.get('/api/chat/messages', async (req, res) => {
       conversation_id: sharedConvId,
       exclusiveOffer: exclusiveOfferOut,
       peerOfferBlocks,
+      peerLastReadAt,
     });
   } catch (err) {
     console.error('GET /api/chat/messages:', err);
@@ -10562,6 +10686,151 @@ app.get('/api/listings/:id/preview', async (req, res) => {
       },
     });
   }
+});
+
+function escapeHtmlAttr(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+const ANDROID_PACKAGE_ID = 'com.pi.frontend';
+const PLAY_STORE_URL =
+  process.env.PLAY_STORE_URL ||
+  `https://play.google.com/store/apps/details?id=${ANDROID_PACKAGE_ID}`;
+const APP_STORE_URL =
+  process.env.APP_STORE_URL ||
+  'https://apps.apple.com/search?term=pi%202701';
+/** When true, try the installed app first and fall back to the store. Off until the app is listed. */
+const SHARE_TRY_OPEN_APP =
+  String(process.env.SHARE_TRY_OPEN_APP || '').toLowerCase() === 'true';
+
+/**
+ * Public share landing page. WhatsApp / Facebook / etc. open this HTTPS link.
+ * For now it opens the matching app store (Play on Android, App Store on iOS).
+ * After the app is published, set SHARE_TRY_OPEN_APP=true to open the app when installed.
+ */
+app.get('/p/:id', async (req, res) => {
+  const id = String(req.params.id || '').trim().toLowerCase();
+  if (!CHAT_LISTING_ID_UUID_RE.test(id)) {
+    return res.status(404).type('html').send('<!doctype html><html lang="he"><body>לא נמצא</body></html>');
+  }
+  let title = 'פוסט מפי 2701';
+  let description = 'הורידו את פי 2701 כדי לצפות בפוסט';
+  let image = '';
+  try {
+    const {data} = await supabase
+      .from('ads')
+      .select('description, main_image_url, additional_image_urls')
+      .eq('id', id)
+      .maybeSingle();
+    const desc = data?.description != null ? String(data.description).trim() : '';
+    if (desc && desc.toLowerCase() !== 'פוסט' && desc.toLowerCase() !== 'post') {
+      title = desc.slice(0, 80);
+      description = desc.slice(0, 180);
+    }
+    const extra = Array.isArray(data?.additional_image_urls)
+      ? data.additional_image_urls
+      : [];
+    image =
+      (data?.main_image_url && String(data.main_image_url).trim()) ||
+      (extra.find(u => u && String(u).trim()) || '');
+  } catch (_) {
+    /* still serve a working store landing page */
+  }
+  const publicUrl = `https://pi-back.vercel.app/p/${id}`;
+  const appUrl = `pifrontend://post/${id}`;
+  const intentUrl = `intent://post/${id}#Intent;scheme=pifrontend;package=${ANDROID_PACKAGE_ID};S.browser_fallback_url=${encodeURIComponent(PLAY_STORE_URL)};end`;
+  const safeTitle = escapeHtmlAttr(title);
+  const safeDesc = escapeHtmlAttr(description);
+  const safeImage = escapeHtmlAttr(image);
+  const safePlay = escapeHtmlAttr(PLAY_STORE_URL);
+  const safeAppStore = escapeHtmlAttr(APP_STORE_URL);
+  res
+    .status(200)
+    .type('html')
+    .set('Cache-Control', 'public, max-age=60')
+    .send(`<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>${safeTitle}</title>
+  <meta property="og:title" content="${safeTitle}"/>
+  <meta property="og:description" content="${safeDesc}"/>
+  <meta property="og:url" content="${escapeHtmlAttr(publicUrl)}"/>
+  <meta property="og:type" content="article"/>
+  ${safeImage ? `<meta property="og:image" content="${safeImage}"/>` : ''}
+  <meta name="twitter:card" content="summary_large_image"/>
+  <meta name="twitter:title" content="${safeTitle}"/>
+  <meta name="twitter:description" content="${safeDesc}"/>
+  <style>
+    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#1e1d27;color:#fff;font-family:Arial,sans-serif;text-align:center;padding:24px}
+    .card{max-width:360px}
+    h1{font-size:22px;margin:0 0 10px}
+    p{color:#c9c7d6;line-height:1.5}
+    a.btn{display:inline-block;margin:10px 6px 0;background:#fee787;color:#1e1d27;
+      text-decoration:none;font-weight:700;padding:12px 22px;border-radius:999px}
+    .stores{display:none}
+    body.is-desktop .stores{display:block}
+    body.is-desktop .one-store{display:none}
+  </style>
+  <script>
+    (function(){
+      var ua = navigator.userAgent || '';
+      var android = /android/i.test(ua);
+      var ios = /iphone|ipad|ipod/i.test(ua);
+      var playUrl = ${JSON.stringify(PLAY_STORE_URL)};
+      var appStoreUrl = ${JSON.stringify(APP_STORE_URL)};
+      var tryApp = ${SHARE_TRY_OPEN_APP ? 'true' : 'false'};
+      var appUrl = ${JSON.stringify(appUrl)};
+      var intentUrl = ${JSON.stringify(intentUrl)};
+      var storeUrl = android ? playUrl : (ios ? appStoreUrl : '');
+      function goStore() {
+        if (storeUrl) window.location.replace(storeUrl);
+      }
+      if (!android && !ios) {
+        document.documentElement.classList.add('is-desktop');
+        document.addEventListener('DOMContentLoaded', function(){
+          document.body.classList.add('is-desktop');
+        });
+        return;
+      }
+      if (tryApp) {
+        try { window.location.href = android ? intentUrl : appUrl; } catch (e) {}
+        setTimeout(goStore, 1600);
+      } else {
+        goStore();
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div class="card">
+    <h1>פי 2701</h1>
+    <p>${safeDesc}</p>
+    <p class="one-store">פותחים את חנות האפליקציות…</p>
+    <a class="btn one-store" id="storeBtn" href="${safePlay}">פתח בחנות</a>
+    <div class="stores">
+      <p>הורידו את פי 2701</p>
+      <a class="btn" href="${safePlay}">Google Play</a>
+      <a class="btn" href="${safeAppStore}">App Store</a>
+    </div>
+  </div>
+  <script>
+    (function(){
+      var ua = navigator.userAgent || '';
+      var btn = document.getElementById('storeBtn');
+      if (!btn) return;
+      if (/iphone|ipad|ipod/i.test(ua)) btn.href = ${JSON.stringify(APP_STORE_URL)};
+      else btn.href = ${JSON.stringify(PLAY_STORE_URL)};
+    })();
+  </script>
+</body>
+</html>`);
 });
 
 // POST /api/listings/:id/view - record a view (increment view_count)
