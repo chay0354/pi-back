@@ -10703,14 +10703,13 @@ const PLAY_STORE_URL =
 const APP_STORE_URL =
   process.env.APP_STORE_URL ||
   'https://apps.apple.com/search?term=pi%202701';
-/** When true, try the installed app first and fall back to the store. Off until the app is listed. */
+/** Try the installed app first (deep link to that post), then fall back to the store. */
 const SHARE_TRY_OPEN_APP =
-  String(process.env.SHARE_TRY_OPEN_APP || '').toLowerCase() === 'true';
+  String(process.env.SHARE_TRY_OPEN_APP || 'true').toLowerCase() !== 'false';
 
 /**
  * Public share landing page. WhatsApp / Facebook / etc. open this HTTPS link.
- * For now it opens the matching app store (Play on Android, App Store on iOS).
- * After the app is published, set SHARE_TRY_OPEN_APP=true to open the app when installed.
+ * If Pi is installed it opens that exact post; otherwise the matching app store.
  */
 app.get('/p/:id', async (req, res) => {
   const id = String(req.params.id || '').trim().toLowerCase();
@@ -10774,6 +10773,7 @@ app.get('/p/:id', async (req, res) => {
     p{color:#c9c7d6;line-height:1.5}
     a.btn{display:inline-block;margin:10px 6px 0;background:#fee787;color:#1e1d27;
       text-decoration:none;font-weight:700;padding:12px 22px;border-radius:999px}
+    a.btn.ghost{background:transparent;color:#fee787;border:1px solid #fee787}
     .stores{display:none}
     body.is-desktop .stores{display:block}
     body.is-desktop .one-store{display:none}
@@ -10789,9 +10789,20 @@ app.get('/p/:id', async (req, res) => {
       var appUrl = ${JSON.stringify(appUrl)};
       var intentUrl = ${JSON.stringify(intentUrl)};
       var storeUrl = android ? playUrl : (ios ? appStoreUrl : '');
+      var storeTimer = null;
+      var leftForApp = false;
       function goStore() {
+        if (leftForApp || document.hidden) return;
         if (storeUrl) window.location.replace(storeUrl);
       }
+      function cancelStore() {
+        leftForApp = true;
+        if (storeTimer) clearTimeout(storeTimer);
+      }
+      document.addEventListener('visibilitychange', function(){
+        if (document.hidden) cancelStore();
+      });
+      window.addEventListener('pagehide', cancelStore);
       if (!android && !ios) {
         document.documentElement.classList.add('is-desktop');
         document.addEventListener('DOMContentLoaded', function(){
@@ -10800,8 +10811,8 @@ app.get('/p/:id', async (req, res) => {
         return;
       }
       if (tryApp) {
+        storeTimer = setTimeout(goStore, 1800);
         try { window.location.href = android ? intentUrl : appUrl; } catch (e) {}
-        setTimeout(goStore, 1600);
       } else {
         goStore();
       }
@@ -10812,8 +10823,9 @@ app.get('/p/:id', async (req, res) => {
   <div class="card">
     <h1>פי 2701</h1>
     <p>${safeDesc}</p>
-    <p class="one-store">פותחים את חנות האפליקציות…</p>
-    <a class="btn one-store" id="storeBtn" href="${safePlay}">פתח בחנות</a>
+    <p class="one-store">פותחים את הפרסום באפליקציה…</p>
+    <a class="btn one-store" id="appBtn" href="${escapeHtmlAttr(appUrl)}">פתח באפליקציה</a>
+    <a class="btn ghost one-store" id="storeBtn" href="${safePlay}">פתח בחנות</a>
     <div class="stores">
       <p>הורידו את פי 2701</p>
       <a class="btn" href="${safePlay}">Google Play</a>
