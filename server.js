@@ -9117,19 +9117,82 @@ function buildUnreadCountByConversation(convIds, lastMessages, isSelfRef, lastRe
   return unreadByConvId;
 }
 
+async function countUnreadChatMessagesForUser(userEmail) {
+  const selfRefs = await chatSelfRefsForEmail(userEmail);
+  const refs = [...selfRefs];
+  if (refs.length === 0) return 0;
+
+  let myPartsRes = await supabase
+    .from('chat_participants')
+    .select('conversation_id, last_read_at')
+    .in('user_id', refs);
+  if (myPartsRes.error && isMissingColumnError(myPartsRes.error)) {
+    myPartsRes = await supabase
+      .from('chat_participants')
+      .select('conversation_id')
+      .in('user_id', refs);
+  }
+  if (myPartsRes.error) {
+    console.error('countUnreadChatMessagesForUser participants:', myPartsRes.error.message);
+    return 0;
+  }
+
+  const myParts = myPartsRes.data || [];
+  const convIds = [...new Set(myParts.map((p) => p.conversation_id).filter(Boolean))];
+  if (convIds.length === 0) return 0;
+
+  const lastReadByConv = {};
+  myParts.forEach((p) => {
+    const cid = p.conversation_id;
+    if (!cid) return;
+    const ts = p.last_read_at || null;
+    if (!lastReadByConv[cid]) {
+      lastReadByConv[cid] = ts;
+      return;
+    }
+    if (ts && (!lastReadByConv[cid] || new Date(ts) > new Date(lastReadByConv[cid]))) {
+      lastReadByConv[cid] = ts;
+    }
+  });
+
+  const inList = `(${refs
+    .map((r) => `"${String(r).replace(/"/g, '')}"`)
+    .join(',')})`;
+
+  let total = 0;
+  const chunkSize = 12;
+  for (let i = 0; i < convIds.length; i += chunkSize) {
+    const chunk = convIds.slice(i, i + chunkSize);
+    const counts = await Promise.all(
+      chunk.map(async (cid) => {
+        let q = supabase
+          .from('chat_messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('conversation_id', cid)
+          .not('sender_id', 'in', inList);
+        const lastRead = lastReadByConv[cid];
+        if (lastRead) q = q.gt('created_at', lastRead);
+        const { count, error } = await q;
+        if (error) {
+          console.warn('countUnreadChatMessagesForUser conv', cid, error.message);
+          return 0;
+        }
+        return typeof count === 'number' ? count : 0;
+      }),
+    );
+    total += counts.reduce((sum, n) => sum + n, 0);
+  }
+  return total;
+}
+
 app.get('/api/chat/unread-count', async (req, res) => {
   try {
     const userEmail = normEmail(req.query.user_email);
     if (!userEmail) return res.status(400).json({ success: false, error: 'user_email required' });
-    const after = (req.query.after && String(req.query.after).trim()) || null;
-    let query = supabase.from('chat_messages').select('id', { count: 'exact', head: true }).eq('receiver_id', userEmail);
-    if (after) query = query.gt('created_at', after);
-    const { count, error } = await query;
-    if (error) {
-      console.error('GET /api/chat/unread-count:', error.message);
-      return res.json({ success: true, count: 0 });
-    }
-    res.json({ success: true, count: typeof count === 'number' ? count : 0 });
+    // Ignore `after`: the app used it as "last opened the inbox", which hid
+    // real unread messages and left the badge stuck at 0 or at the Pi +1.
+    const count = await countUnreadChatMessagesForUser(userEmail);
+    res.json({ success: true, count });
   } catch (err) {
     console.error('GET /api/chat/unread-count:', err);
     res.json({ success: true, count: 0 });
