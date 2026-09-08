@@ -464,7 +464,7 @@ const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KE
 // Configure multer for file uploads (in-memory storage)
 const upload = multer({ storage: multer.memoryStorage() });
 
-const CHAT_MEDIA_TYPES = new Set(['image', 'audio', 'file']);
+const CHAT_MEDIA_TYPES = new Set(['image', 'audio', 'file', 'video']);
 
 function normalizeChatMediaType(raw) {
   const t = raw != null ? String(raw).trim().toLowerCase() : '';
@@ -473,7 +473,7 @@ function normalizeChatMediaType(raw) {
 
 function isAllowedChatUploadMime(mime) {
   const m = (mime || '').toLowerCase();
-  if (m.startsWith('image/') || m.startsWith('audio/')) return true;
+  if (m.startsWith('image/') || m.startsWith('audio/') || m.startsWith('video/')) return true;
   if (m.startsWith('text/')) return true;
   if (m === 'application/pdf') return true;
   if (
@@ -782,9 +782,17 @@ app.post('/api/ai/pi-search', async (req, res) => {
       ranked.push(key);
       if (ranked.length >= 20) break;
     }
-    // Client already narrowed by rooms/type. If Gemini returns nothing, keep
-    // those constraint-matching ads instead of an empty result.
-    if (!ranked.length && constraints && constraints.rooms != null) {
+    // Client already narrowed by rooms / area / floor / price / type. If Gemini
+    // returns nothing, keep those constraint-matching ads instead of an empty
+    // result.
+    const hasHardNumbers =
+      !!constraints &&
+      (constraints.rooms != null ||
+        constraints.area != null ||
+        constraints.floor != null ||
+        constraints.price != null ||
+        constraints.amenities != null);
+    if (!ranked.length && hasHardNumbers) {
       for (const item of pool) {
         const key = String(item.id);
         if (seen.has(key)) continue;
@@ -10203,7 +10211,7 @@ app.post('/api/chat/messages', async (req, res) => {
       return res.status(400).json({ success: false, error: 'body or media_url required' });
     }
     if (mediaUrl && !mediaType) {
-      return res.status(400).json({ success: false, error: 'media_type must be image, audio, or file when media_url is set' });
+      return res.status(400).json({ success: false, error: 'media_type must be image, audio, file, or video when media_url is set' });
     }
     if (mediaType && !mediaUrl) {
       return res.status(400).json({ success: false, error: 'media_url required when media_type is set' });
@@ -12265,6 +12273,12 @@ app.post('/api/chat/upload-media', upload.single('file'), async (req, res) => {
                         ? 'mp3'
                         : mime.includes('mp4') && mime.startsWith('audio/')
                           ? 'm4a'
+                          : mime.startsWith('video/') && mime.includes('webm')
+                            ? 'webm'
+                            : mime.startsWith('video/') && mime.includes('quicktime')
+                              ? 'mov'
+                              : mime.startsWith('video/')
+                                ? 'mp4'
                           : null;
     const safeExt = String(fromName || guessExt || 'bin').replace(/[^a-zA-Z0-9]/g, '') || 'bin';
     const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${safeExt}`;
@@ -12365,6 +12379,10 @@ app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req,
   }
 });
 
+/** Buckets a client may request a signed upload URL for. */
+const DEFAULT_SIGNED_UPLOAD_BUCKET = 'user-pohto-video';
+const SIGNED_UPLOAD_BUCKETS = new Set([DEFAULT_SIGNED_UPLOAD_BUCKET, 'chat']);
+
 // Signed upload URL — client PUTs the file directly to Supabase
 // (avoids Vercel ~4.5MB body-size limit for photos and videos).
 app.post('/api/upload/signed-url', async (req, res) => {
@@ -12377,6 +12395,11 @@ app.post('/api/upload/signed-url', async (req, res) => {
       });
     }
 
+    const requestedBucket = req.body?.bucket ? String(req.body.bucket).trim() : '';
+    const bucket = SIGNED_UPLOAD_BUCKETS.has(requestedBucket)
+      ? requestedBucket
+      : DEFAULT_SIGNED_UPLOAD_BUCKET;
+
     const folder = (req.body && req.body.folder)
       ? String(req.body.folder).replace(/[^a-zA-Z0-9/_-]/g, '')
       : 'general';
@@ -12386,7 +12409,7 @@ app.post('/api/upload/signed-url', async (req, res) => {
     const objectPath = `${folder}/${Date.now()}-${safeName}`;
 
     const { data, error } = await supabase.storage
-      .from('user-pohto-video')
+      .from(bucket)
       .createSignedUploadUrl(objectPath);
 
     if (error) {
@@ -12399,7 +12422,7 @@ app.post('/api/upload/signed-url', async (req, res) => {
     }
 
     const { data: urlData } = supabase.storage
-      .from('user-pohto-video')
+      .from(bucket)
       .getPublicUrl(objectPath);
 
     res.json({
