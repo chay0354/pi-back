@@ -10607,7 +10607,7 @@ app.get('/api/listings/:id/preview', async (req, res) => {
     }
     let row = null;
     const PREVIEW_SELECT_WITH_CREATOR =
-      'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, price, address, purpose, creator_email, creator_name, profile_image_url, subscription_id, general_details, category';
+      'id, description, feed_post, property_type, main_image_url, additional_image_urls, video_url, video_hls_url, mux_playback_id, price, address, purpose, creator_email, creator_name, profile_image_url, subscription_id, general_details, category';
     const primary = await supabase
       .from('ads')
       .select(PREVIEW_SELECT_WITH_CREATOR)
@@ -10646,10 +10646,36 @@ app.get('/api/listings/:id/preview', async (req, res) => {
       });
     }
     const additional = Array.isArray(row.additional_image_urls) ? row.additional_image_urls : [];
-    const mediaUrl =
-      (row.main_image_url && String(row.main_image_url).trim()) ||
+    const isPreviewVideoUrl = url => {
+      const s = String(url || '').trim().toLowerCase();
+      if (!s) return false;
+      if (/\.(mp4|webm|mov|m4v|mkv|m3u8)(\?|#|$)/i.test(s)) return true;
+      return s.includes('stream.mux.com');
+    };
+    const mainImage =
+      row.main_image_url != null && String(row.main_image_url).trim()
+        ? String(row.main_image_url).trim()
+        : '';
+    const extraStill = additional
+      .map(u => (u != null ? String(u).trim() : ''))
+      .find(u => u && !isPreviewVideoUrl(u));
+    const stillUrl = (mainImage && !isPreviewVideoUrl(mainImage) ? mainImage : '') || extraStill || '';
+    const videoUrl =
       (row.video_url && String(row.video_url).trim()) ||
-      (additional.find(u => u && String(u).trim()) || null);
+      (mainImage && isPreviewVideoUrl(mainImage) ? mainImage : '') ||
+      null;
+    const videoHlsUrl =
+      row.video_hls_url != null && String(row.video_hls_url).trim()
+        ? String(row.video_hls_url).trim()
+        : muxVideo.hlsFromPlaybackId(row.mux_playback_id);
+    const muxPlayback = row.mux_playback_id != null ? String(row.mux_playback_id).trim() : '';
+    const muxPoster = muxPlayback
+      ? `https://image.mux.com/${muxPlayback}/thumbnail.jpg?time=0&width=480`
+      : (() => {
+          const m = String(videoHlsUrl || videoUrl || '').match(/stream\.mux\.com\/([A-Za-z0-9]+)/i);
+          return m ? `https://image.mux.com/${m[1]}/thumbnail.jpg?time=0&width=480` : null;
+        })();
+    const mediaUrl = stillUrl || muxPoster || videoUrl || extraStill || null;
     const purposeRaw = row.purpose != null ? String(row.purpose).trim().toLowerCase() : '';
     const purposeLabel = purposeRaw === 'rent' ? 'להשכרה' : 'למכירה';
     const priceNum = row.price != null ? Number(row.price) : null;
@@ -10659,6 +10685,9 @@ app.get('/api/listings/:id/preview', async (req, res) => {
         id: row.id,
         description: row.description || '',
         mediaUrl: mediaUrl || null,
+        videoUrl: videoUrl || null,
+        videoHlsUrl: videoHlsUrl || null,
+        posterUrl: stillUrl || muxPoster || null,
         feedPost: row.feed_post === true || row.feed_post === 'true' || row.feed_post === 't',
         propertyType: row.property_type || null,
         price: Number.isFinite(priceNum) ? priceNum : null,
