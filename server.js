@@ -194,7 +194,7 @@ function isB2BSubscriptionType(type) {
 /** Developer-company accounts: business_name is the display name and the logo is the avatar. */
 function isCompanyLikeSubscriptionType(type) {
   const t = String(type || '').trim().toLowerCase();
-  return t === 'company';
+  return t === 'company' || t === 'project_marketer';
 }
 
 /** Broker + משווק פרויקטים — same listing/profile display rules as brokers. */
@@ -221,15 +221,10 @@ function subscriptionDisplayNameFromRow(sub) {
   return sub.name || sub.business_name || sub.contact_person_name || null;
 }
 
+// Every account type now uploads its own profile photo; the company logo is
+// only an avatar fallback for rows created before that became mandatory.
 function subscriptionAvatarUrlFromRow(sub) {
   if (!sub) return null;
-  const type = String(sub.subscription_type || '').toLowerCase();
-  if (isCompanyLikeSubscriptionType(type)) {
-    return sub.company_logo_url || sub.profile_picture_url || null;
-  }
-  if (isBrokerLikeSubscriptionType(type)) {
-    return sub.profile_picture_url || sub.company_logo_url || null;
-  }
   return sub.profile_picture_url || sub.company_logo_url || null;
 }
 
@@ -1281,7 +1276,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       companyWebsite,
       description,
       types, // Array of selected types (for professional)
-      specializations, // Array of selected specializations (for professional)
+      specializations, // תחומי התמחות — professional + broker
       activityRegions, // Array of selected regions (for broker)
       agreedToTerms,
       marketerPlan, // project_marketer: 'single' | 'team5' | 'team10'
@@ -1482,7 +1477,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       company_website: companyWebsite,
       description,
       types: types ? (Array.isArray(types) ? JSON.stringify(types) : types) : null, // For professional
-      specializations: specializations ? (Array.isArray(specializations) ? JSON.stringify(specializations) : specializations) : null, // For professional
+      specializations: specializations ? (Array.isArray(specializations) ? JSON.stringify(specializations) : specializations) : null, // תחומי התמחות — professional + broker
       activity_regions: activityRegions ? (Array.isArray(activityRegions) ? JSON.stringify(activityRegions) : activityRegions) : null, // For broker
       profile_picture_url: fileUrls.profilePicture || null,
       additional_images_urls: fileUrls.additionalImages ? JSON.stringify(fileUrls.additionalImages) : null,
@@ -2310,9 +2305,9 @@ app.post('/api/users/register-regular', async (req, res) => {
           updatedKeys: Object.keys(updates),
         });
       } else {
-        console.log('[users/register-regular] existing user returned (no changes)', {
-          id: existing.id,
-        });
+      console.log('[users/register-regular] existing user returned (no changes)', {
+        id: existing.id,
+      });
       }
       row = await ensureRegularUserReady(row);
       return res.json({
@@ -2343,12 +2338,23 @@ app.post('/api/users/register-regular', async (req, res) => {
       access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
       max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
     };
+    const bnbHostLock = parseBnbHostLock(body.bnb_host_lock ?? body.bnbHostLock);
+    if (bnbHostLock) insertRow.bnb_host_lock = bnbHostLock;
 
-    const { data: inserted, error: insertErr } = await supabase
+    let { data: inserted, error: insertErr } = await supabase
       .from('subscriptions')
       .insert(insertRow)
       .select('*')
       .single();
+
+    if (insertErr && isMissingBnbHostLockColumnError(insertErr) && insertRow.bnb_host_lock) {
+      delete insertRow.bnb_host_lock;
+      ({ data: inserted, error: insertErr } = await supabase
+        .from('subscriptions')
+        .insert(insertRow)
+        .select('*')
+        .single());
+    }
 
     if (insertErr) {
       console.error('[users/register-regular] insert error:', insertErr);
@@ -2729,6 +2735,9 @@ app.post('/api/agency/join', async (req, res) => {
             ? String(body.phone).trim()
             : null,
         business_name: manager.business_name || null,
+        company_logo_url: manager.company_logo_url || manager.profile_picture_url || null,
+        profile_picture_url:
+          manager.profile_picture_url || manager.company_logo_url || null,
         parent_subscription_id: manager.id,
         marketer_plan: 'single',
         password_hash: hashPassword(password),
@@ -2969,6 +2978,16 @@ function isMissingAppleUserIdColumnError(err) {
   return /apple_user_id/i.test(msg) && /does not exist|42703|schema cache|PGRST204/i.test(msg);
 }
 
+function parseBnbHostLock(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  return s === 'private' || s === 'business' ? s : null;
+}
+
+function isMissingBnbHostLockColumnError(err) {
+  const msg = String((err && err.message) || err || '');
+  return /bnb_host_lock/i.test(msg) && /does not exist|42703|schema cache|PGRST204/i.test(msg);
+}
+
 /**
  * Shared create/sign-in path for Google / Apple regular users.
  * providerExtras may include apple_user_id.
@@ -2983,6 +3002,7 @@ async function upsertSocialRegularUser({
   profilePictureUrl = null,
   intent = 'register',
   providerLabel = 'Google',
+  bnbHostLock = null,
 }) {
   let existing = null;
   if (appleUserId) {
@@ -3017,9 +3037,9 @@ async function upsertSocialRegularUser({
       };
     }
     existing = byEmail || null;
-  }
+    }
 
-  if (existing) {
+    if (existing) {
     const existingType = String(existing.subscription_type || '').trim();
     if (existingType && existingType !== 'user') {
       return {
@@ -3038,7 +3058,7 @@ async function upsertSocialRegularUser({
     if (businessAddress && !existing.business_address) {
       extras.business_address = businessAddress;
     }
-    if (profilePictureUrl && !existing.profile_picture_url) {
+      if (profilePictureUrl && !existing.profile_picture_url) {
       extras.profile_picture_url = profilePictureUrl;
     }
     if (appleUserId && !existing.apple_user_id) {
@@ -3059,9 +3079,9 @@ async function upsertSocialRegularUser({
     return {
       status: 200,
       body: {
-        success: true,
+          success: true,
         subscription: sanitizeSubscriptionForClient(ready),
-        created: false,
+          created: false,
       },
     };
   }
@@ -3096,28 +3116,30 @@ async function upsertSocialRegularUser({
         error: `אנא הזן מספר טלפון לפני ההרשמה עם ${providerLabel}`,
       },
     };
-  }
+    }
 
-  const insertRow = {
-    subscription_type: 'user',
-    email: emailNorm,
-    name,
+    const insertRow = {
+      subscription_type: 'user',
+      email: emailNorm,
+      name,
     phone: phoneFromClient,
     business_address: businessAddress,
-    profile_picture_url: profilePictureUrl,
-    status: 'verified',
-    verified_at: new Date().toISOString(),
+      profile_picture_url: profilePictureUrl,
+      status: 'verified',
+      verified_at: new Date().toISOString(),
     subscriber_number: await generateUniqueSubscriberNumber(),
     access_expires_at: addMonths(new Date(), BASE_ACCESS_MONTHS).toISOString(),
     max_published_listings: DEFAULT_MONTHLY_LISTING_QUOTA,
-  };
+    };
   if (appleUserId) insertRow.apple_user_id = appleUserId;
+  const socialBnbHostLock = parseBnbHostLock(bnbHostLock);
+  if (socialBnbHostLock) insertRow.bnb_host_lock = socialBnbHostLock;
 
   let {data: inserted, error: insertErr} = await supabase
-    .from('subscriptions')
-    .insert(insertRow)
-    .select('*')
-    .single();
+      .from('subscriptions')
+      .insert(insertRow)
+      .select('*')
+      .single();
 
   if (insertErr && isMissingAppleUserIdColumnError(insertErr) && insertRow.apple_user_id) {
     delete insertRow.apple_user_id;
@@ -3128,7 +3150,16 @@ async function upsertSocialRegularUser({
       .single());
   }
 
-  if (insertErr) {
+  if (insertErr && isMissingBnbHostLockColumnError(insertErr) && insertRow.bnb_host_lock) {
+    delete insertRow.bnb_host_lock;
+    ({data: inserted, error: insertErr} = await supabase
+      .from('subscriptions')
+      .insert(insertRow)
+      .select('*')
+      .single());
+  }
+
+    if (insertErr) {
     console.error(`[${logTag}] insert error:`, insertErr);
     if (isUniqueEmailViolation(insertErr)) {
       const {data: raced} = await supabase
@@ -3210,7 +3241,8 @@ function parseSocialAuthBody(body = {}) {
     'login'
       ? 'login'
       : 'register';
-  return {phoneFromClient, nameFromClient, businessAddress, intent};
+  const bnbHostLock = parseBnbHostLock(body.bnb_host_lock ?? body.bnbHostLock);
+  return {phoneFromClient, nameFromClient, businessAddress, intent, bnbHostLock};
 }
 
 // POST /api/auth/google – verify Google ID token; create or sign in regular user
@@ -3222,6 +3254,7 @@ app.post('/api/auth/google', async (req, res) => {
       nameFromClient,
       businessAddress,
       intent,
+      bnbHostLock,
     } = parseSocialAuthBody(req.body || {});
 
     let googleUser;
@@ -3241,6 +3274,7 @@ app.post('/api/auth/google', async (req, res) => {
       profilePictureUrl: googleUser.picture || null,
       intent,
       providerLabel: 'Google',
+      bnbHostLock,
     });
     return res.status(result.status).json(result.body);
   } catch (err) {
@@ -3262,6 +3296,7 @@ app.post('/api/auth/apple', async (req, res) => {
       nameFromClient,
       businessAddress,
       intent,
+      bnbHostLock,
     } = parseSocialAuthBody(req.body || {});
 
     let appleUser;
@@ -3282,6 +3317,7 @@ app.post('/api/auth/apple', async (req, res) => {
       profilePictureUrl: null,
       intent,
       providerLabel: 'Apple',
+      bnbHostLock,
     });
     return res.status(result.status).json(result.body);
   } catch (err) {
@@ -3299,7 +3335,26 @@ const SUBSCRIPTION_SELECT =
   'specializations, activity_regions, types, description, phone, ' +
   'block_exclusive_offers, block_collab_offers, block_relevant_post_updates, ' +
   'marketer_plan, marketer_seat_limit, parent_subscription_id, ' +
+  'bnb_host_lock, ' +
   'created_at, updated_at';
+
+function subscriptionSelectWithoutBnbHostLock() {
+  return SUBSCRIPTION_SELECT.replace('bnb_host_lock, ', '');
+}
+
+async function querySubscriptionsSelect(applyFilters) {
+  let result = await applyFilters(
+    supabase.from('subscriptions').select(SUBSCRIPTION_SELECT),
+  );
+  if (result.error && isMissingBnbHostLockColumnError(result.error)) {
+    result = await applyFilters(
+      supabase
+        .from('subscriptions')
+        .select(subscriptionSelectWithoutBnbHostLock()),
+    );
+  }
+  return result;
+}
 
 const CHAT_OFFER_PREFERENCE_FIELDS = [
   'block_exclusive_offers',
@@ -3360,11 +3415,9 @@ app.get('/api/subscription/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { data: subscription, error } = await supabase
-      .from('subscriptions')
-      .select(SUBSCRIPTION_SELECT)
-      .eq('id', id)
-      .single();
+    const { data: subscription, error } = await querySubscriptionsSelect(q =>
+      q.eq('id', id).single(),
+    );
 
     if (error || !subscription) {
       return res.status(200).json({
@@ -4078,11 +4131,10 @@ app.patch('/api/subscription/:id', async (req, res) => {
       }
 
       const subType = String(existing.subscription_type || '').toLowerCase();
-      if (subType !== 'broker' && subType !== 'professional') {
+      if (!isB2BSubscriptionType(subType)) {
         return res.status(403).json({
           success: false,
-          error:
-            'Profile video can only be updated for broker or professional accounts',
+          error: 'Profile video is only available for business accounts',
         });
       }
       existingForVideo = existing;
@@ -4148,12 +4200,20 @@ app.patch('/api/subscription/:id', async (req, res) => {
     }
     updates.updated_at = new Date().toISOString();
 
-    const { data: updated, error: updateError } = await supabase
+    let { data: updated, error: updateError } = await supabase
       .from('subscriptions')
       .update(updates)
       .eq('id', String(id).trim())
       .select(SUBSCRIPTION_SELECT)
       .single();
+    if (updateError && isMissingBnbHostLockColumnError(updateError)) {
+      ({ data: updated, error: updateError } = await supabase
+        .from('subscriptions')
+        .update(updates)
+        .eq('id', String(id).trim())
+        .select(subscriptionSelectWithoutBnbHostLock())
+        .single());
+    }
 
     if (updateError || !updated) {
       console.error('Error updating subscription profile:', updateError);
@@ -4665,14 +4725,14 @@ app.post('/api/chat/groups', async (req, res) => {
     }
     if (!creatorSub) {
       const { data: byEmail, error: creatorErr } = await supabase
-        .from('subscriptions')
-        .select('email, subscription_type')
-        .ilike('email', creator)
-        .limit(1)
-        .maybeSingle();
-      if (creatorErr) {
-        return res.status(500).json({ success: false, error: creatorErr.message });
-      }
+      .from('subscriptions')
+      .select('email, subscription_type')
+      .ilike('email', creator)
+      .limit(1)
+      .maybeSingle();
+    if (creatorErr) {
+      return res.status(500).json({ success: false, error: creatorErr.message });
+    }
       creatorSub = byEmail || null;
     }
     if (
@@ -4763,7 +4823,7 @@ app.post('/api/chat/groups', async (req, res) => {
         const retry2 = await supabase
           .from('chat_conversations')
           .insert({ type: 'group', title, ...(groupImageUrl ? { group_image_url: groupImageUrl } : {}) })
-          .select('id, type, title')
+        .select('id, type, title')
           .single();
         newConv = retry2.data;
         convErr = retry2.error;
@@ -5299,9 +5359,9 @@ app.get('/api/chat/group-messages', async (req, res) => {
     let convMeta = null;
     const [rAll, rCreator] = await Promise.all([
       supabase
-        .from('chat_conversations')
+      .from('chat_conversations')
         .select('title, group_image_url, group_description, group_kind')
-        .eq('id', convId)
+      .eq('id', convId)
         .maybeSingle(),
       supabase
         .from('chat_conversations')
@@ -5420,16 +5480,16 @@ app.get('/api/chat/group-messages', async (req, res) => {
       const sub =
         subsByRef.get(m.email) ||
         (m.userRef ? subsByRef.get(String(m.userRef).trim().toLowerCase()) : null);
-      if (sub) {
+        if (sub) {
         const subEmail = normEmail(sub.email);
         if (subEmail) m.email = subEmail;
         m.subscriptionId = sub.id != null ? String(sub.id).trim() : null;
-        if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
-        m.subscriptionType =
-          sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
+          if (!m.name) m.name = subscriptionDisplayNameFromRow(sub);
+          m.subscriptionType =
+            sub?.subscription_type != null ? String(sub.subscription_type).trim().toLowerCase() : null;
         m.profileImageUrl = asPublicImageUrl(subscriptionProfilePicFromRow(sub));
-      }
-      if (!m.profileImageUrl && m.participantProfileImageUrl) {
+        }
+        if (!m.profileImageUrl && m.participantProfileImageUrl) {
         m.profileImageUrl = asPublicImageUrl(m.participantProfileImageUrl);
       }
       if (!m.name) m.name = m.email.includes('@') ? m.email.split('@')[0] : m.email || m.email;
@@ -5699,7 +5759,7 @@ app.post('/api/company-reports', async (req, res) => {
           ? 'professional'
           : subjectTypeRaw === 'bnb'
             ? 'bnb'
-            : 'company';
+          : 'company';
 
     const allowedCompany = new Set([
       'construction_quality',
@@ -5745,7 +5805,7 @@ app.post('/api/company-reports', async (req, res) => {
           ? allowedProfessional
           : subject_type === 'bnb'
             ? allowedBnb
-            : allowedCompany;
+          : allowedCompany;
 
     const reason_keys = [
       ...new Set(
@@ -6364,9 +6424,9 @@ app.get('/api/follows/hub', async (req, res) => {
       relationRows = data || [];
     } else if (tab === 'following') {
       const { data: followRows, error: fErr } = await supabase
-        .from('user_follows')
-        .select('following_subscription_id, created_at')
-        .eq('follower_subscription_id', userId)
+            .from('user_follows')
+            .select('following_subscription_id, created_at')
+            .eq('follower_subscription_id', userId)
         .order('created_at', { ascending: false });
       if (fErr) {
         return res.status(500).json({ success: false, error: fErr.message });
@@ -6385,14 +6445,14 @@ app.get('/api/follows/hub', async (req, res) => {
       let pendingRows = [];
       if (viewerId && viewerId === userId) {
         const { data: pendingOut, error: pErr } = await supabase
-          .from('user_follow_requests')
-          .select('id, target_subscription_id, created_at')
-          .eq('requester_subscription_id', userId)
-          .eq('status', 'pending')
+            .from('user_follow_requests')
+            .select('id, target_subscription_id, created_at')
+            .eq('requester_subscription_id', userId)
+            .eq('status', 'pending')
           .order('created_at', { ascending: false });
-        if (pErr) {
-          return res.status(500).json({ success: false, error: pErr.message });
-        }
+      if (pErr) {
+        return res.status(500).json({ success: false, error: pErr.message });
+      }
         pendingRows = (pendingOut || [])
           .filter(r => {
             const tid = String(r?.target_subscription_id || '');
@@ -6403,7 +6463,7 @@ app.get('/api/follows/hub', async (req, res) => {
             created_at: r.created_at,
             pending_request_id: r.id,
           }));
-      }
+        }
       relationRows = [...pendingRows, ...acceptedRows];
     } else {
       const { data, error } = await supabase
@@ -6423,7 +6483,7 @@ app.get('/api/follows/hub', async (req, res) => {
           ? 'following_subscription_id'
           : tab === 'likes'
             ? 'user_id'
-            : 'requester_subscription_id';
+          : 'requester_subscription_id';
     const idsInOrder = relationRows.map(r => String(r[idField] || '').trim()).filter(Boolean);
     const uniqueIds = [...new Set(idsInOrder)];
     if (uniqueIds.length === 0) {
@@ -7571,10 +7631,9 @@ app.get('/api/listings', async (req, res) => {
     const subIds = [...new Set([...fromSubscriptionId, ...fromOwnerId])];
     if (subIds.length > 0) {
       try {
-        const { data: subs } = await supabase
-          .from('subscriptions')
-          .select(SUBSCRIPTION_SELECT)
-          .in('id', subIds);
+        const { data: subs } = await querySubscriptionsSelect(q =>
+          q.in('id', subIds),
+        );
         if (subs && subs.length) {
           subs.forEach(s => {
             // Display name by registration type (subscriptions has no agent_name column; broker agent is in "name")
@@ -7838,7 +7897,7 @@ app.get('/api/stories/feed', async (req, res) => {
           'id, subscription_id, media_url, media_hls_url, video_status, created_at, general_details',
         )
         .gte('created_at', storyCutoff)
-        .order('created_at', { ascending: false })
+      .order('created_at', { ascending: false })
         .limit(2000));
       if (storyErr && /general_details/i.test(String(storyErr.message || ''))) {
         ({ data: storyRows, error: storyErr } = await supabase
@@ -7847,12 +7906,12 @@ app.get('/api/stories/feed', async (req, res) => {
             'id, subscription_id, media_url, media_hls_url, video_status, created_at',
           )
           .gte('created_at', storyCutoff)
-          .order('created_at', { ascending: false })
+        .order('created_at', { ascending: false })
           .limit(2000));
       }
       if (!storyErr && storyRows) {
         for (const row of storyRows) {
-          const sid = row.subscription_id;
+      const sid = row.subscription_id;
           const url = row.media_url && String(row.media_url).trim();
           if (!sid || !url) continue;
           if (!storiesBySubId.has(sid)) storiesBySubId.set(sid, []);
@@ -7915,13 +7974,13 @@ app.get('/api/stories/feed', async (req, res) => {
             'story',
           );
           if (profileMedia || storyMedia) {
-            slides.push({
-              id: `${s.id}-profile-video`,
+        slides.push({
+          id: `${s.id}-profile-video`,
               ...(profileMedia || storyMedia),
-              media_type: 'video',
-              kind: 'profile',
-            });
-          }
+          media_type: 'video',
+          kind: 'profile',
+        });
+      }
         }
       }
 
@@ -8312,21 +8371,21 @@ app.get('/api/professionals/directory', async (req, res) => {
       const isBroker = subType === 'broker';
       const displayName = isBroker
         ? (row.broker_office_name && String(row.broker_office_name).trim()) ||
-          (row.name && String(row.name).trim()) ||
+        (row.name && String(row.name).trim()) ||
           (row.contact_person_name && String(row.contact_person_name).trim()) ||
           (row.business_name && String(row.business_name).trim()) ||
           'מתווך'
         : (row.name && String(row.name).trim()) ||
-          (row.business_name && String(row.business_name).trim()) ||
-          (row.contact_person_name && String(row.contact_person_name).trim()) ||
-          'בעל מקצוע';
+        (row.business_name && String(row.business_name).trim()) ||
+        (row.contact_person_name && String(row.contact_person_name).trim()) ||
+        'בעל מקצוע';
       // Pros: סוג = types, tags = התמחויות.
-      // Brokers: סוג = תיווך, tags = אזורי פעילות (same chip row as specialties).
+      // Brokers: סוג = תיווך, plus their own תחומי התמחות and אזורי פעילות as
+      // two separate chip rows — brokers who never filled the first show only
+      // the regions, exactly as before.
       const types = isBroker ? ['תיווך'] : parseJsonArray(row.types);
-      const specializations = isBroker
-        ? parseJsonArray(row.activity_regions)
-        : parseJsonArray(row.specializations);
       const activityRegions = parseJsonArray(row.activity_regions);
+      const specializations = parseJsonArray(row.specializations);
       const avatarUrl =
         asPublicImageUrl(row.profile_picture_url) ||
         asPublicImageUrl(row.company_logo_url);
@@ -8649,7 +8708,11 @@ const CHAT_LISTING_ID_UUID_RE =
 const PROFESSIONAL_UPDATES_SENDER_EMAIL = 'updates@pi-professional-alerts.internal';
 const PROFESSIONAL_UPDATES_SENDER_NAME = 'עדכונים על פוסטים רלוונטים';
 
-/** Mirrors pi-front PROFESSIONAL_FILTER_TYPES (utils/constant.js) — validates client-supplied types. */
+/**
+ * Validates client-supplied types. Superset of pi-front PROFESSIONAL_SIGNUP_TYPES:
+ * תיווך stays accepted for older clients, but no professional can register as
+ * תיווך anymore, so it simply matches nobody.
+ */
 const PROFESSIONAL_NOTIFY_TYPES = new Set([
   'תיווך',
   'עורך דין',
@@ -9266,9 +9329,9 @@ app.get('/api/chat/conversations', async (req, res) => {
       .eq('user_id', userEmail);
     if (myPartsRes.error && isMissingColumnError(myPartsRes.error)) {
       const fb = await supabase
-        .from('chat_participants')
-        .select('conversation_id')
-        .eq('user_id', userEmail);
+      .from('chat_participants')
+      .select('conversation_id')
+      .eq('user_id', userEmail);
       myParts = fb.data || [];
     } else {
       myParts = myPartsRes.data || [];
@@ -9904,15 +9967,15 @@ app.get('/api/chat/participant-display', async (req, res) => {
         .maybeSingle();
       if (byEmail.error && isMissingBlockOffersColumnError(byEmail.error)) {
         const fallback = await supabase
-          .from('subscriptions')
-          .select(
-            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
-          )
-          .ilike('email', userRef)
-          .maybeSingle();
+        .from('subscriptions')
+        .select(
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+        )
+        .ilike('email', userRef)
+        .maybeSingle();
         sub = fallback.data || null;
       } else {
-        sub = byEmail.data || null;
+      sub = byEmail.data || null;
       }
     } else if (CHAT_UUID_RE.test(userRef)) {
       const byId = await supabase
@@ -9924,15 +9987,15 @@ app.get('/api/chat/participant-display', async (req, res) => {
         .maybeSingle();
       if (byId.error && isMissingBlockOffersColumnError(byId.error)) {
         const fallback = await supabase
-          .from('subscriptions')
-          .select(
-            'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
-          )
-          .eq('id', userRef)
-          .maybeSingle();
+        .from('subscriptions')
+        .select(
+          'name, contact_person_name, subscription_type, business_name, broker_office_name, profile_picture_url, company_logo_url, phone, mobile_phone, office_phone',
+        )
+        .eq('id', userRef)
+        .maybeSingle();
         sub = fallback.data || null;
       } else {
-        sub = byId.data || null;
+      sub = byId.data || null;
       }
     }
     if (sub) {
@@ -10014,45 +10077,45 @@ app.get('/api/chat/messages', async (req, res) => {
         supabase.from('chat_participants').select('conversation_id').eq('user_id', otherRef),
       ]);
       const myConvIds = new Set((myParts || []).map((p) => p.conversation_id));
-      const sharedConvIds = (otherParts || [])
+    const sharedConvIds = (otherParts || [])
         .map((p) => p.conversation_id)
         .filter((id) => myConvIds.has(id));
-      if (sharedConvIds.length > 0) {
-        if (sharedConvIds.length === 1) {
-          sharedConvId = sharedConvIds[0];
+    if (sharedConvIds.length > 0) {
+      if (sharedConvIds.length === 1) {
+        sharedConvId = sharedConvIds[0];
+      } else {
+        const { data: latestRows } = await supabase
+          .from('chat_messages')
+          .select('conversation_id, created_at')
+          .in('conversation_id', sharedConvIds)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (latestRows && latestRows.length > 0) {
+          sharedConvId = latestRows[0].conversation_id;
         } else {
-          const { data: latestRows } = await supabase
-            .from('chat_messages')
-            .select('conversation_id, created_at')
-            .in('conversation_id', sharedConvIds)
-            .order('created_at', { ascending: false })
+          const { data: convRows } = await supabase
+            .from('chat_conversations')
+            .select('id, last_message_at')
+            .in('id', sharedConvIds)
+            .order('last_message_at', { ascending: false, nullsFirst: false })
             .limit(1);
-          if (latestRows && latestRows.length > 0) {
-            sharedConvId = latestRows[0].conversation_id;
-          } else {
-            const { data: convRows } = await supabase
-              .from('chat_conversations')
-              .select('id, last_message_at')
-              .in('id', sharedConvIds)
-              .order('last_message_at', { ascending: false, nullsFirst: false })
-              .limit(1);
             sharedConvId =
               convRows && convRows[0] ? convRows[0].id : sharedConvIds[0];
-          }
         }
       }
+    }
 
-      if (!sharedConvId && (otherParts || []).length > 0) {
-        const convId = (otherParts || [])[0].conversation_id;
+    if (!sharedConvId && (otherParts || []).length > 0) {
+      const convId = (otherParts || [])[0].conversation_id;
         const { data: parts } = await supabase
           .from('chat_participants')
           .select('user_id')
           .eq('conversation_id', convId);
-        if ((parts || []).length === 1) {
+      if ((parts || []).length === 1) {
           await supabase
             .from('chat_participants')
             .insert({ conversation_id: convId, user_id: myEmail });
-          sharedConvId = convId;
+        sharedConvId = convId;
         }
       }
     }
@@ -10084,25 +10147,25 @@ app.get('/api/chat/messages', async (req, res) => {
           .maybeSingle(),
       ]);
       list = messages;
-      if (!eoRes.error && eoRes.data) {
+    if (!eoRes.error && eoRes.data) {
         const kindRaw = String(eoRes.data.offer_kind || '')
           .trim()
           .toLowerCase();
-        exclusiveOfferOut = {
-          conversationId: sharedConvId,
-          status: eoRes.data.status,
-          brokerEmail: normEmail(eoRes.data.broker_email),
-          ownerEmail: normEmail(eoRes.data.owner_email),
-          monthsCommitted:
+      exclusiveOfferOut = {
+        conversationId: sharedConvId,
+        status: eoRes.data.status,
+        brokerEmail: normEmail(eoRes.data.broker_email),
+        ownerEmail: normEmail(eoRes.data.owner_email),
+        monthsCommitted:
             eoRes.data.months_committed != null
               ? Number(eoRes.data.months_committed)
               : null,
           listingId:
             eoRes.data.listing_id != null ? String(eoRes.data.listing_id) : null,
           offerKind: kindRaw === 'collab' ? 'collab' : 'exclusive',
-        };
-      } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
-        console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
+      };
+    } else if (eoRes.error && !isMissingExclusiveOfferTableError(eoRes.error)) {
+      console.warn('GET /api/chat/messages exclusive offer:', eoRes.error.message);
       }
     } catch (loadErr) {
       console.error('GET /api/chat/messages:', loadErr?.message || loadErr);
@@ -12055,6 +12118,25 @@ app.get('/api/search/users/recent', async (req, res) => {
       subs = subRows || [];
     }
     const subsById = Object.fromEntries(subs.map(s => [String(s.id), s]));
+    // BnB business hosts are regular `user` accounts that often have no profile
+    // photo — their only image lives on the ad, so fall back to it.
+    const bnbLogoBySubId = {};
+    const subsWithoutPhoto = subs
+      .filter((s) => !s.profile_picture_url && !s.company_logo_url)
+      .map((s) => String(s.id));
+    if (subsWithoutPhoto.length > 0) {
+      const { data: bnbRows } = await supabase
+        .from('ads')
+        .select('subscription_id, bnb_business_logo_url, created_at')
+        .in('subscription_id', subsWithoutPhoto)
+        .eq('category', 5)
+        .not('bnb_business_logo_url', 'is', null)
+        .order('created_at', { ascending: false });
+      for (const r of bnbRows || []) {
+        const key = String(r.subscription_id);
+        if (!bnbLogoBySubId[key]) bnbLogoBySubId[key] = r.bnb_business_logo_url;
+      }
+    }
     const recent = list
       .map(row => {
         const sub = subsById[String(row.target_subscription_id)];
@@ -12066,7 +12148,10 @@ app.get('/api/search/users/recent', async (req, res) => {
         else if (type === 'professional') name = sub.name || sub.business_name || sub.contact_person_name || null;
         else name = sub.name || sub.contact_person_name || sub.business_name || null;
         const pic = asPublicImageUrl(
-          sub.profile_picture_url || (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) || null,
+          sub.profile_picture_url ||
+            (isCompanyLikeSubscriptionType(type) ? sub.company_logo_url : null) ||
+            bnbLogoBySubId[String(sub.id)] ||
+            null,
         );
         return {
           id: row.id,
