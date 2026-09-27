@@ -146,6 +146,27 @@ COMMENT ON COLUMN public.subscriptions.marketer_seat_limit IS
 COMMENT ON COLUMN public.subscriptions.parent_subscription_id IS
   'Marketing agency manager this subscription belongs to (joined with an invite code).';
 
+-- migration-subscription-bnb-host-lock.sql
+ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS bnb_host_lock TEXT NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'public.subscriptions'::regclass
+      AND conname = 'subscriptions_bnb_host_lock_check'
+  ) THEN
+    ALTER TABLE public.subscriptions
+      ADD CONSTRAINT subscriptions_bnb_host_lock_check
+      CHECK (bnb_host_lock IS NULL OR bnb_host_lock IN ('private', 'business'));
+  END IF;
+END $$;
+
+COMMENT ON COLUMN subscriptions.bnb_host_lock IS
+  'Set only when a guest created this regular account from the BnB publish sheet (private or business). Null = both create options remain available.';
+
 CREATE INDEX IF NOT EXISTS subscriptions_parent_subscription_id_idx
   ON public.subscriptions (parent_subscription_id)
   WHERE parent_subscription_id IS NOT NULL;

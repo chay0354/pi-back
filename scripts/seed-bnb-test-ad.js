@@ -34,6 +34,7 @@ const ALL_HOSPITALITY = [
   'special',
   'rural',
   'desert',
+  'urban',
 ];
 
 const ALL_SERVICES = [

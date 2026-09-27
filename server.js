@@ -43,6 +43,15 @@ const B2B_SUBSCRIPTION_TYPES = new Set([
 ]);
 /** משווק פרויקטים plans — team plans may issue agency join codes. */
 const MARKETER_SEAT_LIMIT_BY_PLAN = {single: null, team5: 5, team10: 10};
+/**
+ * מנוי לחברות plans — cap how many listings a company may keep published.
+ * `null` = unlimited. Feed posts are never counted.
+ */
+const COMPANY_LISTING_LIMIT_BY_PLAN = {
+  projects5: 5,
+  projects10: 10,
+  multi: null,
+};
 const MIN_PASSWORD_LENGTH = 8;
 const DEFAULT_MONTHLY_LISTING_QUOTA = 65;
 // Every account starts with 3 months of usage; coupons extend by 3/6/12 months.
@@ -1280,6 +1289,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       activityRegions, // Array of selected regions (for broker)
       agreedToTerms,
       marketerPlan, // project_marketer: 'single' | 'team5' | 'team10'
+      companyPlan, // company: 'projects5' | 'projects10' | 'multi'
       profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
       company_logo_url, // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
       video_url, // Optional: pre-uploaded intro video URL (Android JSON submit)
@@ -1502,6 +1512,15 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       subscriptionData.marketer_plan = normalizedPlan;
       subscriptionData.marketer_seat_limit =
         MARKETER_SEAT_LIMIT_BY_PLAN[normalizedPlan];
+    }
+
+    if (subscriptionType === 'company') {
+      const plan = String(companyPlan || '').trim();
+      if (
+        Object.prototype.hasOwnProperty.call(COMPANY_LISTING_LIMIT_BY_PLAN, plan)
+      ) {
+        subscriptionData.company_plan = plan;
+      }
     }
 
     const { data: subscription, error: dbError } = await supabase
@@ -3335,6 +3354,7 @@ const SUBSCRIPTION_SELECT =
   'specializations, activity_regions, types, description, phone, ' +
   'block_exclusive_offers, block_collab_offers, block_relevant_post_updates, ' +
   'marketer_plan, marketer_seat_limit, parent_subscription_id, ' +
+  'company_plan, ' +
   'bnb_host_lock, ' +
   'created_at, updated_at';
 
@@ -8709,9 +8729,8 @@ const PROFESSIONAL_UPDATES_SENDER_EMAIL = 'updates@pi-professional-alerts.intern
 const PROFESSIONAL_UPDATES_SENDER_NAME = 'עדכונים על פוסטים רלוונטים';
 
 /**
- * Validates client-supplied types. Superset of pi-front PROFESSIONAL_SIGNUP_TYPES:
- * תיווך stays accepted for older clients, but no professional can register as
- * תיווך anymore, so it simply matches nobody.
+ * Validates client-supplied types. Same list as the post-target sheet
+ * (PROFESSIONAL_FILTER_TYPES): professional trades, plus תיווך for brokers.
  */
 const PROFESSIONAL_NOTIFY_TYPES = new Set([
   'תיווך',
@@ -8844,10 +8863,33 @@ async function insertProfessionalNotificationMessage({ conversationId, receiverE
 }
 
 /**
- * After a feed post is published, DM every matching `professional` subscription
- * (never brokers/companies) whose registered types overlap the selected ones,
- * excluding the poster themselves. Best-effort — publish never fails because of this.
+ * After a feed post is published, DM every matching professional whose registered
+ * types overlap the selected ones, and every broker when תיווך is selected.
+ * Excludes the poster. Best-effort — publish never fails because of this.
  */
+async function loadPostNotifySubscriptions(subscriptionType) {
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('id, email, types, subscription_type, block_relevant_post_updates')
+    .eq('subscription_type', subscriptionType);
+  if (error && isMissingBlockOffersColumnError(error)) {
+    const fb = await supabase
+      .from('subscriptions')
+      .select('id, email, types, subscription_type')
+      .eq('subscription_type', subscriptionType);
+    if (fb.error) {
+      console.error('[professional-notify] subscriptions lookup failed:', fb.error.message);
+      return [];
+    }
+    return fb.data || [];
+  }
+  if (error) {
+    console.error('[professional-notify] subscriptions lookup failed:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
 async function notifyProfessionalsAboutPost(ad, requestedTypesRaw) {
   const requestedTypes = (Array.isArray(requestedTypesRaw) ? requestedTypesRaw : [])
     .map(t => String(t || '').trim())
@@ -8855,30 +8897,17 @@ async function notifyProfessionalsAboutPost(ad, requestedTypesRaw) {
   if (requestedTypes.length === 0) return;
   const posterEmail = normEmail(ad?.creator_email);
 
-  const { data: candidates, error } = await supabase
-    .from('subscriptions')
-    .select('id, email, types, subscription_type, block_relevant_post_updates')
-    .eq('subscription_type', 'professional');
-  let professionalRows = candidates;
-  if (error && isMissingBlockOffersColumnError(error)) {
-    const fb = await supabase
-      .from('subscriptions')
-      .select('id, email, types, subscription_type')
-      .eq('subscription_type', 'professional');
-    if (fb.error) {
-      console.error('[professional-notify] subscriptions lookup failed:', fb.error.message);
-      return;
-    }
-    professionalRows = fb.data;
-  } else if (error) {
-    console.error('[professional-notify] subscriptions lookup failed:', error.message);
-    return;
-  }
+  const professionalRows = await loadPostNotifySubscriptions('professional');
+  const brokerRows = requestedTypes.includes('תיווך')
+    ? await loadPostNotifySubscriptions('broker')
+    : [];
 
-  const matches = (professionalRows || []).filter(row => {
+  const matches = [...professionalRows, ...brokerRows].filter(row => {
     const email = normEmail(row.email);
     if (!email || email === posterEmail) return false;
     if (row.block_relevant_post_updates === true) return false;
+    const subType = String(row.subscription_type || '').trim().toLowerCase();
+    if (subType === 'broker') return requestedTypes.includes('תיווך');
     const types = parseSubscriptionTypesList(row.types);
     return types.some(t => requestedTypes.includes(t));
   });
@@ -11718,9 +11747,52 @@ app.delete('/api/posts/:id/comments/:commentId/reaction', async (req, res) => {
   }
 });
 // Media URLs reference files in storage bucket: user-photo-video
+/**
+ * מנוי לחברות quota gate. Returns a Hebrew error string when the company has
+ * reached its plan's listing cap, otherwise null. Posts and every non-company
+ * subscription type (brokers, professionals, משווקי פרויקטים) are exempt.
+ */
+async function getCompanyListingQuotaError(adRecord) {
+  const subscriptionId = adRecord?.subscription_id;
+  if (!subscriptionId) return null;
+  if (adRecord.feed_post === true) return null;
+
+  const {data: sub, error: subErr} = await supabase
+    .from('subscriptions')
+    .select('subscription_type, company_plan')
+    .eq('id', subscriptionId)
+    .maybeSingle();
+  if (subErr || !sub) return null;
+  if (String(sub.subscription_type || '') !== 'company') return null;
+
+  const plan = String(sub.company_plan || '').trim();
+  if (!Object.prototype.hasOwnProperty.call(COMPANY_LISTING_LIMIT_BY_PLAN, plan)) {
+    return null;
+  }
+  const limit = COMPANY_LISTING_LIMIT_BY_PLAN[plan];
+  if (limit == null) return null;
+
+  const {count, error: countErr} = await supabase
+    .from('ads')
+    .select('id', {count: 'exact', head: true})
+    .eq('subscription_id', subscriptionId)
+    .not('feed_post', 'is', true);
+  if (countErr) return null;
+
+  if (Number(count || 0) >= limit) {
+    return `עברת את המכסה — המנוי שלך מאפשר עד ${limit} מודעות פעילות. ניתן למחוק מודעה קיימת או לשדרג את המנוי. פרסום פוסטים נשאר ללא הגבלה.`;
+  }
+  return null;
+}
+
 app.post('/api/listings', async (req, res) => {
   try {
     const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
+
+    const quotaError = await getCompanyListingQuotaError(adRecord);
+    if (quotaError) {
+      return res.status(409).json({success: false, error: quotaError});
+    }
 
     const { data: ad, error: insertError } = await supabase
       .from('ads')
