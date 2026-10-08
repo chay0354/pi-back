@@ -1281,15 +1281,113 @@ function normalizeDirectoryVideoCrop(value) {
   }
   if (!crop || typeof crop !== 'object' || Array.isArray(crop)) return null;
   const aspect = Number(crop.aspect);
-  const frameWidth = Number(crop.frameWidth);
-  const frameHeight = Number(crop.frameHeight);
-  const frameLeft = Number(crop.frameLeft);
-  const frameTop = Number(crop.frameTop);
+  let frameWidth = Number(crop.frameWidth);
+  let frameHeight = Number(crop.frameHeight);
+  let frameLeft = Number(crop.frameLeft);
+  let frameTop = Number(crop.frameTop);
   if (![aspect, frameWidth, frameHeight, frameLeft, frameTop].every(Number.isFinite)) {
     return null;
   }
   if (aspect <= 0 || frameWidth <= 0 || frameHeight <= 0) return null;
+
+  // Zoomed-out editor frames store width/height < 1 so the media floats inside
+  // the card. Old clients then show a tiny photo on re-edit / directory. Expand
+  // to cover-fill around the same focal point so the crop still fills the frame.
+  if (frameWidth < 1 || frameHeight < 1) {
+    const centerX = frameLeft + frameWidth / 2;
+    const centerY = frameTop + frameHeight / 2;
+    const scale = Math.max(1 / frameWidth, 1 / frameHeight);
+    frameWidth *= scale;
+    frameHeight *= scale;
+    frameLeft = centerX - frameWidth / 2;
+    frameTop = centerY - frameHeight / 2;
+  }
+
   return {aspect, frameWidth, frameHeight, frameLeft, frameTop};
+}
+
+/** Crop-editor letterbox fill used by CircleImageCropModal (composeFramedImage). */
+const PROFILE_CROP_EDITOR_BG = {r: 0x1e, g: 0x1d, b: 0x27};
+
+/**
+ * Auto-orient and strip crop-editor letterboxing so a re-opened profile photo
+ * still fills the circle / horizontal frame (no tiny floating image).
+ * Falls back to the original bytes if sharp is unavailable or trim is unsafe.
+ */
+async function prepareProfileImageUpload(file) {
+  const originalBuffer = file?.buffer;
+  const originalType = file?.mimetype || 'image/jpeg';
+  if (!originalBuffer || !Buffer.isBuffer(originalBuffer) || originalBuffer.length < 32) {
+    return {
+      buffer: originalBuffer,
+      contentType: originalType,
+      ext: null,
+    };
+  }
+
+  let sharp;
+  try {
+    sharp = require('sharp');
+  } catch (err) {
+    console.warn('[prepareProfileImageUpload] sharp unavailable:', err?.message);
+    return {buffer: originalBuffer, contentType: originalType, ext: null};
+  }
+
+  try {
+    const oriented = sharp(originalBuffer, {failOn: 'none'}).rotate();
+    const origMeta = await oriented.metadata();
+    const origW = Math.max(1, origMeta.width || 1);
+    const origH = Math.max(1, origMeta.height || 1);
+
+    let outputBuffer = null;
+    let outW = origW;
+    let outH = origH;
+    try {
+      const trimmed = await sharp(originalBuffer, {failOn: 'none'})
+        .rotate()
+        .trim({
+          background: PROFILE_CROP_EDITOR_BG,
+          threshold: 28,
+        })
+        .jpeg({quality: 90, mozjpeg: true})
+        .toBuffer({resolveWithObject: true});
+      const removedRatio = Math.max(
+        (origW - trimmed.info.width) / origW,
+        (origH - trimmed.info.height) / origH,
+      );
+      // Accept only a real letterbox strip — ignore tiny noise and near-empty trims.
+      if (
+        removedRatio >= 0.03 &&
+        removedRatio <= 0.75 &&
+        trimmed.info.width >= 32 &&
+        trimmed.info.height >= 32
+      ) {
+        outputBuffer = trimmed.data;
+        outW = trimmed.info.width;
+        outH = trimmed.info.height;
+      }
+    } catch (_) {
+      // trim can throw when no matching border exists — fall through.
+    }
+
+    if (!outputBuffer) {
+      outputBuffer = await sharp(originalBuffer, {failOn: 'none'})
+        .rotate()
+        .jpeg({quality: 90, mozjpeg: true})
+        .toBuffer();
+    }
+
+    return {
+      buffer: outputBuffer,
+      contentType: 'image/jpeg',
+      ext: 'jpg',
+      width: outW,
+      height: outH,
+    };
+  } catch (err) {
+    console.warn('[prepareProfileImageUpload] failed, using raw upload:', err?.message);
+    return {buffer: originalBuffer, contentType: originalType, ext: null};
+  }
 }
 
 // Submit subscription form (all types: broker, company, professional)
@@ -1384,13 +1482,12 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       // Upload profile picture only if not already provided (e.g. uploaded when moving stage 1 → 2)
       if (!fileUrls.profilePicture && req.files.profilePicture && req.files.profilePicture[0]) {
         const profileFile = req.files.profilePicture[0];
-        const safeName = (profileFile.originalname || 'photo').replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^_+|_+$/g, '') || 'photo';
-        const ext = safeName.includes('.') ? safeName.slice(safeName.lastIndexOf('.')) : '.jpg';
-        const fileName = `profile-${Date.now()}${ext}`;
+        const prepared = await prepareProfileImageUpload(profileFile);
+        const fileName = `profile-${Date.now()}.${prepared.ext || 'jpg'}`;
         const { data, error } = await supabase.storage
           .from('profile-pics')
-          .upload(fileName, profileFile.buffer, {
-            contentType: profileFile.mimetype,
+          .upload(fileName, prepared.buffer, {
+            contentType: prepared.contentType || 'image/jpeg',
             upsert: false
           });
         if (!error && data) {
@@ -12728,12 +12825,19 @@ app.post('/api/upload-profile-pic', upload.single('profilePicture'), async (req,
     if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
       return res.status(503).json({ success: false, error: 'Server upload not configured.' });
     }
+    const prepared = await prepareProfileImageUpload(req.file);
     // Supabase storage keys must be ASCII-safe (no Hebrew/special chars)
-    const ext = (req.file.originalname || '').includes('.') ? (req.file.originalname.match(/\.([a-zA-Z0-9]+)$/)?.[1] || 'jpg') : 'jpg';
-    const fileName = `profile-${Date.now()}.${ext.replace(/[^a-zA-Z0-9]/g, '') || 'jpg'}`;
+    const rawExt = prepared.ext
+      || ((req.file.originalname || '').includes('.')
+        ? (req.file.originalname.match(/\.([a-zA-Z0-9]+)$/)?.[1] || 'jpg')
+        : 'jpg');
+    const fileName = `profile-${Date.now()}.${String(rawExt).replace(/[^a-zA-Z0-9]/g, '') || 'jpg'}`;
     const { data, error } = await supabase.storage
       .from('profile-pics')
-      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype || 'image/jpeg', upsert: false });
+      .upload(fileName, prepared.buffer, {
+        contentType: prepared.contentType || 'image/jpeg',
+        upsert: false,
+      });
     if (error) {
       console.error('Profile pic upload error:', error);
       return res.status(500).json({ success: false, error: 'Failed to upload profile picture.' });
