@@ -41,8 +41,13 @@ const B2B_SUBSCRIPTION_TYPES = new Set([
   'professional',
   'project_marketer',
 ]);
-/** משווק פרויקטים plans — team plans may issue agency join codes. */
+/**
+ * משווק פרויקטים plans chosen by a marketing manager.
+ * Seats are marketers who can join under the manager (`null` = the manager alone).
+ * Listing caps count published projects for the whole office (`null` = unlimited).
+ */
 const MARKETER_SEAT_LIMIT_BY_PLAN = {single: null, team5: 5, team10: 10};
+const MARKETER_LISTING_LIMIT_BY_PLAN = {single: 5, team5: 10, team10: null};
 /**
  * מנוי לחברות plans — cap how many listings a company may keep published.
  * `null` = unlimited. Feed posts are never counted.
@@ -1264,6 +1269,29 @@ function subscriptionSubmitParser(req, res, next) {
   return next();
 }
 
+function normalizeDirectoryVideoCrop(value) {
+  if (value == null || value === '') return null;
+  let crop = value;
+  if (typeof crop === 'string') {
+    try {
+      crop = JSON.parse(crop);
+    } catch {
+      return null;
+    }
+  }
+  if (!crop || typeof crop !== 'object' || Array.isArray(crop)) return null;
+  const aspect = Number(crop.aspect);
+  const frameWidth = Number(crop.frameWidth);
+  const frameHeight = Number(crop.frameHeight);
+  const frameLeft = Number(crop.frameLeft);
+  const frameTop = Number(crop.frameTop);
+  if (![aspect, frameWidth, frameHeight, frameLeft, frameTop].every(Number.isFinite)) {
+    return null;
+  }
+  if (aspect <= 0 || frameWidth <= 0 || frameHeight <= 0) return null;
+  return {aspect, frameWidth, frameHeight, frameLeft, frameTop};
+}
+
 // Submit subscription form (all types: broker, company, professional)
 app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) => {
   try {
@@ -1291,6 +1319,8 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       marketerPlan, // project_marketer: 'single' | 'team5' | 'team10'
       companyPlan, // company: 'projects5' | 'projects10' | 'multi'
       profile_picture_url, // Optional: URL from stage-1 upload (profile-pics bucket)
+      directory_cover_url, // Optional: horizontal crop shown on the professionals directory card
+      directory_video_crop, // Optional: horizontal framing for a profile video in the directory card
       company_logo_url, // Optional: pre-uploaded logo URL (saved as-is to company_logo_url column for all 3 subscription types)
       video_url, // Optional: pre-uploaded intro video URL (Android JSON submit)
       deferVerificationEmail, // When true, email is sent only from POST /api/subscription/resend-code
@@ -1490,6 +1520,11 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       specializations: specializations ? (Array.isArray(specializations) ? JSON.stringify(specializations) : specializations) : null, // תחומי התמחות — professional + broker
       activity_regions: activityRegions ? (Array.isArray(activityRegions) ? JSON.stringify(activityRegions) : activityRegions) : null, // For broker
       profile_picture_url: fileUrls.profilePicture || null,
+      directory_cover_url:
+        directory_cover_url && String(directory_cover_url).trim()
+          ? String(directory_cover_url).trim()
+          : null,
+      directory_video_crop: normalizeDirectoryVideoCrop(directory_video_crop),
       additional_images_urls: fileUrls.additionalImages ? JSON.stringify(fileUrls.additionalImages) : null,
       company_logo_url: fileUrls.companyLogo || null,
       video_url: fileUrls.video || null,
@@ -3350,7 +3385,7 @@ const SUBSCRIPTION_SELECT =
   'id, email, name, subscription_type, status, subscriber_number, ' +
   'business_name, contact_person_name, company_id, office_phone, mobile_phone, company_website, ' +
   'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
-  'profile_picture_url, company_logo_url, video_url, additional_images_urls, ' +
+  'profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, additional_images_urls, ' +
   'specializations, activity_regions, types, description, phone, ' +
   'block_exclusive_offers, block_collab_offers, block_relevant_post_updates, ' +
   'marketer_plan, marketer_seat_limit, parent_subscription_id, ' +
@@ -4121,6 +4156,8 @@ const EDITABLE_SUBSCRIPTION_FIELDS = [
   'specializations',
   'description',
   'profile_picture_url',
+  'directory_cover_url',
+  'directory_video_crop',
   'company_logo_url',
 ];
 
@@ -4178,6 +4215,10 @@ app.patch('/api/subscription/:id', async (req, res) => {
         } else {
           updates[key] = null;
         }
+        continue;
+      }
+      if (key === 'directory_video_crop') {
+        updates[key] = normalizeDirectoryVideoCrop(value);
         continue;
       }
       if (typeof value === 'string') {
@@ -4813,7 +4854,12 @@ app.post('/api/chat/groups', async (req, res) => {
           : 'קבוצה';
     const title = titleIn || defaultTitle;
 
-    const insertRow = { type: 'group', title, group_kind: kind };
+    const insertRow = {
+      type: 'group',
+      title,
+      group_kind: kind,
+      last_message_at: new Date().toISOString(),
+    };
     if (groupImageUrl) insertRow.group_image_url = groupImageUrl;
 
     let { data: newConv, error: convErr } = await supabase
@@ -8309,7 +8355,7 @@ app.get('/api/professionals/directory', async (req, res) => {
     const { data: rows, error } = await supabase
       .from('subscriptions')
       .select(
-        'id, email, name, contact_person_name, business_name, broker_office_name, business_address, description, profile_picture_url, company_logo_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, activity_regions, types, subscription_type, status, updated_at',
+        'id, email, name, contact_person_name, business_name, broker_office_name, business_address, description, profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, activity_regions, types, subscription_type, status, updated_at',
       )
       .in('subscription_type', ['professional', 'broker'])
       .in('status', ['verified', 'active'])
@@ -8415,6 +8461,8 @@ app.get('/api/professionals/directory', async (req, res) => {
         subscription_type: isBroker ? 'broker' : 'professional',
         display_name: displayName,
         profile_image_url: avatarUrl,
+        directory_cover_url: asPublicImageUrl(row.directory_cover_url),
+        directory_video_crop: normalizeDirectoryVideoCrop(row.directory_video_crop),
         video_url: asPublicImageUrl(row.video_url),
         video_hls_url: row.video_hls_url || null,
         video_playback_url: muxVideo.resolveSubscriptionPlaybackUrl(row),
@@ -10431,8 +10479,8 @@ app.post('/api/chat/messages', async (req, res) => {
           });
         }
 
-        // Company → broker collab is not allowed.
-        if (offerKind === 'collab') {
+        // Companies are outside exclusivity and collab offers.
+        if (offerKind === 'collab' || offerKind === 'exclusive') {
           const senderType = String(
             senderRows.find(s => normEmail(s?.email) === senderEmail)
               ?.subscription_type ||
@@ -10465,7 +10513,17 @@ app.post('/api/chat/messages', async (req, res) => {
           )
             .trim()
             .toLowerCase();
-          if (isCompanyLikeSubscriptionType(senderType) && receiverType === 'broker') {
+          if (senderType === 'company' || receiverType === 'company') {
+            return res.status(403).json({
+              success: false,
+              error: 'הצעות שת״פ ובלעדיות לא זמינות לחשבון חברה',
+            });
+          }
+          if (
+            offerKind === 'collab' &&
+            isCompanyLikeSubscriptionType(senderType) &&
+            receiverType === 'broker'
+          ) {
             return res.status(403).json({
               success: false,
               error: 'חברה לא יכולה לשלוח הצעת שת״פ למתווך',
@@ -11785,6 +11843,62 @@ async function getCompanyListingQuotaError(adRecord) {
   return null;
 }
 
+/**
+ * Marketing-manager plans cap published projects for the whole office.
+ * A marketer who joined with a code is counted against the manager's plan.
+ * Feed posts are not counted. `team10` is unlimited.
+ */
+async function getMarketerListingQuotaError(adRecord) {
+  const subscriptionId = adRecord?.subscription_id;
+  if (!subscriptionId) return null;
+  if (adRecord.feed_post === true) return null;
+
+  const {data: sub, error: subErr} = await supabase
+    .from('subscriptions')
+    .select('id, subscription_type, marketer_plan, parent_subscription_id')
+    .eq('id', subscriptionId)
+    .maybeSingle();
+  if (subErr || !sub) return null;
+  if (String(sub.subscription_type || '') !== 'project_marketer') return null;
+
+  let officeId = sub.id;
+  let plan = String(sub.marketer_plan || '').trim();
+  if (sub.parent_subscription_id) {
+    officeId = sub.parent_subscription_id;
+    const {data: parent, error: parentErr} = await supabase
+      .from('subscriptions')
+      .select('marketer_plan')
+      .eq('id', officeId)
+      .maybeSingle();
+    if (parentErr || !parent) return null;
+    plan = String(parent.marketer_plan || '').trim();
+  }
+  if (!Object.prototype.hasOwnProperty.call(MARKETER_LISTING_LIMIT_BY_PLAN, plan)) {
+    return null;
+  }
+  const limit = MARKETER_LISTING_LIMIT_BY_PLAN[plan];
+  if (limit == null) return null;
+
+  const {data: members, error: membersErr} = await supabase
+    .from('subscriptions')
+    .select('id')
+    .eq('parent_subscription_id', officeId);
+  if (membersErr) return null;
+  const ids = [officeId, ...(members || []).map(row => row.id)];
+
+  const {count, error: countErr} = await supabase
+    .from('ads')
+    .select('id', {count: 'exact', head: true})
+    .in('subscription_id', ids)
+    .not('feed_post', 'is', true);
+  if (countErr) return null;
+
+  if (Number(count || 0) >= limit) {
+    return `עברת את המכסה — המנוי שלך מאפשר עד ${limit} פרויקטים פעילים. ניתן למחוק פרויקט קיים או לשדרג את המנוי. פרסום פוסטים נשאר ללא הגבלה.`;
+  }
+  return null;
+}
+
 app.post('/api/listings', async (req, res) => {
   try {
     const adRecord = await buildAdRecordFromListingBody(req.body, supabase);
@@ -11792,6 +11906,10 @@ app.post('/api/listings', async (req, res) => {
     const quotaError = await getCompanyListingQuotaError(adRecord);
     if (quotaError) {
       return res.status(409).json({success: false, error: quotaError});
+    }
+    const marketerQuotaError = await getMarketerListingQuotaError(adRecord);
+    if (marketerQuotaError) {
+      return res.status(409).json({success: false, error: marketerQuotaError});
     }
 
     const { data: ad, error: insertError } = await supabase
