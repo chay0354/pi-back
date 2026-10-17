@@ -6,6 +6,7 @@ const multer = require('multer');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
 const muxVideo = require('./muxVideo');
+const chatPush = require('./chatPush');
 const {
   buildPiAiListingSummary,
   sanitizePiAiPoolItem,
@@ -1408,6 +1409,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       contactPersonName,
       officePhone,
       mobilePhone,
+      virtualPhone,
       companyWebsite,
       description,
       types, // Array of selected types (for professional)
@@ -1611,6 +1613,8 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       contact_person_name: contactPersonName,
       office_phone: officePhone,
       mobile_phone: mobilePhone,
+      virtual_phone:
+        virtualPhone && String(virtualPhone).trim() ? String(virtualPhone).trim() : null,
       company_website: companyWebsite,
       description,
       types: types ? (Array.isArray(types) ? JSON.stringify(types) : types) : null, // For professional
@@ -3480,7 +3484,7 @@ app.post('/api/auth/apple', async (req, res) => {
 // Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
 const SUBSCRIPTION_SELECT =
   'id, email, name, subscription_type, status, subscriber_number, ' +
-  'business_name, contact_person_name, company_id, office_phone, mobile_phone, company_website, ' +
+  'business_name, contact_person_name, company_id, office_phone, mobile_phone, virtual_phone, company_website, ' +
   'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
   'profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, additional_images_urls, ' +
   'specializations, activity_regions, types, description, phone, ' +
@@ -4243,6 +4247,7 @@ const EDITABLE_SUBSCRIPTION_FIELDS = [
   'phone',
   'mobile_phone',
   'office_phone',
+  'virtual_phone',
   'company_website',
   'business_address',
   'company_id',
@@ -5756,6 +5761,15 @@ app.post('/api/chat/group-messages', async (req, res) => {
         .single();
       if (fallback.error) return res.status(500).json({ success: false, error: fallback.error.message });
       await supabase.from('chat_conversations').update({ last_message_at: fallback.data.created_at }).eq('id', convId);
+      await chatPush.notifyChatMessage(supabase, {
+        conversationId: convId,
+        senderEmail,
+        recipientEmails: members,
+        body: bodyRaw,
+        mediaType: mediaUrl ? mediaType : null,
+        listingShare: listingShareToStore,
+        isGroup: true,
+      });
       const fd = fallback.data;
       return res.json({
         success: true,
@@ -5773,6 +5787,15 @@ app.post('/api/chat/group-messages', async (req, res) => {
       });
     }
     await supabase.from('chat_conversations').update({ last_message_at: msg.created_at }).eq('id', convId);
+    await chatPush.notifyChatMessage(supabase, {
+      conversationId: convId,
+      senderEmail,
+      recipientEmails: members,
+      body: bodyRaw,
+      mediaType: mediaUrl ? mediaType : null,
+      listingShare: listingShareToStore,
+      isGroup: true,
+    });
     res.json({
       success: true,
       message: {
@@ -8452,7 +8475,7 @@ app.get('/api/professionals/directory', async (req, res) => {
     const { data: rows, error } = await supabase
       .from('subscriptions')
       .select(
-        'id, email, name, contact_person_name, business_name, broker_office_name, business_address, description, profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, activity_regions, types, subscription_type, status, updated_at',
+        'id, email, name, contact_person_name, business_name, broker_office_name, business_address, virtual_phone, description, profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, video_hls_url, video_status, mux_playback_id, specializations, activity_regions, types, subscription_type, status, updated_at',
       )
       .in('subscription_type', ['professional', 'broker'])
       .in('status', ['verified', 'active'])
@@ -8566,6 +8589,7 @@ app.get('/api/professionals/directory', async (req, res) => {
         video_status: row.video_status || null,
         address: row.business_address && String(row.business_address).trim() ? String(row.business_address).trim() : null,
         bio: row.description && String(row.description).trim() ? String(row.description).trim() : null,
+        virtual_phone: row.virtual_phone && String(row.virtual_phone).trim() ? String(row.virtual_phone).trim() : null,
         specializations,
         activity_regions: activityRegions,
         types,
@@ -8579,6 +8603,35 @@ app.get('/api/professionals/directory', async (req, res) => {
   } catch (err) {
     console.error('GET /api/professionals/directory:', err);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==================== PUSH NOTIFICATIONS ====================
+// POST /api/push/register — body: { token, email, subscription_id?, platform? }
+app.post('/api/push/register', async (req, res) => {
+  try {
+    await chatPush.registerPushToken(supabase, {
+      token: req.body?.token,
+      email: req.body?.email,
+      subscriptionId:
+        req.body?.subscription_id && LISTING_AD_UUID_RE.test(String(req.body.subscription_id).trim())
+          ? String(req.body.subscription_id).trim()
+          : null,
+      platform: req.body?.platform,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/push/unregister — body: { token } (logout / permission revoked)
+app.post('/api/push/unregister', async (req, res) => {
+  try {
+    await chatPush.unregisterPushToken(supabase, req.body?.token);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
   }
 });
 
@@ -10883,6 +10936,15 @@ app.post('/api/chat/messages', async (req, res) => {
         brokerEmail: senderEmail,
         ownerEmail: receiverEmail,
       });
+      await chatPush.notifyChatMessage(supabase, {
+        conversationId: convId,
+        senderEmail,
+        recipientEmails: [receiverEmail],
+        body,
+        mediaType: fallbackPayload.media_type || null,
+        listingShare: listingShareToStore,
+        isGroup: false,
+      });
       return res.json({
         success: true,
         conversation_id: convId,
@@ -10896,6 +10958,15 @@ app.post('/api/chat/messages', async (req, res) => {
       listingId: listingToStore,
       brokerEmail: senderEmail,
       ownerEmail: receiverEmail,
+    });
+    await chatPush.notifyChatMessage(supabase, {
+      conversationId: convId,
+      senderEmail,
+      recipientEmails: [receiverEmail],
+      body,
+      mediaType: winningPayload?.media_type || null,
+      listingShare: listingShareToStore,
+      isGroup: false,
     });
     res.json({
       success: true,
