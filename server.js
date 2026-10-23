@@ -1696,11 +1696,20 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       }
     }
 
-    const { data: subscription, error: dbError } = await supabase
+    let insertRow = subscriptionData;
+    let { data: subscription, error: dbError } = await supabase
       .from('subscriptions')
-      .insert([subscriptionData])
+      .insert([insertRow])
       .select()
       .single();
+    if (dbError && isMissingHidePrivatePhoneColumnError(dbError)) {
+      insertRow = omitHidePrivatePhone(insertRow);
+      ({ data: subscription, error: dbError } = await supabase
+        .from('subscriptions')
+        .insert([insertRow])
+        .select()
+        .single());
+    }
 
     if (dbError) {
       console.error('Database error:', dbError);
@@ -3182,6 +3191,22 @@ function isMissingBnbHostLockColumnError(err) {
   return /bnb_host_lock/i.test(msg) && /does not exist|42703|schema cache|PGRST204/i.test(msg);
 }
 
+function isMissingHidePrivatePhoneColumnError(err) {
+  const msg = String((err && err.message) || err || '');
+  return /hide_private_phone/i.test(msg) && /does not exist|42703|schema cache|PGRST204/i.test(msg);
+}
+
+function withoutHidePrivatePhoneColumn(selectSql) {
+  return String(selectSql).replace(/hide_private_phone,\s*/g, '');
+}
+
+function omitHidePrivatePhone(row) {
+  if (!row || typeof row !== 'object') return row;
+  const next = {...row};
+  delete next.hide_private_phone;
+  return next;
+}
+
 /**
  * Shared create/sign-in path for Google / Apple regular users.
  * providerExtras may include apple_user_id.
@@ -3538,15 +3563,15 @@ function subscriptionSelectWithoutBnbHostLock() {
 }
 
 async function querySubscriptionsSelect(applyFilters) {
-  let result = await applyFilters(
-    supabase.from('subscriptions').select(SUBSCRIPTION_SELECT),
-  );
+  let select = SUBSCRIPTION_SELECT;
+  let result = await applyFilters(supabase.from('subscriptions').select(select));
   if (result.error && isMissingBnbHostLockColumnError(result.error)) {
-    result = await applyFilters(
-      supabase
-        .from('subscriptions')
-        .select(subscriptionSelectWithoutBnbHostLock()),
-    );
+    select = subscriptionSelectWithoutBnbHostLock();
+    result = await applyFilters(supabase.from('subscriptions').select(select));
+  }
+  if (result.error && isMissingHidePrivatePhoneColumnError(result.error)) {
+    select = withoutHidePrivatePhoneColumn(select);
+    result = await applyFilters(supabase.from('subscriptions').select(select));
   }
   return result;
 }
@@ -4401,18 +4426,31 @@ app.patch('/api/subscription/:id', async (req, res) => {
     }
     updates.updated_at = new Date().toISOString();
 
+    let updateRow = updates;
+    let select = SUBSCRIPTION_SELECT;
     let { data: updated, error: updateError } = await supabase
       .from('subscriptions')
-      .update(updates)
+      .update(updateRow)
       .eq('id', String(id).trim())
-      .select(SUBSCRIPTION_SELECT)
+      .select(select)
       .single();
     if (updateError && isMissingBnbHostLockColumnError(updateError)) {
+      select = subscriptionSelectWithoutBnbHostLock();
       ({ data: updated, error: updateError } = await supabase
         .from('subscriptions')
-        .update(updates)
+        .update(updateRow)
         .eq('id', String(id).trim())
-        .select(subscriptionSelectWithoutBnbHostLock())
+        .select(select)
+        .single());
+    }
+    if (updateError && isMissingHidePrivatePhoneColumnError(updateError)) {
+      updateRow = omitHidePrivatePhone(updateRow);
+      select = withoutHidePrivatePhoneColumn(select);
+      ({ data: updated, error: updateError } = await supabase
+        .from('subscriptions')
+        .update(updateRow)
+        .eq('id', String(id).trim())
+        .select(select)
         .single());
     }
 
