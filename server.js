@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 const { Resend } = require('resend');
 const muxVideo = require('./muxVideo');
 const chatPush = require('./chatPush');
+const twilioVirtualNumbers = require('./twilioVirtualNumbers');
 const {
   buildPiAiListingSummary,
   sanitizePiAiPoolItem,
@@ -445,6 +446,39 @@ if (!supabaseKey || supabaseKey.includes('YOUR_SERVICE_ROLE_KEY_HERE')) {
 
 const supabase = createClient(supabaseUrl, supabaseKey, { global: { fetch: customFetch } });
 const { buildAdRecordFromListingBody } = require('./listingAdRecord');
+
+app.use(twilioVirtualNumbers.WEBHOOK_PREFIX, twilioVirtualNumbers.createVoiceWebhookRouter({ supabase }));
+
+/**
+ * The virtual number always forwards to the office number (brokers have none, so their
+ * direct phone). No-op until Twilio is configured; the placeholder number stays as-is.
+ */
+async function syncVirtualNumberForwarding(subscription) {
+  if (!subscription?.id || !twilioVirtualNumbers.isEnabled()) return;
+  const type = String(subscription.subscription_type || '').toLowerCase();
+  if (!isB2BSubscriptionType(type)) return;
+  const target =
+    (subscription.office_phone && String(subscription.office_phone).trim()) ||
+    (type === 'broker' && subscription.phone && String(subscription.phone).trim()) ||
+    '';
+  if (!target) return;
+  try {
+    const assignment = await twilioVirtualNumbers.assignVirtualNumber(supabase, {
+      subscriptionId: subscription.id,
+      targetPhone: target,
+      phoneKind: 'office',
+    });
+    if (assignment?.phone_e164 && assignment.phone_e164 !== subscription.virtual_phone) {
+      await supabase
+        .from('subscriptions')
+        .update({ virtual_phone: assignment.phone_e164 })
+        .eq('id', subscription.id);
+      subscription.virtual_phone = assignment.phone_e164;
+    }
+  } catch (err) {
+    console.error('[twilio] virtual number sync failed', subscription.id, err.message);
+  }
+}
 
 /** Direct Postgres for broker search when REST/RLS returns no rows (set DATABASE_URL from Supabase → Settings → Database). */
 let brokerSearchPgPool = null;
@@ -1410,6 +1444,7 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       officePhone,
       mobilePhone,
       virtualPhone,
+      hidePrivatePhone, // hide מספר פרטי ישיר on the profile / ads
       companyWebsite,
       description,
       types, // Array of selected types (for professional)
@@ -1443,11 +1478,11 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
         });
       }
     } else {
-      // For professional: email, phone, and name (or businessName) are required
-      if (!email || !phone || (!name && !businessName)) {
+      // For professional: email, office phone, and name (or businessName) are required
+      if (!email || !officePhone || (!name && !businessName)) {
         return res.status(400).json({ 
           success: false, 
-          error: 'Missing required fields. Please provide email, phone, and name/business name.' 
+          error: 'Missing required fields. Please provide email, office phone, and name/business name.' 
         });
       }
     }
@@ -1615,6 +1650,8 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
       mobile_phone: mobilePhone,
       virtual_phone:
         virtualPhone && String(virtualPhone).trim() ? String(virtualPhone).trim() : null,
+      hide_private_phone:
+        hidePrivatePhone === true || hidePrivatePhone === 'true' || hidePrivatePhone === '1',
       company_website: companyWebsite,
       description,
       types: types ? (Array.isArray(types) ? JSON.stringify(types) : types) : null, // For professional
@@ -1676,6 +1713,8 @@ app.post('/api/subscription/submit', subscriptionSubmitParser, async (req, res) 
         details: dbError.message 
       });
     }
+
+    await syncVirtualNumberForwarding(subscription);
 
     const submitPassword = req.body?.password != null ? String(req.body.password) : '';
     if (isB2BSubscriptionType(subscriptionType) && submitPassword.length >= MIN_PASSWORD_LENGTH) {
@@ -3484,7 +3523,7 @@ app.post('/api/auth/apple', async (req, res) => {
 // Get subscription by ID – same fields as listings builder so description and all subscription fields are returned
 const SUBSCRIPTION_SELECT =
   'id, email, name, subscription_type, status, subscriber_number, ' +
-  'business_name, contact_person_name, company_id, office_phone, mobile_phone, virtual_phone, company_website, ' +
+  'business_name, contact_person_name, company_id, office_phone, mobile_phone, virtual_phone, hide_private_phone, company_website, ' +
   'brokerage_license_number, broker_office_name, dealer_number, business_address, ' +
   'profile_picture_url, directory_cover_url, directory_video_crop, company_logo_url, video_url, additional_images_urls, ' +
   'specializations, activity_regions, types, description, phone, ' +
@@ -4247,7 +4286,6 @@ const EDITABLE_SUBSCRIPTION_FIELDS = [
   'phone',
   'mobile_phone',
   'office_phone',
-  'virtual_phone',
   'company_website',
   'business_address',
   'company_id',
@@ -4330,7 +4368,7 @@ app.patch('/api/subscription/:id', async (req, res) => {
       updates[key] = value;
     }
 
-    for (const key of CHAT_OFFER_PREFERENCE_FIELDS) {
+    for (const key of [...CHAT_OFFER_PREFERENCE_FIELDS, 'hide_private_phone']) {
       if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
       const raw = body[key];
       updates[key] =
@@ -4384,6 +4422,10 @@ app.patch('/api/subscription/:id', async (req, res) => {
         success: false,
         error: updateError?.message || 'Failed to update profile',
       });
+    }
+
+    if ('office_phone' in updates || 'phone' in updates) {
+      await syncVirtualNumberForwarding(updated);
     }
 
     if (wantsVideoUpdate && existingForVideo) {

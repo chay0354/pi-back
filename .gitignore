@@ -6,3 +6,6 @@ dist/
 build/
 client_secret*.json
 **/client_secret*.json
+
+.vercel
+.env*.local
