@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const { Pool } = require('pg');
 const { Resend } = require('resend');
+const { registerPropertyAlertRoutes, notifyNewPropertyEmail } = require('./propertyAlerts');
 const muxVideo = require('./muxVideo');
 const chatPush = require('./chatPush');
 const twilioVirtualNumbers = require('./twilioVirtualNumbers');
@@ -12218,6 +12219,14 @@ app.post('/api/listings', async (req, res) => {
       }
     }
 
+    if (!adIsFeedPost && ad.status === 'published' && ad.is_frozen !== true) {
+      try {
+        await notifyNewPropertyEmail(supabase, resend, ad);
+      } catch (alertErr) {
+        console.error('[property-alerts] create hook failed:', alertErr.message);
+      }
+    }
+
     res.status(201).json({
       success: true,
       id: ad.id,
@@ -12249,7 +12258,7 @@ app.put('/api/listings/:id', async (req, res) => {
     const { data: existingAd } = await supabase
       .from('ads')
       .select(
-        'video_url, main_image_url, sales_image_url, subscription_id, feed_post, general_details',
+        'video_url, main_image_url, sales_image_url, subscription_id, feed_post, general_details, status',
       )
       .eq('id', id)
       .maybeSingle();
@@ -12339,6 +12348,22 @@ app.put('/api/listings/:id', async (req, res) => {
         existingAd,
         ad,
       );
+    }
+
+    const updatedIsFeedPost =
+      ad.feed_post === true || ad.feed_post === 'true' || ad.feed_post === 't';
+    if (
+      existingAd &&
+      existingAd.status !== 'published' &&
+      ad.status === 'published' &&
+      !updatedIsFeedPost &&
+      ad.is_frozen !== true
+    ) {
+      try {
+        await notifyNewPropertyEmail(supabase, resend, ad);
+      } catch (alertErr) {
+        console.error('[property-alerts] update hook failed:', alertErr.message);
+      }
     }
 
     res.status(200).json({
@@ -13203,6 +13228,7 @@ app.post('/api/mux/reprocess', async (req, res) => {
 });
 
 require('./adminRoutes')(app, supabase);
+registerPropertyAlertRoutes(app, supabase);
 
 module.exports = app;
 
