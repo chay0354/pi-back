@@ -3,6 +3,8 @@
  * ADMIN_PASSWORD in the server environment overrides the built-in password.
  */
 const crypto = require('crypto');
+const {Resend} = require('resend');
+const {sendPropertyAlertSample} = require('./propertyAlerts');
 
 const B2B = new Set(['broker', 'company', 'professional', 'project_marketer']);
 
@@ -144,6 +146,32 @@ module.exports = function registerAdminRoutes(app, supabase) {
       return res.status(401).json({success: false, error: 'סיסמה שגויה'});
     }
     return res.json({success: true, token: adminToken(password)});
+  });
+
+  app.post('/api/admin/property-alert-sample', requireAdmin, async (req, res) => {
+    try {
+      const to = String((req.body && req.body.to) || '').trim();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+        return res.status(400).json({success: false, error: 'מייל לא תקין'});
+      }
+      const {data, error} = await supabase
+        .from('ads')
+        .select(
+          'id, project_name, address, land_address, category, price, price_per_night, purpose, rooms, area, description, main_image_url, additional_image_urls, property_type, status, feed_post, is_frozen, created_at',
+        )
+        .eq('status', 'published')
+        .order('created_at', {ascending: false})
+        .limit(12);
+      if (error) return res.status(500).json({success: false, error: error.message});
+      const ad = (data || []).find(row => row.feed_post !== true && row.is_frozen !== true);
+      if (!ad) return res.status(404).json({success: false, error: 'אין נכס לדוגמה'});
+      const key = process.env.RESEND_API_KEY;
+      const resend = key ? new Resend(key) : null;
+      const sent = await sendPropertyAlertSample(resend, to, ad);
+      return res.json({success: true, to, adId: ad.id, messageId: sent.id});
+    } catch (err) {
+      return res.status(err.status || 500).json({success: false, error: err.message || 'שליחה נכשלה'});
+    }
   });
 
   app.get('/api/admin/overview', requireAdmin, async (req, res) => {

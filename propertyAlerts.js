@@ -182,6 +182,37 @@ async function mapPool(items, limit, fn) {
   );
 }
 
+async function sendPropertyAlertSample(resend, to, ad) {
+  const label = categoryLabel(ad && ad.category) || 'נדל״ן';
+  const subject = `דוגמה · נכס חדש ב${label} · Pi 2701`;
+  const html = buildEmailHtml(
+    ad || {
+      id: 'sample',
+      category: 10,
+      project_name: 'דירת דוגמה',
+      address: 'תל אביב',
+      price: 2500000,
+      purpose: 'sale',
+      rooms: 4,
+      area: 110,
+      description: 'זוהי דוגמה למייל עדכון על נכס חדש.',
+    },
+  );
+  const from = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+  if (!resend) {
+    const error = new Error('RESEND_API_KEY חסר בשרת');
+    error.status = 503;
+    throw error;
+  }
+  const result = await resend.emails.send({from, to, subject, html});
+  if (result && result.error) {
+    const error = new Error(result.error.message || 'שליחת המייל נכשלה');
+    error.status = 502;
+    throw error;
+  }
+  return {id: (result && (result.id || (result.data && result.data.id))) || null};
+}
+
 async function notifyNewPropertyEmail(supabase, resend, ad) {
   if (!ad || !ad.id || isFeedPost(ad) || ad.status !== 'published' || ad.is_frozen === true) return;
   const categoryId = Number(ad.category);
@@ -304,4 +335,5 @@ module.exports = {
   CATEGORIES,
   registerPropertyAlertRoutes,
   notifyNewPropertyEmail,
+  sendPropertyAlertSample,
 };
