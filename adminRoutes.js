@@ -1,6 +1,6 @@
 /**
  * Password-gated stats for the site and the app. They share one database.
- * Set ADMIN_PASSWORD in the server environment before using /admin.
+ * ADMIN_PASSWORD in the server environment overrides the built-in password.
  */
 const crypto = require('crypto');
 
@@ -39,7 +39,7 @@ const STAGES = [
 ];
 
 function adminPassword() {
-  return String(process.env.ADMIN_PASSWORD || '').trim();
+  return String(process.env.ADMIN_PASSWORD || 'PIADMIN0386').trim();
 }
 
 function adminToken(password) {
