@@ -13202,6 +13202,8 @@ app.post('/api/mux/reprocess', async (req, res) => {
   }
 });
 
+require('./adminRoutes')(app, supabase);
+
 module.exports = app;
 
 // Start server (0.0.0.0 = accept connections from any network interface, so you can access from other devices)
