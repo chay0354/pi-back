@@ -104,44 +104,74 @@ function buildEmailHtml(ad) {
       ? description.slice(0, 160)
       : '';
 
-  const factHtml = facts
+  const factCells = facts
     .map(
       fact =>
-        `<td style="padding:0 0 8px 8px;"><span style="display:inline-block;padding:6px 12px;border-radius:999px;background:#2b2a39;color:#f7f3e6;font-size:13px;">${escapeHtml(fact)}</span></td>`,
+        `<td style="padding:0 0 8px 8px;"><span style="display:inline-block;padding:7px 12px;border-radius:999px;border:1px solid rgba(244,173,57,0.35);background:#2a2838;color:#f7f3e6;font-size:13px;font-family:Arial,Helvetica,sans-serif;">${escapeHtml(fact)}</span></td>`,
     )
     .join('');
 
   return `<!doctype html>
 <html lang="he" dir="rtl">
-  <body style="margin:0;padding:0;background:#14131c;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#14131c;padding:28px 12px;">
+  <body style="margin:0;padding:0;background:#0c0b12;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0c0b12;padding:28px 12px;">
       <tr>
         <td align="center">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#1e1d27;border-radius:28px;overflow:hidden;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;background:#1e1d27;border:1px solid #5c5874;border-radius:28px;overflow:hidden;">
             <tr>
-              <td style="padding:28px 28px 8px;font-family:Arial,Helvetica,sans-serif;text-align:right;">
-                <div style="color:#ffc40a;font-weight:800;letter-spacing:0.08em;font-size:14px;">PI 2701</div>
-                <div style="margin-top:18px;display:inline-block;padding:6px 12px;border-radius:999px;background:#ffc40a;color:#1e1d27;font-size:13px;font-weight:700;">${escapeHtml(category)}</div>
-                <h1 style="margin:14px 0 0;color:#ffffff;font-size:28px;line-height:1.25;font-weight:700;">נכס חדש עלה</h1>
-                <p style="margin:8px 0 0;color:#c8c2dc;font-size:16px;line-height:1.5;">${escapeHtml(title)}</p>
+              <td style="height:6px;background:#f4ad39;font-size:0;line-height:0;">&nbsp;</td>
+            </tr>
+            <tr>
+              <td style="padding:26px 28px 8px;font-family:Arial,Helvetica,sans-serif;text-align:right;direction:rtl;">
+                <div style="color:#f4ad39;font-weight:800;letter-spacing:0.16em;font-size:13px;">PI 2701</div>
+                <div style="margin-top:16px;color:#8c85b3;font-size:13px;">עדכון נכס חדש</div>
+                <h1 style="margin:6px 0 0;color:#ffffff;font-size:30px;line-height:1.2;font-weight:700;">${escapeHtml(title)}</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px 28px 0;text-align:right;direction:rtl;">
+                <table role="presentation" cellspacing="0" cellpadding="0" style="border:1.5px dashed #f4ad39;border-radius:16px;">
+                  <tr>
+                    <td style="padding:10px 16px;font-family:Arial,Helvetica,sans-serif;text-align:center;">
+                      <div style="color:#8c85b3;font-size:11px;letter-spacing:0.08em;">קטגוריה</div>
+                      <div style="margin-top:2px;color:#f4ad39;font-size:18px;font-weight:700;">${escapeHtml(category)}</div>
+                    </td>
+                  </tr>
+                </table>
               </td>
             </tr>
             ${
               image
-                ? `<tr><td style="padding:18px 28px 0;"><img src="${escapeHtml(image)}" alt="" width="504" style="display:block;width:100%;max-width:504px;height:240px;object-fit:cover;border-radius:18px;background:#2b2a39;" /></td></tr>`
+                ? `<tr><td style="padding:18px 28px 0;"><img src="${escapeHtml(image)}" alt="" width="504" style="display:block;width:100%;max-width:504px;height:220px;object-fit:cover;border-radius:16px;background:#2b2a39;" /></td></tr>`
                 : ''
             }
             <tr>
-              <td style="padding:18px 28px 0;font-family:Arial,Helvetica,sans-serif;text-align:right;">
-                ${address ? `<p style="margin:0 0 12px;color:#f7f3e6;font-size:16px;">${escapeHtml(address)}</p>` : ''}
-                ${blurb ? `<p style="margin:0 0 14px;color:#c8c2dc;font-size:14px;line-height:1.5;">${escapeHtml(blurb)}</p>` : ''}
-                <table role="presentation" cellspacing="0" cellpadding="0"><tr>${factHtml}</tr></table>
+              <td style="padding:16px 28px 18px;font-family:Arial,Helvetica,sans-serif;text-align:right;direction:rtl;">
+                ${address ? `<p style="margin:0;color:#f7f3e6;font-size:16px;line-height:1.4;">${escapeHtml(address)}</p>` : ''}
+                ${blurb ? `<p style="margin:8px 0 0;color:#c8c2dc;font-size:14px;line-height:1.55;">${escapeHtml(blurb)}</p>` : ''}
               </td>
             </tr>
             <tr>
-              <td style="padding:8px 28px 28px;font-family:Arial,Helvetica,sans-serif;text-align:right;">
-                <a href="${escapeHtml(link)}" style="display:inline-block;margin-top:8px;padding:14px 22px;border-radius:999px;background:#ffc40a;color:#1e1d27;font-size:16px;font-weight:700;text-decoration:none;">צפו בנכס</a>
-                <p style="margin:18px 0 0;color:#8c85b3;font-size:12px;line-height:1.5;">המייל נשלח כי בחרתם לקבל עדכון על נכסים חדשים בקטגוריית ${escapeHtml(category)}. אפשר לכבות את זה בתפריט, בעדכון נכסים חדשים שעולים.</p>
+              <td style="padding:0;background:#1e1d27;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td width="18" height="28" style="background:#0c0b12;border-radius:0 18px 18px 0;font-size:0;line-height:0;">&nbsp;</td>
+                    <td style="border-top:2px dashed #f4ad39;font-size:0;line-height:0;">&nbsp;</td>
+                    <td width="18" height="28" style="background:#0c0b12;border-radius:18px 0 0 18px;font-size:0;line-height:0;">&nbsp;</td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:8px 28px 28px;font-family:Arial,Helvetica,sans-serif;text-align:right;direction:rtl;background:#241f33;">
+                ${
+                  price
+                    ? `<div style="color:#8c85b3;font-size:12px;">מחיר</div><div style="margin:4px 0 14px;color:#f4ad39;font-size:34px;font-weight:800;line-height:1;">${escapeHtml(price)}</div>`
+                    : ''
+                }
+                ${factCells ? `<table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 16px;"><tr>${factCells}</tr></table>` : ''}
+                <a href="${escapeHtml(link)}" style="display:block;padding:16px 22px;border-radius:999px;background:#f4ad39;color:#1e1d27;font-size:17px;font-weight:700;text-decoration:none;text-align:center;">צפו בנכס</a>
+                <p style="margin:16px 0 0;color:#8c85b3;font-size:12px;line-height:1.5;">המייל נשלח כי בחרתם לקבל עדכון על נכסים חדשים בקטגוריית ${escapeHtml(category)}. אפשר לכבות את זה בתפריט, בעדכון נכסים חדשים שעולים.</p>
               </td>
             </tr>
           </table>
